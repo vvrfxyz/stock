@@ -1,0 +1,7 @@
+sqlalchemy
+psycopg2-binary
+alembic
+python-dotenv
+yfinance
+pandas
+loguru
