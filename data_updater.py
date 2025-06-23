@@ -63,7 +63,7 @@ def update_historical_data(db_manager: DatabaseManager, symbol: str):
             logger.warning(f"{symbol} 没有可用的历史价格数据。")
             return
 
-        df.rename(columns={'Adj Close': 'adj_close_backward'}, inplace=True)
+        df.rename(columns={'Adj Close': 'adj_close'}, inplace=True)
         df.reset_index(inplace=True)
 
         # 3. 准备价格数据 (DailyPrice)
@@ -77,7 +77,7 @@ def update_historical_data(db_manager: DatabaseManager, symbol: str):
                 'low': row['Low'],
                 'close': row['Close'],
                 'volume': row['Volume'],
-                'adj_close_backward': row.get('adj_close_backward'),
+                'adj_close': row.get('adj_close'),
             })
 
         db_manager.bulk_upsert(DailyPrice, prices_to_insert, ['security_id', 'date'])

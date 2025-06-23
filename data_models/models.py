@@ -58,7 +58,7 @@ class DailyPrice(Base):
     low = Column(Numeric(19, 6))
     close = Column(Numeric(19, 6))
     volume = Column(BigInteger)
-    adj_close_backward = Column(Numeric(19, 6), nullable=True)
+    adj_close = Column(Numeric(19, 6), nullable=True)
     turnover_rate = Column(Numeric(10, 6), nullable=True)
     adj_factor = Column(Numeric(20, 12), nullable=False, server_default='1.0')
     
