@@ -53,14 +53,14 @@ class DailyPrice(Base):
     __tablename__ = 'daily_prices'
     security_id = Column(Integer, primary_key=True)
     date = Column(Date, primary_key=True, index=True)
-    open = Column(Numeric(19, 4))
-    high = Column(Numeric(19, 4))
-    low = Column(Numeric(19, 4))
-    close = Column(Numeric(19, 4))
+    open = Column(Numeric(19, 6))
+    high = Column(Numeric(19, 6))
+    low = Column(Numeric(19, 6))
+    close = Column(Numeric(19, 6))
     volume = Column(BigInteger)
-    adj_close_backward = Column(Numeric(19, 4), nullable=True)
+    adj_close_backward = Column(Numeric(19, 6), nullable=True)
     turnover_rate = Column(Numeric(10, 6), nullable=True)
-    adj_factor = Column(Numeric(20, 10), nullable=False, server_default='1.0')
+    adj_factor = Column(Numeric(20, 12), nullable=False, server_default='1.0')
     
 class CorporateAction(Base):
     __tablename__ = 'corporate_actions'

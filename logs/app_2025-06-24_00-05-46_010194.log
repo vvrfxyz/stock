@@ -1,0 +1,9 @@
+2025-06-24 00:05:46.013 | INFO     | __main__:setup_logging:17 - 日志记录器设置完成。
+2025-06-24 00:05:46.014 | INFO     | db_manager:__init__:29 - 数据库引擎创建成功。
+2025-06-24 00:05:46.014 | INFO     | __main__:main:40 - ========== 开始处理 AAPL ==========
+2025-06-24 00:05:46.014 | INFO     | data_updater:update_stock_info:23 - 开始为 AAPL 获取基本信息...
+2025-06-24 00:05:50.192 | SUCCESS  | db_manager:upsert_security_info:86 - 成功更新/插入 Security 信息: AAPL
+2025-06-24 00:05:50.192 | INFO     | data_updater:update_historical_data:57 - 开始为 AAPL 获取全部历史数据...
+2025-06-24 00:05:50.202 | ERROR    | data_updater:update_historical_data:117 - 为 AAPL 更新历史数据时出错: Instance <Security at 0x111fcd940> is not bound to a Session; attribute refresh operation cannot proceed (Background on this error at: https://sqlalche.me/e/20/bhk3)
+2025-06-24 00:05:50.202 | INFO     | __main__:main:49 - ========== 完成处理 AAPL ==========
+

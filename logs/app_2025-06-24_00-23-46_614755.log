@@ -1,0 +1,10 @@
+2025-06-24 00:23:46.619 | INFO     | __main__:setup_logging:17 - 日志记录器设置完成。
+2025-06-24 00:23:46.622 | INFO     | db_manager:__init__:31 - 数据库引擎创建成功。
+2025-06-24 00:23:46.622 | INFO     | __main__:main:40 - ========== 开始处理 AAPL ==========
+2025-06-24 00:23:46.622 | INFO     | data_updater:update_stock_info:21 - 开始为 AAPL 获取基本信息...
+2025-06-24 00:23:49.402 | SUCCESS  | db_manager:upsert_security_info:89 - 成功更新/插入 Security 信息: AAPL
+2025-06-24 00:23:49.403 | INFO     | data_updater:update_historical_data:52 - 开始为 AAPL 获取全部历史数据...
+2025-06-24 00:27:21.044 | SUCCESS  | db_manager:bulk_upsert:104 - 成功批量更新/插入 11222 条记录到 daily_prices。
+2025-06-24 00:27:21.080 | SUCCESS  | db_manager:bulk_upsert:104 - 成功批量更新/插入 92 条记录到 corporate_actions。
+2025-06-24 00:27:21.088 | INFO     | __main__:main:49 - ========== 完成处理 AAPL ==========
+
