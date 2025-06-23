@@ -1,15 +1,27 @@
+import os
 from logging.config import fileConfig
 
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 
 from alembic import context
+from dotenv import load_dotenv
+from data_models.models import Base
 
-from data_models.models import Base 
+load_dotenv()
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
 
+db_url = os.getenv('DATABASE_URL')
+if db_url:
+    # 如果从 .env 加载成功，就用它来设置 Alembic 的配置
+    config.set_main_option('sqlalchemy.url', db_url)
+    # 打印一些信息以确认，但隐藏敏感部分
+    try:
+        print(f"Alembic 使用了 .env 文件中的数据库连接: ...@{db_url.split('@')[-1]}")
+    except IndexError:
+        print("Alembic 正在使用 .env 文件中的数据库连接。")
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
 if config.config_file_name is not None:
