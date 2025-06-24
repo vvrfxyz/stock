@@ -20,33 +20,34 @@ def main():
     """主执行函数"""
     setup_logging()
 
+    db_manager = None
     try:
         # 1. 初始化数据库管理器
         db_manager = DatabaseManager()
-        
-        # (可选) 如果是第一次运行，创建数据库表。
-        # 在生产环境中，更推荐使用 alembic migrations 来管理表结构。
+
+        # (可选) ...
         # db_manager.create_tables()
+        # 2. 定义要处理的股票列表
+        symbols_to_process = ['AAPL']
+        # 3. 循环处理每只股票
+        for symbol in symbols_to_process:
+            logger.info(f"========== 开始处理 {symbol} ==========")
 
+            update_stock_info(db_manager, symbol)
+
+            update_historical_data(db_manager, symbol)
+
+            logger.info(f"========== 完成处理 {symbol} ==========\n")
     except Exception as e:
-        logger.critical(f"程序启动失败，无法连接到数据库: {e}")
-        return
+        if db_manager is None:
+            logger.critical(f"程序启动失败，无法初始化数据库管理器: {e}", exc_info=True)
+        else:
+            logger.critical(f"程序在执行过程中遇到未处理的异常: {e}", exc_info=True)
+    finally:
+        if db_manager:
+            db_manager.close()
+        logger.info("程序执行完毕。")
 
-    # 2. 定义要处理的股票列表
-    symbols_to_process = ['AAPL']
-
-    # 3. 循环处理每只股票
-    for symbol in symbols_to_process:
-        logger.info(f"========== 开始处理 {symbol} ==========")
-        
-        # 首先，更新或创建股票的基本信息
-        update_stock_info(db_manager, symbol)
-        
-        # 然后，更新其全部历史价格和公司行动
-        # 【关键修改】调用新的函数，不再需要日期参数
-        update_historical_data(db_manager, symbol)
-        
-        logger.info(f"========== 完成处理 {symbol} ==========\n")
 
 if __name__ == '__main__':
     main()

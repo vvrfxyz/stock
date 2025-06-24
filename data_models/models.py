@@ -60,8 +60,9 @@ class DailyPrice(Base):
     volume = Column(BigInteger)
     adj_close = Column(Numeric(19, 6), nullable=True)
     turnover_rate = Column(Numeric(10, 6), nullable=True)
-    adj_factor = Column(Numeric(20, 12), nullable=False, server_default='1.0')
-    
+    adj_factor = Column(Numeric(20, 12), nullable=False, default=1.0)
+    event_factor = Column(Numeric(20, 12), nullable=False, default=1.0)
+
 class CorporateAction(Base):
     __tablename__ = 'corporate_actions'
     id = Column(Integer, primary_key=True)

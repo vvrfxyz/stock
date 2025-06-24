@@ -19,6 +19,15 @@ class DatabaseManager:
     结合了高效的批量操作和安全的会话管理。
     """
 
+    def close(self):
+        """
+        显式关闭数据库引擎和连接池。
+        """
+        if self.engine:
+            logger.info("正在关闭数据库引擎连接池...")
+            self.engine.dispose()
+            logger.success("数据库引擎已成功关闭。")
+
     def __init__(self, db_url: str = None):
         if db_url is None:
             db_url = os.getenv("DATABASE_URL")
@@ -26,7 +35,7 @@ class DatabaseManager:
             raise ValueError("数据库URL未找到。请在 .env 文件中设置 DATABASE_URL 或在初始化时提供。")
 
         try:
-            self.engine = create_engine(db_url)
+            self.engine = create_engine(db_url, pool_pre_ping=True)
             self._session_factory = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
             logger.info("数据库引擎创建成功。")
         except Exception as e:
