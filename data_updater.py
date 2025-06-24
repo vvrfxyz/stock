@@ -51,55 +51,93 @@ def update_stock_info(db_manager: DatabaseManager, symbol: str):
 
 def reverse_engineer_adj_factors(df: pd.DataFrame) -> pd.DataFrame:
     """
-    从雅虎财经数据中反向工程复权因子，识别并量化黑盒事件。
+    从雅虎财经数据中反向工程复权因子。
+    该函数会计算两个核心因子：
+    1. our_factor: 累积复权因子，用于将任何一天的 Close 价格直接转换为 Adj Close。
+    2. event_factor: 事件因子，仅在事件发生前一天不为1，用于描述单次复权事件的乘数。
     """
     logger.info("开始反向工程复权因子，识别黑盒事件...")
-    # 1. 数据预处理和重命名
+    # 1. 数据预处理
     df.rename(columns={'Adj Close': 'yahoo_adj_close', 'Stock Splits': 'split_ratio'}, inplace=True)
     df.sort_index(ascending=True, inplace=True)
+
+    # 修复 Pandas FutureWarning，使用直接赋值替代 inplace=True
+    df['Close'] = df['Close'].replace(0, np.nan)
+    df['Close'] = df['Close'].ffill()
+
     # 2. 计算雅虎的“实际”每日累积复权因子 (我们的“黄金标准”)
     df['yahoo_factor'] = df['yahoo_adj_close'].div(df['Close']).replace([np.inf, -np.inf], np.nan).ffill()
+
     # 3. 初始化我们将要计算的列
-    df['our_factor'] = 1.0  # 默认值为1.0
+    df['our_factor'] = 1.0
+    df['event_factor'] = 1.0
     df['black_box_factor'] = np.nan
+
     if df.empty:
         return df
 
     # 4. 从后向前迭代，构建我们自己的复权因子链条
-    # --- 【修改】 使用 .loc 避免链式赋值警告 ---
     last_day_index = df.index[-1]
-    df.loc[last_day_index, 'our_factor'] = df.loc[last_day_index, 'yahoo_factor']
+    if pd.notna(df.loc[last_day_index, 'yahoo_factor']):
+        df.loc[last_day_index, 'our_factor'] = df.loc[last_day_index, 'yahoo_factor']
+    else:
+        # 如果最后一天因子无效，则设为1
+        df.loc[last_day_index, 'our_factor'] = 1.0
+        logger.warning(f"最后交易日 {last_day_index.date()} 的雅虎因子无效，已设置为1.0。")
+
     last_our_factor = df.loc[last_day_index, 'our_factor']
-    # 迭代从倒数第二天到第一天的所有日期
+
     for i in range(len(df) - 2, -1, -1):
         today_index = df.index[i]
         tomorrow_index = df.index[i + 1]
+        # --- a. 根据白盒事件计算今天的“理论”累积因子 ---
 
-        tomorrow_close = df.loc[tomorrow_index, 'Close']
+        # 【修复】获取今天的收盘价作为分红计算的基准
+        today_close = df.loc[today_index, 'Close']
+
         dividend_on_tomorrow = df.loc[tomorrow_index, 'Dividends']
         split_ratio_on_tomorrow = df.loc[tomorrow_index, 'split_ratio']
-
+        # 【修复】使用 today_close 计算分红调整比例
         dividend_adj_ratio = (
-                                         tomorrow_close - dividend_on_tomorrow) / tomorrow_close if tomorrow_close > 0 and dividend_on_tomorrow > 0 else 1.0
-        split_adj_ratio = 1.0 / split_ratio_on_tomorrow if split_ratio_on_tomorrow > 0 else 1.0
+                                         today_close - dividend_on_tomorrow) / today_close if today_close > 0 and dividend_on_tomorrow > 0 else 1.0
 
-        our_factor_today = last_our_factor * dividend_adj_ratio * split_adj_ratio
+        split_ratio = df.loc[tomorrow_index, 'split_ratio']
+        # yfinance中，无拆股事件时split_ratio为0
+        if split_ratio > 0 and split_ratio != 1.0:
+            split_adj_ratio = 1.0 / split_ratio
+        else:
+            split_adj_ratio = 1.0
+
+        theoretical_event_factor = dividend_adj_ratio * split_adj_ratio
+        theoretical_our_factor_today = last_our_factor * theoretical_event_factor
+        # --- b. 获取雅虎的“实际”累积因子 ---
         yahoo_factor_today = df.loc[today_index, 'yahoo_factor']
-        if not np.isclose(our_factor_today, yahoo_factor_today, rtol=1e-6, atol=1e-9):
-            black_box_correction = yahoo_factor_today / our_factor_today
+        # 如果雅虎因子无效，跳过本次比较，直接沿用理论值
+        if pd.isna(yahoo_factor_today):
+            logger.warning(f"[{today_index.date()}] 雅虎因子无效，使用理论值。")
+            our_factor_today = theoretical_our_factor_today
+        # --- c. 比较理论与现实，识别黑盒事件 ---
+        elif not np.isclose(theoretical_our_factor_today, yahoo_factor_today, rtol=1e-6, atol=1e-9):
+            black_box_correction = yahoo_factor_today / theoretical_our_factor_today
             df.loc[today_index, 'black_box_factor'] = black_box_correction
-
             logger.warning(
                 f"[{today_index.date()}] 发现黑盒事件! "
-                f"理论因子: {our_factor_today:.8f}, "
+                f"理论因子: {theoretical_our_factor_today:.8f}, "
                 f"雅虎因子: {yahoo_factor_today:.8f}, "
                 f"修正系数: {black_box_correction:.8f}"
             )
 
             our_factor_today = yahoo_factor_today
-
+        else:
+            our_factor_today = theoretical_our_factor_today
+        # --- d. 存储计算结果 ---
         df.loc[today_index, 'our_factor'] = our_factor_today
+
+        event_factor_today = our_factor_today / last_our_factor if last_our_factor != 0 else 1.0
+        df.loc[today_index, 'event_factor'] = event_factor_today
+        # --- e. 更新循环变量 ---
         last_our_factor = our_factor_today
+
     logger.success("复权因子反向工程完成。")
     return df
 
@@ -133,7 +171,8 @@ def update_historical_data(db_manager: DatabaseManager, symbol: str):
                 'close': row['Close'],
                 'volume': row['Volume'],
                 'adj_close': row.get('yahoo_adj_close'), # 存储雅虎的后复权价，作为参考
-                'adj_factor': row.get('our_factor') # 存储我们自己计算的、最精确的因子
+                'adj_factor': row.get('our_factor'), # 存储我们自己计算的、最精确的因子
+                'event_factor': row.get('event_factor')
             })
 
         db_manager.bulk_upsert(DailyPrice, prices_to_insert, ['security_id', 'date'])
