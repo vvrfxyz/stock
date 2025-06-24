@@ -53,91 +53,86 @@ def reverse_engineer_adj_factors(df: pd.DataFrame) -> pd.DataFrame:
     """
     从雅虎财经数据中反向工程复权因子。
     该函数会计算两个核心因子：
-    1. our_factor: 累积复权因子，用于将任何一天的 Close 价格直接转换为 Adj Close。
-    2. event_factor: 事件因子，仅在事件发生前一天不为1，用于描述单次复权事件的乘数。
+    1. adj_factor: 累积复权因子，用于高性能计算。 (adj_price = raw_price * adj_factor)
+    2. event_factor: 事件因子，仅在事件发生前一天不为1.0，代表单次调整的乘数。
+    同时，它会识别理论计算（股息、拆分）无法解释的“黑盒”调整事件。
     """
-    logger.info("开始反向工程复权因子，识别黑盒事件...")
+    logger.info("开始反向工程复权因子...")
     # 1. 数据预处理
     df.rename(columns={'Adj Close': 'yahoo_adj_close', 'Stock Splits': 'split_ratio'}, inplace=True)
     df.sort_index(ascending=True, inplace=True)
 
-    # 修复 Pandas FutureWarning，使用直接赋值替代 inplace=True
+    if 'split_ratio' in df.columns:
+        df['split_ratio'].fillna(0, inplace=True)
+    else:
+        df['split_ratio'] = 0.0
+
     df['Close'] = df['Close'].replace(0, np.nan)
     df['Close'] = df['Close'].ffill()
-
-    # 2. 计算雅虎的“实际”每日累积复权因子 (我们的“黄金标准”)
-    df['yahoo_factor'] = df['yahoo_adj_close'].div(df['Close']).replace([np.inf, -np.inf], np.nan).ffill()
-
-    # 3. 初始化我们将要计算的列
-    df['our_factor'] = 1.0
+    if df.empty or 'yahoo_adj_close' not in df.columns:
+        logger.warning("数据框为空或缺少 'Adj Close' 列，无法进行复权因子计算。")
+        df['adj_factor'] = 1.0
+        df['event_factor'] = 1.0
+        df['black_box_factor'] = np.nan
+        return df
+    # 2. 计算雅虎的累积复权因子 (我们的黄金标准)
+    # 这个因子直接将任何一天的名义收盘价调整到与最新收盘价可比的水平。
+    df['adj_factor'] = df['yahoo_adj_close'].div(df['Close']).replace([np.inf, -np.inf], np.nan)
+    # 从后向前填充，因为最近的因子最可靠，可以修复数据末尾可能存在的NaN。
+    df['adj_factor'] = df['adj_factor'].bfill()
+    # 3. 初始化 event_factor 和 black_box_factor
     df['event_factor'] = 1.0
     df['black_box_factor'] = np.nan
-
-    if df.empty:
-        return df
-
-    # 4. 从后向前迭代，构建我们自己的复权因子链条
-    last_day_index = df.index[-1]
-    if pd.notna(df.loc[last_day_index, 'yahoo_factor']):
-        df.loc[last_day_index, 'our_factor'] = df.loc[last_day_index, 'yahoo_factor']
-    else:
-        # 如果最后一天因子无效，则设为1
-        df.loc[last_day_index, 'our_factor'] = 1.0
-        logger.warning(f"最后交易日 {last_day_index.date()} 的雅虎因子无效，已设置为1.0。")
-
-    last_our_factor = df.loc[last_day_index, 'our_factor']
-
+    # 4. 从后向前迭代，计算每日事件因子并识别黑盒事件
+    # 我们从倒数第二天开始，因为事件因子是关于两天之间关系的
     for i in range(len(df) - 2, -1, -1):
-        today_index = df.index[i]
-        tomorrow_index = df.index[i + 1]
-        # --- a. 根据白盒事件计算今天的“理论”累积因子 ---
-
-        # 【修复】获取今天的收盘价作为分红计算的基准
-        today_close = df.loc[today_index, 'Close']
-
-        dividend_on_tomorrow = df.loc[tomorrow_index, 'Dividends']
-        split_ratio_on_tomorrow = df.loc[tomorrow_index, 'split_ratio']
-        # 【修复】使用 today_close 计算分红调整比例
-        dividend_adj_ratio = (
-                                         today_close - dividend_on_tomorrow) / today_close if today_close > 0 and dividend_on_tomorrow > 0 else 1.0
-
-        split_ratio = df.loc[tomorrow_index, 'split_ratio']
-        # yfinance中，无拆股事件时split_ratio为0
-        if split_ratio > 0 and split_ratio != 1.0:
-            split_adj_ratio = 1.0 / split_ratio
-        else:
-            split_adj_ratio = 1.0
+        today_row = df.iloc[i]
+        tomorrow_row = df.iloc[i + 1]
+        # --- a. 计算基于雅虎数据的“实际”事件因子 ---
+        # 这是两天累积因子之间的比率，代表了这一天发生的总调整
+        adj_factor_today = today_row['adj_factor']
+        adj_factor_tomorrow = tomorrow_row['adj_factor']
+        if pd.isna(adj_factor_today) or pd.isna(adj_factor_tomorrow) or adj_factor_tomorrow == 0:
+            continue  # 如果因子无效，无法计算比率，跳过
+        # actual_event_factor 是连接今天和明天价格的真实乘数
+        actual_event_factor = adj_factor_today / adj_factor_tomorrow
+        df.loc[today_row.name, 'event_factor'] = actual_event_factor
+        # --- b. 根据已知的公司行动（白盒事件）计算“理论”事件因子 ---
+        dividend_on_tomorrow = tomorrow_row['Dividends']
+        split_ratio_on_tomorrow = tomorrow_row['split_ratio']
+        # 股息调整因子：(P_t-1 - D_t) / P_t-1
+        # 使用今天的收盘价作为计算基准
+        today_close = today_row['Close']
+        dividend_adj_ratio = 1.0
+        if dividend_on_tomorrow > 0 and today_close > 0:
+            dividend_adj_ratio = (today_close - dividend_on_tomorrow) / today_close
+        # 拆股调整因子：1 / split_ratio
+        # yfinance中，无拆股事件时split_ratio为0或1
+        split_adj_ratio = 1.0
+        if split_ratio_on_tomorrow > 1.0:  # 拆股
+            split_adj_ratio = 1.0 / split_ratio_on_tomorrow
+        elif 0 < split_ratio_on_tomorrow < 1.0:  # 并股
+            split_adj_ratio = 1.0 / split_ratio_on_tomorrow
 
         theoretical_event_factor = dividend_adj_ratio * split_adj_ratio
-        theoretical_our_factor_today = last_our_factor * theoretical_event_factor
-        # --- b. 获取雅虎的“实际”累积因子 ---
-        yahoo_factor_today = df.loc[today_index, 'yahoo_factor']
-        # 如果雅虎因子无效，跳过本次比较，直接沿用理论值
-        if pd.isna(yahoo_factor_today):
-            logger.warning(f"[{today_index.date()}] 雅虎因子无效，使用理论值。")
-            our_factor_today = theoretical_our_factor_today
-        # --- c. 比较理论与现实，识别黑盒事件 ---
-        elif not np.isclose(theoretical_our_factor_today, yahoo_factor_today, rtol=1e-6, atol=1e-9):
-            black_box_correction = yahoo_factor_today / theoretical_our_factor_today
-            df.loc[today_index, 'black_box_factor'] = black_box_correction
+        # --- c. 比较实际与理论，识别黑盒事件 ---
+        # 如果实际事件因子显著不为1，但与我们的理论计算不符，则认为存在黑盒事件
+        # 使用 rtol=1e-4 (0.01%) 作为容忍度，避免浮点误差
+        is_significant_event = not np.isclose(actual_event_factor, 1.0, rtol=1e-9, atol=1e-9)
+        is_explained = np.isclose(actual_event_factor, theoretical_event_factor, rtol=1e-4, atol=1e-9)
+        if is_significant_event and not is_explained:
+            # 理论因子不能为0，否则无法计算修正系数
+            if theoretical_event_factor == 0:
+                black_box_correction = np.inf
+            else:
+                black_box_correction = actual_event_factor / theoretical_event_factor
+            df.loc[today_row.name, 'black_box_factor'] = black_box_correction
             logger.warning(
-                f"[{today_index.date()}] 发现黑盒事件! "
-                f"理论因子: {theoretical_our_factor_today:.8f}, "
-                f"雅虎因子: {yahoo_factor_today:.8f}, "
+                f"[{today_row.name.date()}] 发现黑盒事件! "
+                f"实际事件因子: {actual_event_factor:.8f}, "
+                f"理论事件因子: {theoretical_event_factor:.8f} (Div: {dividend_adj_ratio:.6f}, Split: {split_adj_ratio:.6f}), "
                 f"修正系数: {black_box_correction:.8f}"
             )
-
-            our_factor_today = yahoo_factor_today
-        else:
-            our_factor_today = theoretical_our_factor_today
-        # --- d. 存储计算结果 ---
-        df.loc[today_index, 'our_factor'] = our_factor_today
-
-        event_factor_today = our_factor_today / last_our_factor if last_our_factor != 0 else 1.0
-        df.loc[today_index, 'event_factor'] = event_factor_today
-        # --- e. 更新循环变量 ---
-        last_our_factor = our_factor_today
-
     logger.success("复权因子反向工程完成。")
     return df
 
@@ -197,12 +192,15 @@ def update_historical_data(db_manager: DatabaseManager, symbol: str):
                                    ['security_id', 'event_date', 'event_type'],
                                    constraint='_security_date_type_uc')
 
-        # 5. 准备并存储黑盒事件数据 (SpecialAdjustment)
-        adjustments_to_insert = []
-        adjustments_df = processed_df[processed_df['black_box_factor'].notna()]
+        adjustments_df = processed_df[
+            pd.notna(processed_df['black_box_factor']) &
+            np.isfinite(processed_df['black_box_factor'])
+            ]
 
+        # 5. 准备并存储黑盒事件数据 (SpecialAdjustment)
         if not adjustments_df.empty:
             logger.info(f"为 {symbol} 找到 {len(adjustments_df)} 个特殊调整事件，正在存入数据库...")
+            adjustments_to_insert = []
             for row in adjustments_df.to_dict('records'):
                 adjustments_to_insert.append({
                     'security_id': security_id,
@@ -215,6 +213,7 @@ def update_historical_data(db_manager: DatabaseManager, symbol: str):
                 index_elements=['security_id', 'event_date'],
                 constraint='_security_date_uc'
             )
+
 
     except Exception as e:
         logger.error(f"为 {symbol} 更新历史数据时出错: {e}", exc_info=True)  # 添加 exc_info=True 以获取更详细的堆栈跟踪
