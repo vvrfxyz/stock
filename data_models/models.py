@@ -62,6 +62,7 @@ class DailyPrice(Base):
     turnover_rate = Column(Numeric(10, 6), nullable=True)
     adj_factor = Column(Numeric(20, 6), nullable=False, server_default='1.0')
     event_factor = Column(Numeric(20, 6), nullable=False, server_default='1.0')
+    cal_event_factor = Column(Numeric(20, 6), nullable=False, server_default='1.0')
 
 class CorporateAction(Base):
     __tablename__ = 'corporate_actions'

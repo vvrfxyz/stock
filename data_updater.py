@@ -51,88 +51,80 @@ def update_stock_info(db_manager: DatabaseManager, symbol: str):
 
 def reverse_engineer_adj_factors(df: pd.DataFrame) -> pd.DataFrame:
     """
-    通过混合模型精确计算复权因子，输出混合结果：
-    - adj_factor: 用于【后复权】的累积调整因子。
-    - event_factor: 用于【前复权】的独立事件调整因子。
+    根据明确的定义，简化计算复权因子。
+
+    1. adj_factor: 后复权累积因子 (adj_close / close)。
+    2. cal_event_factor: adj_factor的每日变化率。
+    3. event_factor: 基于分红和拆股事件的前复权事件因子。
     """
-    logger.info("开始通过混合模型计算复权因子（后复权累积因子 + 前复权事件因子）...")
-    # 1. 数据预处理 (与原版相同)
-    df.rename(columns={'Adj Close': 'yahoo_adj_close', 'Stock Splits': 'split_ratio'}, inplace=True)
-    df.sort_index(ascending=True, inplace=True)
-    for col in ['split_ratio', 'Dividends']:
-        df[col] = df[col].fillna(0)
-    df['Close'] = df['Close'].replace(0, np.nan).ffill()
-    df['yahoo_adj_close'] = df['yahoo_adj_close'].replace(0, np.nan).ffill()
-    if df.empty or 'Close' not in df.columns or df['Close'].isnull().all():
-        logger.warning("数据框为空或缺少关键价格列，无法计算。")
+    print("开始简化计算复权因子...")
+
+    # --- 步骤 0: 数据预处理 (与原版基本一致) ---
+    # 为了代码清晰，直接使用新列名，避免混淆
+    df_copy = df.copy()
+    df_copy.rename(columns={
+        'Adj Close': 'adj_close',
+        'Stock Splits': 'split_ratio',
+        'Dividends': 'dividends',
+        'Close': 'close'
+    }, inplace=True)
+
+    df_copy.sort_index(ascending=True, inplace=True)
+
+    for col in ['split_ratio', 'dividends']:
+        df_copy[col] = df_copy[col].fillna(0)
+
+    # 填充价格数据中的0或NaN值，防止计算错误
+    for col in ['close', 'adj_close']:
+        df_copy[col] = df_copy[col].replace(0, np.nan).ffill()
+
+    if df_copy.empty or 'close' not in df_copy.columns or df_copy['close'].isnull().all():
+        print("警告: 数据框为空或缺少关键价格列，无法计算。")
         df['adj_factor'] = 1.0
+        df['cal_event_factor'] = 1.0
         df['event_factor'] = 1.0
         return df
-    # 2. 计算“白盒”理论事件因子 (theoretical_event_factor) (与原版相同)
-    # 这是后复权视角下的事件因子，即 Price_After / Price_Before
-    df['theoretical_event_factor'] = 1.0
-    df['prev_close'] = df['Close'].shift(1)
-    mask_div = (df['Dividends'] > 0) & (df['prev_close'] > 0)
-    df.loc[mask_div, 'theoretical_event_factor'] = (df['prev_close'][mask_div] - df['Dividends'][mask_div]) / \
-                                                   df['prev_close'][mask_div]
-    mask_split = (df['split_ratio'] > 0) & (df['split_ratio'] != 1.0)
-    df.loc[mask_split, 'theoretical_event_factor'] *= (1.0 / df['split_ratio'][mask_split])
-    # 3. 计算“实际”事件因子 (actual_event_factor) (与原版相同)
-    temp_adj_factor = df['yahoo_adj_close'] / df['Close']
-    temp_adj_factor = temp_adj_factor.replace([np.inf, -np.inf], np.nan).bfill().ffill()
-    df['actual_event_factor'] = temp_adj_factor.shift(1) / temp_adj_factor
-    df['actual_event_factor'].iloc[0] = 1.0
-    # 4. 识别并隔离“黑盒”事件 (核心逻辑) (与原版相同)
-    df['black_box_factor'] = 1.0
-    tolerance = 1e-5
-    unexplained_mask = (
-            (np.abs(df['actual_event_factor'] - df['theoretical_event_factor']) > tolerance) &
-            (df['theoretical_event_factor'] != 0)
-    )
-    if unexplained_mask.any():
-        logger.warning(f"发现 {unexplained_mask.sum()} 个疑似黑盒事件（如配股、增发等）。")
-        df.loc[unexplained_mask, 'black_box_factor'] = df['actual_event_factor'][unexplained_mask] / \
-                                                       df['theoretical_event_factor'][unexplained_mask]
-        for date in df.index[unexplained_mask]:
-            logger.info(f"  - 日期: {date.date()}, "
-                        f"实际因子: {df.loc[date, 'actual_event_factor']:.6f}, "
-                        f"理论因子: {df.loc[date, 'theoretical_event_factor']:.6f}, "
-                        f"推断黑盒因子: {df.loc[date, 'black_box_factor']:.6f}")
-    # 5. 生成最终的、干净的后复权事件因子 (backward_event_factor)
-    # 为了清晰，我们称之为 backward_event_factor，因为它用于计算后复权 adj_factor
-    df['backward_event_factor'] = df['theoretical_event_factor'] * df['black_box_factor']
-    # 6. 生成最终的【后复权】adj_factor (基于我们干净的 backward_event_factor)
-    # 此部分逻辑保持原样，不做任何改动
-    reversed_event_factor = df['backward_event_factor'].iloc[::-1]
-    reversed_adj_factor = pd.Series(np.nan, index=reversed_event_factor.index)
-    reversed_adj_factor.iloc[0] = 1.0
-    for i in range(1, len(reversed_adj_factor)):
-        reversed_adj_factor.iloc[i] = reversed_adj_factor.iloc[i - 1] * reversed_event_factor.iloc[i - 1]
-    df['adj_factor'] = reversed_adj_factor.iloc[::-1]
-    last_yahoo_factor = df['yahoo_adj_close'].iloc[-1] / df['Close'].iloc[-1]
-    df['adj_factor'] *= last_yahoo_factor
-    # ==============================================================================
-    # 7. 【核心修改】生成最终的【前复权】event_factor
-    # 定义：前复权事件因子是后复权事件因子的倒数。
-    # 在非事件日，两者都为1。在事件日，如果后复权因子是 E (<1)，则前复权因子是 1/E (>1)。
-    # 我们直接使用已经计算好的 backward_event_factor 来生成最终的 event_factor 列。
 
-    # 使用 np.where 进行高效、安全的转换
-    # 条件：当 backward_event_factor 不为1且不为0时，取其倒数，否则保持为1
-    df['event_factor'] = np.where(
-        (df['backward_event_factor'] != 1.0) & (df['backward_event_factor'] != 0),
-        1.0 / df['backward_event_factor'],
-        1.0
-    )
-    # ==============================================================================
-    # 8. 清理与最终四舍五入
-    df.drop(columns=['prev_close', 'theoretical_event_factor', 'actual_event_factor', 'backward_event_factor'],
-            inplace=True)
-    df['adj_factor'] = df['adj_factor'].round(6)
-    df['event_factor'] = df['event_factor'].round(6)
-    df['black_box_factor'] = df['black_box_factor'].round(6)
+    # --- 步骤 1: 计算 adj_factor (后复权累积因子) ---
+    # 定义: adj_factor = adj_close / close
+    df_copy['adj_factor'] = df_copy['adj_close'] / df_copy['close']
+    # 处理可能出现的无穷大值或空值
+    df_copy['adj_factor'].replace([np.inf, -np.inf], np.nan, inplace=True)
+    df_copy['adj_factor'].bfill(inplace=True)  # 从后向前填充，保证序列末端有值
+    df_copy['adj_factor'].ffill(inplace=True)  # 从前向后填充，处理剩余空值
 
-    logger.success("混合复权因子计算完成：adj_factor (后复权), event_factor (前复权)。")
+    # --- 步骤 2 & 3: 计算 cal_event_factor 并修正 ---
+    # 定义: cal_event_factor = adj_factor(t) / adj_factor(t-1)
+    df_copy['cal_event_factor'] = df_copy['adj_factor'] / df_copy['adj_factor'].shift(1)
+    df_copy['cal_event_factor'].iloc[0] = 1.0  # 第一天的变化率定义为1
+
+    # 修正接近1的浮点数误差
+    # 使用 np.isclose 比直接比较更安全
+    df_copy.loc[np.isclose(df_copy['cal_event_factor'], 1.0), 'cal_event_factor'] = 1.0
+
+    # --- 步骤 4: 计算 event_factor (前复权事件因子) ---
+    # 定义: 仅根据分红和拆股事件计算，用于前复权
+    # 前复权因子 = Price_Before / Price_After
+    df_copy['event_factor'] = 1.0
+    df_copy['prev_close'] = df_copy['close'].shift(1)
+
+    # 分红事件因子: prev_close / (prev_close - dividend)
+    mask_div = (df_copy['dividends'] > 0) & (df_copy['prev_close'] > 0)
+    df_copy.loc[mask_div, 'event_factor'] = df_copy['prev_close'][mask_div] / \
+                                            (df_copy['prev_close'][mask_div] - df_copy['dividends'][mask_div])
+
+    # 拆股事件因子: split_ratio
+    # 如果当天同时有分红和拆股，则累乘
+    mask_split = (df_copy['split_ratio'] > 0) & (df_copy['split_ratio'] != 1.0)
+    df_copy.loc[mask_split, 'event_factor'] *= df_copy['split_ratio'][mask_split]
+
+    # --- 步骤 5: 清理并整合到原DataFrame ---
+    # 将计算出的核心字段添加回原始DataFrame
+    df['adj_factor'] = df_copy['adj_factor'].round(6)
+    df['cal_event_factor'] = df_copy['cal_event_factor'].round(6)
+    df['event_factor'] = df_copy['event_factor'].round(6)
+
+    print("简化版复权因子计算完成。")
     return df
 
 
@@ -162,7 +154,8 @@ def update_historical_data(db_manager: DatabaseManager, symbol: str):
                 'volume': row['Volume'],
                 'adj_close': row.get('yahoo_adj_close'),
                 'adj_factor': row.get('adj_factor'),
-                'event_factor': row.get('event_factor')
+                'event_factor': row.get('event_factor'),
+                'cal_event_factor': row.get('cal_event_factor')
             })
 
         db_manager.bulk_upsert(DailyPrice, prices_to_insert, ['security_id', 'date'])
