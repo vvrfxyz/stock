@@ -1,49 +1,78 @@
 # data_updater.py
 import numpy as np
-import yfinance as yf
 import pandas as pd
 from loguru import logger
 from datetime import datetime, timedelta, timezone
 
 from db_manager import DatabaseManager
-from data_models.models import MarketType, AssetType, ActionType, DailyPrice, CorporateAction, SpecialAdjustment, \
-    Security
+from data_models.models import MarketType, AssetType, ActionType, DailyPrice, CorporateAction, Security
+# 导入数据源抽象接口
+from data_sources.base import DataSourceInterface
 
 
-def _map_yfinance_ticker_to_market_type(symbol: str) -> tuple[MarketType, AssetType]:
+def _map_yfinance_info_to_types(symbol: str, info: dict) -> tuple[MarketType, AssetType]:
+    """
+    根据 yfinance 的 info 字典和 symbol 映射到内部的市场和资产类型。
+    """
+    # 1. 确定资产类型 (AssetType)
+    quote_type = info.get('quoteType')
+    if quote_type == 'ETF':
+        asset_type = AssetType.ETF
+    elif quote_type == 'INDEX':
+        asset_type = AssetType.INDEX
+    elif quote_type == 'CRYPTOCURRENCY':
+        asset_type = AssetType.CRYPTO
+    # yfinance 对外汇的表示不统一，这里可以根据需要扩展
+    elif quote_type == 'CURRENCY':
+        asset_type = AssetType.FOREX
+    else:
+        asset_type = AssetType.STOCK  # 默认为股票
+
+    # 2. 确定市场类型 (MarketType)
     symbol_upper = symbol.upper()
     if ".SS" in symbol_upper or ".SZ" in symbol_upper:
-        return MarketType.CNA, AssetType.STOCK
-    if ".HK" in symbol_upper:
-        return MarketType.HK, AssetType.STOCK
-    return MarketType.US, AssetType.STOCK
+        market = MarketType.CNA
+    elif ".HK" in symbol_upper:
+        market = MarketType.HK
+    elif asset_type == AssetType.CRYPTO:
+        market = MarketType.CRYPTO
+    elif asset_type == AssetType.FOREX:
+        market = MarketType.FOREX
+    else:
+        # 默认为美股，对于指数等也可以归类于此
+        market = MarketType.US
+        if asset_type == AssetType.INDEX:
+            market = MarketType.INDEX
+
+    return market, asset_type
 
 
-def update_stock_info(db_manager: DatabaseManager, symbol: str, force_update: bool = False):
-
+def update_stock_info(db_manager: DatabaseManager, symbol: str, data_source: DataSourceInterface,
+                      force_update: bool = False):
+    """使用传入的 data_source 更新股票基本信息"""
     symbol = symbol.lower()
 
     if not force_update:
         with db_manager.get_session() as session:
             security = session.query(Security.info_last_updated_at).filter(Security.symbol == symbol).first()
-            # 如果记录存在，且更新时间在30天内，则跳过
             if security and security.info_last_updated_at > (datetime.now(timezone.utc) - timedelta(days=30)):
                 logger.trace(f"[{symbol}] 的基本信息在30天内已更新，跳过此次API请求。")
                 return
 
     logger.info(f"开始为 {symbol} 获取基本信息...")
     try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.info
+        # 使用抽象接口获取数据
+        info = data_source.get_security_info(symbol)
 
-        if not info or info.get('quoteType') is None:
+        if not info:
             logger.warning(f"无法获取 {symbol} 的有效信息，可能已退市或代码无效。将is_active设为False。")
-            security_id = db_manager.get_or_create_security_id(symbol)
             with db_manager.get_session() as session:
-                session.query(Security).filter(Security.id == security_id).update({'is_active': False})
+                # 尝试找到记录并更新，如果找不到则不操作
+                session.query(Security).filter(Security.symbol == symbol).update({'is_active': False})
             return
 
-        market, asset_type = _map_yfinance_ticker_to_market_type(symbol)
+        # 使用新的映射函数
+        market, asset_type = _map_yfinance_info_to_types(symbol, info)
 
         security_data = {
             'symbol': symbol,
@@ -63,10 +92,11 @@ def update_stock_info(db_manager: DatabaseManager, symbol: str, force_update: bo
         db_manager.upsert_security_info(security_data)
 
     except Exception as e:
-        logger.error(f"为 {symbol} 更新基本信息时出错: {e}")
+        logger.error(f"为 {symbol} 更新基本信息时出错: {e}", exc_info=True)
 
 
 def reverse_engineer_adj_factors(df: pd.DataFrame) -> pd.DataFrame:
+    # ... 此函数内部逻辑不变 ...
     logger.info("开始简化计算复权因子 (v2 - 已修正)...")
     df_copy = df.copy()
     if 'Stock Splits' in df_copy.columns:
@@ -113,81 +143,69 @@ def reverse_engineer_adj_factors(df: pd.DataFrame) -> pd.DataFrame:
     return df_copy[final_ordered_cols]
 
 
-def update_historical_data(db_manager: DatabaseManager, symbol: str, full_refresh: bool = False):
-    """
-    更新股票的历史价格数据。
-    默认为增量更新，可选择全量刷新。
-    增量更新时会验证最新一天数据的复权因子(adj_factor)，若不一致则自动触发全量刷新。
-    成功后，更新 Security 表中的状态。
-    """
+def update_historical_data(db_manager: DatabaseManager, symbol: str, data_source: DataSourceInterface,
+                           full_refresh: bool = False):
+    """使用传入的 data_source 更新历史价格数据"""
     try:
         security_id = db_manager.get_or_create_security_id(symbol)
         if not security_id:
             logger.error(f"无法为 {symbol} 获取或创建 security_id，跳过历史数据更新。")
             return
-        ticker = yf.Ticker(symbol)
 
-        # --- 核心逻辑重构：基于 adj_factor 的验证 ---
         if not full_refresh:
-            # 1. 获取数据库中最新的价格记录详情
             latest_db_details = db_manager.get_latest_daily_price_details(security_id)
             if latest_db_details:
                 verification_date = latest_db_details['date']
                 stored_adj_factor = latest_db_details['adj_factor']
 
-                # 2. 从数据源获取验证日及之后的数据
-                #    我们至少需要验证日当天的数据来进行比较。
                 logger.info(
                     f"开始为 {symbol} (ID: {security_id}) 执行【增量更新】，从 {verification_date} 开始获取数据以进行验证...")
-                # 为了确保因子计算的上下文，可以多获取几天，但yfinance通常能处理好
                 start_date_for_fetch = verification_date
-                df = ticker.history(start=start_date_for_fetch, interval="1d", auto_adjust=False)
+                # 使用抽象接口获取数据
+                df = data_source.get_historical_data(symbol, start=start_date_for_fetch.strftime('%Y-%m-%d'),
+                                                     interval="1d", auto_adjust=False)
+
                 if df.empty:
-                    logger.warning(f"[{symbol}] 在 {start_date_for_fetch} 之后没有从雅虎获取到新数据，可能已是最新。")
-                    # 确保 Security 表中的最新日期是正确的
+                    logger.warning(f"[{symbol}] 在 {start_date_for_fetch} 之后没有从数据源获取到新数据，可能已是最新。")
                     db_manager.update_security_latest_price_date(security_id, verification_date)
                     return
-                # 3. 对获取的新数据计算复权因子
+
                 processed_df_for_check = reverse_engineer_adj_factors(df.copy())
                 processed_df_for_check.reset_index(inplace=True)
 
-                # 在新数据中找到验证日期的行
                 check_row = processed_df_for_check[processed_df_for_check['Date'].dt.date == verification_date]
                 if not check_row.empty:
                     new_adj_factor = check_row.iloc[0]['adj_factor']
-                    # 4. 比较复权因子
                     if not np.isclose(stored_adj_factor, new_adj_factor, atol=1e-6):
                         logger.warning(
                             f"[{symbol}] 数据校验失败: 日期 {verification_date} 的 adj_factor 不匹配。"
                             f"数据库值: {stored_adj_factor:.6f}, 新计算值: {new_adj_factor:.6f}。触发全量更新！"
                         )
-                        # 触发全量更新并直接返回
-                        update_historical_data(db_manager, symbol, full_refresh=True)
+                        update_historical_data(db_manager, symbol, data_source, full_refresh=True)
                         return
                     else:
                         logger.info(f"[{symbol}] 数据校验通过，日期 {verification_date} 的 adj_factor 一致。")
-                        # 校验通过，df 变量中已包含最新数据，直接进入后续合并流程
                 else:
                     logger.warning(
-                        f"[{symbol}] 从雅虎获取的数据中不包含验证日期 {verification_date}，将尝试全量更新以修复。")
-                    update_historical_data(db_manager, symbol, full_refresh=True)
+                        f"[{symbol}] 从数据源获取的数据中不包含验证日期 {verification_date}，将尝试全量更新以修复。")
+                    update_historical_data(db_manager, symbol, data_source, full_refresh=True)
                     return
-            else:  # 如果数据库中没有任何数据
+            else:
                 logger.info(f"数据库中无 {symbol} (ID: {security_id}) 数据，自动执行【首次全量获取】...")
                 full_refresh = True
-        # --- 核心逻辑重构结束 ---
-        # 全量更新或首次获取的逻辑
+
         if full_refresh:
             logger.info(f"开始为 {symbol} (ID: {security_id}) 执行【全量刷新】...")
-            df = ticker.history(period="max", interval="1d", auto_adjust=False)
-        # else: 增量更新时，df 变量已在上面被赋值并验证通过，无需重新获取
+            # 使用抽象接口获取数据
+            df = data_source.get_historical_data(symbol, period="max", interval="1d", auto_adjust=False)
+
         if df.empty:
             logger.warning(f"{symbol} 在指定时间段内没有可用的历史价格数据。")
             last_db_date = db_manager.get_last_price_date(security_id)
             if last_db_date:
                 db_manager.update_security_latest_price_date(security_id, last_db_date)
             return
-        # 对最终的DataFrame（无论是全量的还是增量的）进行处理
+
         processed_df = reverse_engineer_adj_factors(df.copy())
         processed_df.reset_index(inplace=True)
         prices_to_insert = [
@@ -205,15 +223,16 @@ def update_historical_data(db_manager: DatabaseManager, symbol: str, full_refres
                 'cal_event_factor': row.get('cal_event_factor')
             } for row in processed_df.to_dict('records')
         ]
+
         if not prices_to_insert:
             logger.warning(f"为 {symbol} 处理后没有价格数据可插入。")
             return
-        # 使用 bulk_upsert 高效插入或更新数据
+
         db_manager.bulk_upsert(DailyPrice, prices_to_insert, ['security_id', 'date'])
-        # 更新 Security 表中的最新日期状态
+
         latest_date_in_batch = max(p['date'] for p in prices_to_insert)
         db_manager.update_security_latest_price_date(security_id, latest_date_in_batch)
-        # 更新公司行动数据
+
         actions_to_insert = []
         actions_df = processed_df[(processed_df['Dividends'] > 0) | (
                 (processed_df['split_ratio'] > 0) & (processed_df['split_ratio'] != 1.0))]
@@ -226,14 +245,15 @@ def update_historical_data(db_manager: DatabaseManager, symbol: str, full_refres
                 actions_to_insert.append(
                     {'security_id': security_id, 'event_date': row['Date'].date(), 'event_type': ActionType.SPLIT,
                      'value': row['split_ratio']})
+
         if actions_to_insert:
             db_manager.bulk_upsert(CorporateAction, actions_to_insert,
                                    ['security_id', 'event_date', 'event_type'],
                                    constraint='_security_date_type_uc')
 
-        # 如果是全量刷新成功，则更新时间戳
         if full_refresh:
             db_manager.update_security_full_refresh_timestamp(security_id)
+
     except Exception as e:
         logger.error(f"为 {symbol} 更新历史数据时出错: {e}", exc_info=True)
 
