@@ -125,7 +125,7 @@ def main():
 
             security_id, security_market, _ = security_details
 
-            latest_market_trade_date = db_manager.get_latest_trading_day(security_market, today - timedelta(days=1))
+            latest_market_trade_date = db_manager.get_latest_trading_day(security_market, today)
             if not latest_market_trade_date:
                 logger.error(f"无法获取 {security_market} 市场的交易日历信息，跳过 {symbol} 的价格更新。")
                 continue
