@@ -115,7 +115,7 @@ def update_historical_data(db_manager: DatabaseManager, symbol: str, full_refres
     """
     更新股票的历史价格数据。
     默认为增量更新，可选择全量刷新。
-    增量更新时会验证最新一天的数据，若不一致则自动触发全量刷新。
+    增量更新时会验证最新一天数据的复权因子(adj_factor)，若不一致则自动触发全量刷新。
     成功后，更新 Security 表中的状态。
     """
     try:
@@ -123,73 +123,71 @@ def update_historical_data(db_manager: DatabaseManager, symbol: str, full_refres
         if not security_id:
             logger.error(f"无法为 {symbol} 获取或创建 security_id，跳过历史数据更新。")
             return
-
         ticker = yf.Ticker(symbol)
 
-        # --- 修改: 增量更新逻辑重构 ---
+        # --- 核心逻辑重构：基于 adj_factor 的验证 ---
         if not full_refresh:
-            last_date = db_manager.get_last_price_date(security_id)
-            if last_date:
-                # 需求1：增量更新时，查询数据库记录的日期之后的日期的，同时再往前多查询一天。
-                verification_date = last_date
-                start_date = verification_date - timedelta(days=1)
+            # 1. 获取数据库中最新的价格记录详情
+            latest_db_details = db_manager.get_latest_daily_price_details(security_id)
+            if latest_db_details:
+                verification_date = latest_db_details['date']
+                stored_adj_factor = latest_db_details['adj_factor']
 
+                # 2. 从数据源获取验证日及之后的数据
+                #    我们至少需要验证日当天的数据来进行比较。
                 logger.info(
-                    f"开始为 {symbol} (ID: {security_id}) 执行【增量更新】，从 {start_date} 开始获取数据以进行验证...")
-                df = ticker.history(start=start_date, interval="1d", auto_adjust=False)
+                    f"开始为 {symbol} (ID: {security_id}) 执行【增量更新】，从 {verification_date} 开始获取数据以进行验证...")
+                # 为了确保因子计算的上下文，可以多获取几天，但yfinance通常能处理好
+                start_date_for_fetch = verification_date
+                df = ticker.history(start=start_date_for_fetch, interval="1d", auto_adjust=False)
+                if df.empty:
+                    logger.warning(f"[{symbol}] 在 {start_date_for_fetch} 之后没有从雅虎获取到新数据，可能已是最新。")
+                    # 确保 Security 表中的最新日期是正确的
+                    db_manager.update_security_latest_price_date(security_id, verification_date)
+                    return
+                # 3. 对获取的新数据计算复权因子
+                processed_df_for_check = reverse_engineer_adj_factors(df.copy())
+                processed_df_for_check.reset_index(inplace=True)
 
-                if not df.empty:
-                    # 对获取的新数据进行处理
-                    processed_df_for_check = reverse_engineer_adj_factors(df.copy())
-                    processed_df_for_check.reset_index(inplace=True)
-
-                    # 获取数据库中存储的用于验证的记录
-                    db_record = db_manager.get_daily_price_for_date(security_id, verification_date)
-                    # 在新获取的数据中找到验证日期的行
-                    check_row = processed_df_for_check[processed_df_for_check['Date'].dt.date == verification_date]
-
-                    if db_record and not check_row.empty:
-                        stored_adj_close = db_record.adj_close
-                        new_adj_close = check_row.iloc[0]['Adj Close']
-
-                        # 比较adj_close，如果差异大于一个极小值，则认为不符
-                        if not np.isclose(float(stored_adj_close), new_adj_close, atol=1e-4):
-                            logger.warning(
-                                f"[{symbol}] 数据校验失败: 日期 {verification_date} 的 adj_close 不匹配。"
-                                f"数据库值: {stored_adj_close}, 新计算值: {new_adj_close}。触发全量更新！"
-                            )
-                            # 触发全量更新并直接返回，避免后续的增量逻辑
-                            update_historical_data(db_manager, symbol, full_refresh=True)
-                            return
-                        else:
-                            logger.info(f"[{symbol}] 数据校验通过，日期 {verification_date} 的 adj_close 一致。")
-                    else:
+                # 在新数据中找到验证日期的行
+                check_row = processed_df_for_check[processed_df_for_check['Date'].dt.date == verification_date]
+                if not check_row.empty:
+                    new_adj_factor = check_row.iloc[0]['adj_factor']
+                    # 4. 比较复权因子
+                    if not np.isclose(stored_adj_factor, new_adj_factor, atol=1e-6):
                         logger.warning(
-                            f"[{symbol}] 无法在获取的数据或数据库中找到 {verification_date} 的记录进行校验，将继续执行增量更新。")
-
-            else:  # 如果数据库中没有数据，自动转为全量更新
+                            f"[{symbol}] 数据校验失败: 日期 {verification_date} 的 adj_factor 不匹配。"
+                            f"数据库值: {stored_adj_factor:.6f}, 新计算值: {new_adj_factor:.6f}。触发全量更新！"
+                        )
+                        # 触发全量更新并直接返回
+                        update_historical_data(db_manager, symbol, full_refresh=True)
+                        return
+                    else:
+                        logger.info(f"[{symbol}] 数据校验通过，日期 {verification_date} 的 adj_factor 一致。")
+                        # 校验通过，df 变量中已包含最新数据，直接进入后续合并流程
+                else:
+                    logger.warning(
+                        f"[{symbol}] 从雅虎获取的数据中不包含验证日期 {verification_date}，将尝试全量更新以修复。")
+                    update_historical_data(db_manager, symbol, full_refresh=True)
+                    return
+            else:  # 如果数据库中没有任何数据
                 logger.info(f"数据库中无 {symbol} (ID: {security_id}) 数据，自动执行【首次全量获取】...")
                 full_refresh = True
-        # --- 修改结束 ---
-
+        # --- 核心逻辑重构结束 ---
         # 全量更新或首次获取的逻辑
         if full_refresh:
             logger.info(f"开始为 {symbol} (ID: {security_id}) 执行【全量刷新】...")
             df = ticker.history(period="max", interval="1d", auto_adjust=False)
-        else:  # 如果增量更新校验通过，df 变量已经有数据了，无需重新获取
-            logger.info(f"继续为 {symbol} (ID: {security_id}) 执行【增量数据合并】...")
-            # df 变量已在上面的增量逻辑中被赋值
-
+        # else: 增量更新时，df 变量已在上面被赋值并验证通过，无需重新获取
         if df.empty:
             logger.warning(f"{symbol} 在指定时间段内没有可用的历史价格数据。")
             last_db_date = db_manager.get_last_price_date(security_id)
             if last_db_date:
                 db_manager.update_security_latest_price_date(security_id, last_db_date)
             return
-
+        # 对最终的DataFrame（无论是全量的还是增量的）进行处理
         processed_df = reverse_engineer_adj_factors(df.copy())
         processed_df.reset_index(inplace=True)
-
         prices_to_insert = [
             {
                 'security_id': security_id,
@@ -205,20 +203,18 @@ def update_historical_data(db_manager: DatabaseManager, symbol: str, full_refres
                 'cal_event_factor': row.get('cal_event_factor')
             } for row in processed_df.to_dict('records')
         ]
-
         if not prices_to_insert:
             logger.warning(f"为 {symbol} 处理后没有价格数据可插入。")
             return
-
+        # 使用 bulk_upsert 高效插入或更新数据
         db_manager.bulk_upsert(DailyPrice, prices_to_insert, ['security_id', 'date'])
-
+        # 更新 Security 表中的最新日期状态
         latest_date_in_batch = max(p['date'] for p in prices_to_insert)
         db_manager.update_security_latest_price_date(security_id, latest_date_in_batch)
-
+        # 更新公司行动数据
         actions_to_insert = []
         actions_df = processed_df[(processed_df['Dividends'] > 0) | (
                 (processed_df['split_ratio'] > 0) & (processed_df['split_ratio'] != 1.0))]
-
         for row in actions_df.to_dict('records'):
             if row['Dividends'] > 0:
                 actions_to_insert.append(
@@ -228,15 +224,14 @@ def update_historical_data(db_manager: DatabaseManager, symbol: str, full_refres
                 actions_to_insert.append(
                     {'security_id': security_id, 'event_date': row['Date'].date(), 'event_type': ActionType.SPLIT,
                      'value': row['split_ratio']})
-
         if actions_to_insert:
             db_manager.bulk_upsert(CorporateAction, actions_to_insert,
                                    ['security_id', 'event_date', 'event_type'],
                                    constraint='_security_date_type_uc')
 
+        # 如果是全量刷新成功，则更新时间戳
         if full_refresh:
             db_manager.update_security_full_refresh_timestamp(security_id)
-
     except Exception as e:
         logger.error(f"为 {symbol} 更新历史数据时出错: {e}", exc_info=True)
 

@@ -66,21 +66,19 @@ def main():
             update_stock_info(db_manager, symbol)
 
             # --- 核心逻辑修改 ---
-            security = db_manager.get_security_by_symbol(symbol)
-            if not security or not security.is_active:
+            security_details = db_manager.get_security_details_for_update(symbol)
+            if not security_details or not security_details.is_active:
                 logger.warning(f"无法找到 {symbol} 的有效记录或该股票已标记为不活跃，跳过价格更新。")
                 continue
 
+            security_id, security_market, _ = security_details
             # 获取该市场的最后一个实际交易日
-            latest_market_trade_date = db_manager.get_latest_trading_day(security.market, today)
-
+            latest_market_trade_date = db_manager.get_latest_trading_day(security_market, today)
             if not latest_market_trade_date:
-                logger.error(f"无法获取 {security.market} 市场的交易日历信息，跳过 {symbol} 的价格更新。")
+                logger.error(f"无法获取 {security_market} 市场的交易日历信息，跳过 {symbol} 的价格更新。")
                 continue
-
             # 获取该股票在数据库中的最新日期
-            last_db_date = db_manager.get_last_price_date(security.id)
-
+            last_db_date = db_manager.get_last_price_date(security_id)
             # 决定是否需要更新价格数据
             needs_price_update = False
             if last_db_date is None:
@@ -90,22 +88,17 @@ def main():
                 needs_price_update = True
                 logger.info(
                     f"[{symbol}] 数据落后 (数据库最新: {last_db_date}, 市场最新: {latest_market_trade_date})，需要更新。")
-
             if not needs_price_update:
                 logger.info(f"[{symbol}] 价格数据已是最新 ({last_db_date})，无需更新。")
                 logger.info(f"========== 完成处理 {symbol} ==========\n")
                 continue
             # --- 核心逻辑修改结束 ---
-
             # 确定是否需要全量刷新 (强制命令行 > 自动周期)
             is_full_refresh_final = is_full_refresh or (symbol in auto_full_refresh_symbols)
-
             if is_full_refresh_final and not is_full_refresh:
                 logger.info(f"[{symbol}] 触发自动全量更新周期。")
-
             # 执行历史数据更新
             update_historical_data(db_manager, symbol, full_refresh=is_full_refresh_final)
-
             logger.info(f"========== 完成处理 {symbol} ==========\n")
 
     except Exception as e:

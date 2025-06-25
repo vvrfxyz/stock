@@ -1,6 +1,8 @@
 # db_manager.py
 import os
 from contextlib import contextmanager
+from typing import Optional, Tuple
+
 from loguru import logger
 from dotenv import load_dotenv
 from datetime import date, datetime
@@ -83,20 +85,6 @@ class DatabaseManager:
                 {'full_data_last_updated_at': func.now()}
             )
             logger.info(f"已更新 security_id={security_id} 的全量数据更新时间戳。")
-
-    def get_daily_price_for_date(self, security_id: int, date_val: date) -> DailyPrice | None:
-        """
-        获取指定 security_id 和 date 的 DailyPrice 记录。
-        :param security_id: 证券ID。
-        :param date_val: 日期。
-        :return: DailyPrice 对象或 None。
-        """
-        with self.get_session() as session:
-            record = session.query(DailyPrice).filter_by(
-                security_id=security_id,
-                date=date_val
-            ).first()
-            return record
 
     def create_tables(self):
         logger.info("正在创建数据库表（如果不存在）...")
@@ -186,6 +174,47 @@ class DatabaseManager:
         """通过股票代码获取完整的 Security 对象"""
         with self.get_session() as session:
             return session.query(Security).filter(Security.symbol == symbol).first()
+
+    def get_latest_daily_price_details(self, security_id: int) -> Optional[dict]:
+        """
+        获取指定 security_id 最新的 DailyPrice 记录的核心验证字段。
+        返回一个字典，而不是绑定的ORM对象，以避免会话问题。
+
+        :param security_id: 证券ID。
+        :return: 包含 'date' 和 'adj_factor' 的字典，或在无记录时返回 None。
+        """
+        with self.get_session() as session:
+            latest_record = session.query(
+                DailyPrice.date,
+                DailyPrice.adj_factor
+            ).filter(
+                DailyPrice.security_id == security_id
+            ).order_by(
+                DailyPrice.date.desc()
+            ).first()
+            if latest_record:
+                # 返回一个普通字典，这是安全的
+                return {
+                    'date': latest_record.date,
+                    'adj_factor': float(latest_record.adj_factor)
+                }
+
+            return None
+
+    def get_security_details_for_update(self, symbol: str) -> Optional[Tuple[int, MarketType, bool]]:
+        """
+        获取用于更新决策所需的核心安全信息，以避免传递游离对象。
+        :param symbol: 股票代码。
+        :return: 一个包含 (id, market, is_active) 的元组，如果找不到则返回 None。
+        """
+        with self.get_session() as session:
+            # 只查询我们需要的列
+            details = session.query(
+                Security.id,
+                Security.market,
+                Security.is_active
+            ).filter(Security.symbol == symbol).first()
+            return details  # SQLAlchemy 返回的是一个类似元组的 RowProxy 对象，这是安全的
 
     def get_latest_trading_day(self, market: MarketType, as_of_date: date) -> date | None:
         """
