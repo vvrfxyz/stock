@@ -4,3 +4,4 @@ yfinance
 pandas
 loguru
 python-dotenvexchange_calendars
+finnhub-python==2.4.23

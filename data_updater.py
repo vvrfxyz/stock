@@ -146,14 +146,7 @@ def reverse_engineer_adj_factors(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def update_historical_data(db_manager: DatabaseManager, symbol: str, data_source: DataSourceInterface,
-                           full_refresh: bool = False,
-                           secondary_source_for_comparison: Optional[DataSourceInterface] = None):
-    if secondary_source_for_comparison:
-        try:
-            compare_data_sources(symbol, data_source, secondary_source_for_comparison)
-        except Exception as e:
-            logger.error(f"[{symbol}] 在进行数据源对比时发生错误: {e}", exc_info=True)
-
+                           full_refresh: bool = False):
     """使用传入的 data_source 更新历史价格数据"""
     try:
         security_id = db_manager.get_or_create_security_id(symbol)
@@ -265,56 +258,3 @@ def update_historical_data(db_manager: DatabaseManager, symbol: str, data_source
 
     except Exception as e:
         logger.error(f"为 {symbol} 更新历史数据时出错: {e}", exc_info=True)
-
-
-def compare_data_sources(symbol: str, source1: DataSourceInterface, source2: DataSourceInterface, days: int = 60):
-    """
-    比较两个数据源在最近一段时间内的历史数据差异。
-    :param symbol: 证券代码。
-    :param source1: 第一个数据源实例 (主源)。
-    :param source2: 第二个数据源实例 (对比源)。
-    :param days: 对比最近多少天的数据。
-    """
-    logger.info(f"[{symbol}] 开始对比数据源: {source1.__class__.__name__} (主) vs {source2.__class__.__name__} (副)")
-    start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-    # 从两个源获取数据
-    df1 = source1.get_historical_data(symbol, start=start_date)
-    df2 = source2.get_historical_data(symbol, start=start_date)
-    if df1.empty or df2.empty:
-        logger.warning(f"[{symbol}] 数据对比中止：一个或两个数据源未能返回数据。 "
-                       f"{source1.__class__.__name__} 行数: {len(df1)}, {source2.__class__.__name__} 行数: {len(df2)}")
-        return
-    # 重命名列以便合并
-    df1 = df1[['Open', 'High', 'Low', 'Close', 'Volume']].add_suffix('_main')
-    df2 = df2[['Open', 'High', 'Low', 'Close', 'Volume']].add_suffix('_comp')
-    # 合并数据
-    merged_df = pd.merge(df1, df2, left_index=True, right_index=True, how='inner')
-    if merged_df.empty:
-        logger.warning(f"[{symbol}] 数据对比中止：两个数据源的日期索引没有重叠部分。")
-        return
-    logger.info(f"[{symbol}] 在过去 {days} 天内，两个数据源共有 {len(merged_df)} 个重叠的交易日进行对比。")
-    # 计算差异
-    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-        main_col = f'{col}_main'
-        comp_col = f'{col}_comp'
-        diff_col = f'{col}_diff_pct'
-        # 避免除以零
-        merged_df[diff_col] = 100 * (merged_df[main_col] - merged_df[comp_col]) / merged_df[comp_col].replace(0, np.nan)
-
-        # 统计分析
-        mean_diff = merged_df[diff_col].mean()
-        max_diff = merged_df[diff_col].max()
-        min_diff = merged_df[diff_col].min()
-        if pd.notna(mean_diff):
-            logger.info(f"[{symbol}] 对比字段 '{col}': "
-                        f"平均差异 = {mean_diff:.4f}%, "
-                        f"最大差异 = {max_diff:.4f}%, "
-                        f"最小差异 = {min_diff:.4f}%")
-        else:
-            logger.info(f"[{symbol}] 对比字段 '{col}': 无法计算差异（可能数据相同或NaN）。")
-    # 找出差异最大的一天并显示
-    merged_df['Close_abs_diff'] = (merged_df['Close_main'] - merged_df['Close_comp']).abs()
-    if not merged_df.empty and 'Close_abs_diff' in merged_df.columns and merged_df['Close_abs_diff'].notna().any():
-        max_diff_day = merged_df.nlargest(1, 'Close_abs_diff')
-        logger.info(
-            f"[{symbol}] 收盘价绝对差异最大的一天:\n{max_diff_day[['Close_main', 'Close_comp', 'Volume_main', 'Volume_comp']]}")
