@@ -21,6 +21,8 @@ def _map_yfinance_ticker_to_market_type(symbol: str) -> tuple[MarketType, AssetT
 
 def update_stock_info(db_manager: DatabaseManager, symbol: str, force_update: bool = False):
 
+    symbol = symbol.lower()
+
     if not force_update:
         with db_manager.get_session() as session:
             security = session.query(Security.info_last_updated_at).filter(Security.symbol == symbol).first()

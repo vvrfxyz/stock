@@ -1,5 +1,6 @@
 # data_models/models.py
 import enum
+import random as py_random  # 1. 导入标准的 random 模块并使用别名
 from sqlalchemy import (
     create_engine, Column, Integer, String, Date, Boolean, Numeric,
     ForeignKey, UniqueConstraint, Enum, BigInteger, Text, TIMESTAMP
@@ -7,7 +8,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ENUM
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.sql import func
-from sqlalchemy.sql.functions import random
+from sqlalchemy.sql.functions import random  # SQLAlchemy 的 random 保持不变
 
 Base = declarative_base()
 
@@ -68,7 +69,8 @@ class Security(Base):
     # 新增: 用于实现需求 2 (自动全量刷新)
     full_data_last_updated_at = Column(TIMESTAMP(timezone=True), nullable=True,
                                        comment="上一次全量历史数据更新的成功时间")
-    full_refresh_interval = Column(Integer, nullable=False, default=lambda: random.randint(25, 40),
+    # 2. 修改 default lambda 函数以使用正确的 random 模块
+    full_refresh_interval = Column(Integer, nullable=False, default=lambda: py_random.randint(25, 40),
                                    comment="自动全量刷新的随机周期（天）")
 
 class DailyPrice(Base):
@@ -118,4 +120,3 @@ class HistoricalShare(Base):
     float_shares = Column(BigInteger, nullable=True)
 
     __table_args__ = (UniqueConstraint('security_id', 'change_date', name='_security_change_date_uc'),)
-

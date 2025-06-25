@@ -92,6 +92,7 @@ class DatabaseManager:
         logger.success("数据库表检查/创建完成。")
 
     def get_or_create_security_id(self, symbol: str, defaults: dict = None) -> int:
+        symbol = symbol.lower()
         with self.get_session() as session:
             security = session.query(Security).filter_by(symbol=symbol).first()
             if security:
