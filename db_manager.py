@@ -5,11 +5,11 @@ from loguru import logger
 from dotenv import load_dotenv
 from datetime import date, datetime
 
-from sqlalchemy import create_engine, desc, or_
+from sqlalchemy import create_engine, desc, or_, func
 from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert, INTERVAL
 
-from data_models.models import Base, Security, DailyPrice, CorporateAction
+from data_models.models import Base, Security, DailyPrice, CorporateAction, MarketType, TradingCalendar
 
 load_dotenv()
 
@@ -47,6 +47,42 @@ class DatabaseManager:
             raise
         finally:
             session.close()
+
+    def is_trading_day(self, market: MarketType, check_date: date) -> bool:
+        """检查指定市场和日期是否为交易日"""
+        with self.get_session() as session:
+            # 这里假设 TradingCalendar 表已经填充了数据
+            # 可以使用 exchange_calendars 库来填充这个表
+            exists = session.query(TradingCalendar.id).filter_by(
+                market=market,
+                trade_date=check_date
+            ).first()
+            return exists is not None
+
+    def get_securities_for_auto_full_refresh(self) -> list[str]:
+        """获取达到自动全量刷新周期的股票列表"""
+        with self.get_session() as session:
+            # 使用数据库的日期/时间函数进行计算
+            # a. full_data_last_updated_at IS NULL (从未全量更新过)
+            # b. NOW() > full_data_last_updated_at + (full_refresh_interval * '1 day'::interval) (已到更新周期)
+            # 注意: '1 day'::interval 是 PostgreSQL 语法，其他数据库可能不同
+            securities_to_refresh = session.query(Security.symbol).filter(
+                Security.is_active == True,
+                or_(
+                    Security.full_data_last_updated_at.is_(None),
+                    func.now() > Security.full_data_last_updated_at +
+                    (Security.full_refresh_interval * func.cast('1 day', INTERVAL))  # sqlalchemy interval
+                )
+            ).all()
+            return [s[0] for s in securities_to_refresh]
+
+    def update_security_full_refresh_timestamp(self, security_id: int):
+        """当全量刷新成功后，更新时间戳"""
+        with self.get_session() as session:
+            session.query(Security).filter(Security.id == security_id).update(
+                {'full_data_last_updated_at': func.now()}
+            )
+            logger.info(f"已更新 security_id={security_id} 的全量数据更新时间戳。")
 
     def get_daily_price_for_date(self, security_id: int, date_val: date) -> DailyPrice | None:
         """
@@ -138,6 +174,7 @@ class DatabaseManager:
         stmt = pg_insert(Security).values(security_data)
         update_cols = {col.name: col for col in stmt.excluded if
                        col.name not in ['symbol', 'id', 'price_data_latest_date']}
+        update_cols['info_last_updated_at'] = func.now()
         stmt = stmt.on_conflict_do_update(index_elements=['symbol'], set_=update_cols)
 
         with self.engine.connect() as conn:

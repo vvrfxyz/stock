@@ -7,6 +7,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ENUM
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.sql import func
+from sqlalchemy.sql.functions import random
 
 Base = declarative_base()
 
@@ -34,6 +35,15 @@ class ActionType(enum.Enum):
     BONUS = 'BONUS'
 
 
+class TradingCalendar(Base):
+    """存储各市场的交易日信息"""
+    __tablename__ = 'trading_calendars'
+    id = Column(Integer, primary_key=True)
+    market = Column(ENUM(MarketType, name='market_type'), nullable=False, index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+
+    __table_args__ = (UniqueConstraint('market', 'trade_date', name='_market_trade_date_uc'),)
+
 class Security(Base):
     __tablename__ = 'securities'
     id = Column(Integer, primary_key=True)
@@ -45,12 +55,21 @@ class Security(Base):
     currency = Column(String(10))
     sector = Column(String(100))
     industry = Column(String(100))
-    is_active = Column(Boolean, default=True)
+    is_active = Column(Boolean, default=True, index=True)
     list_date = Column(Date)
     delist_date = Column(Date)
-    last_updated = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
-    info_last_updated = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+    # --- 核心状态追踪字段 ---
+    last_updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(),
+                             comment="记录行任意更新的时间")
+    info_last_updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(),
+                                  comment="基本信息（info）上次成功更新的时间")
     price_data_latest_date = Column(Date, nullable=True, index=True, comment="日线价格数据覆盖的最新日期")
+
+    # 新增: 用于实现需求 2 (自动全量刷新)
+    full_data_last_updated_at = Column(TIMESTAMP(timezone=True), nullable=True,
+                                       comment="上一次全量历史数据更新的成功时间")
+    full_refresh_interval = Column(Integer, nullable=False, default=lambda: random.randint(25, 40),
+                                   comment="自动全量刷新的随机周期（天）")
 
 class DailyPrice(Base):
     __tablename__ = 'daily_prices'

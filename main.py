@@ -42,41 +42,52 @@ def main():
     db_manager = None
     try:
         db_manager = DatabaseManager()
+        today = date.today()
 
-        # (可选) 首次运行时，或修改模型后，运行此命令创建/更新表结构
-        # db_manager.create_tables()
+        # 1. 确定需要自动全量刷新的股票
+        auto_full_refresh_symbols = set(db_manager.get_securities_for_auto_full_refresh())
+        if auto_full_refresh_symbols:
+            logger.info(
+                f"检测到 {len(auto_full_refresh_symbols)} 支股票需要自动全量刷新: {', '.join(list(auto_full_refresh_symbols)[:5])}...")
 
-        # --- 修改: 根据解析的参数确定要处理的股票列表 ---
-        symbols_to_process = []
-        if target_symbols:
-            # 如果命令行指定了股票代码，则只处理这些股票
-            symbols_to_process = target_symbols
-        elif is_full_refresh:
-            # 如果指定了全量刷新但未指定股票，则处理所有活跃股票
-            with db_manager.get_session() as session:
-                results = session.query(Security.symbol).filter(Security.is_active == True).all()
-                symbols_to_process = [r[0] for r in results]
-                logger.info(f"全量刷新模式：找到 {len(symbols_to_process)} 个活跃股票进行处理。")
+        # 2. 确定需要增量更新的股票
+        # (可以复用你已有的 get_securities_to_update 逻辑)
+        incremental_update_symbols = set(db_manager.get_securities_to_update(target_date=today))
+
+        # 3. 合并并确定最终处理列表
+        symbols_to_process = set()
+        if target_symbols:  # 如果命令行指定了股票
+            symbols_to_process = set(target_symbols)
         else:
-            # 默认情况，增量更新所有数据落后的股票
-            today = date.today()
-            symbols_to_process = db_manager.get_securities_to_update(target_date=today)
-        # --- 修改结束 ---
-
+            symbols_to_process = auto_full_refresh_symbols.union(incremental_update_symbols)
         if not symbols_to_process:
             logger.info("没有需要更新的股票。程序执行完毕。")
             return
-
         for symbol in symbols_to_process:
             logger.info(f"========== 开始处理 {symbol} ==========")
 
-            # 1. 更新基本信息 (如果股票失效，会自动标记)
+            # 获取股票基本信息，特别是 market
+            security = db_manager.get_security_by_symbol(symbol)  # 假设有这个helper
+            if not security:
+                logger.warning(f"无法在数据库中找到 {symbol} 的记录，跳过。")
+                continue
+            # 需求 1: 检查是否为交易日
+            is_trading_day = db_manager.is_trading_day(security.market, today)
+
+            # 无论是否交易日，都可尝试更新 info (内部有30天冷却)
+            # 这满足了“非交易日只触发info检测”的需求
             update_stock_info(db_manager, symbol)
+            if not is_trading_day:
+                logger.info(f"今天是 {security.market} 市场的非交易日，跳过 {symbol} 的价格数据更新。")
+                continue
+            # 确定是否需要全量刷新
+            # 强制全量刷新 > 自动全量刷新
+            is_full_refresh_final = is_full_refresh or (symbol in auto_full_refresh_symbols)
 
-            # 2. 更新历史数据
-            # 即使只指定了股票代码，is_full_refresh 标志依然有效，用于强制全量更新
-            update_historical_data(db_manager, symbol, full_refresh=is_full_refresh)
-
+            if is_full_refresh_final and not is_full_refresh:
+                logger.info(f"[{symbol}] 触发自动全量更新。")
+            # 更新历史数据
+            update_historical_data(db_manager, symbol, full_refresh=is_full_refresh_final)
             logger.info(f"========== 完成处理 {symbol} ==========\n")
 
     except Exception as e:

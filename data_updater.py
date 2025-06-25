@@ -20,7 +20,7 @@ def _map_yfinance_ticker_to_market_type(symbol: str) -> tuple[MarketType, AssetT
 
 
 def update_stock_info(db_manager: DatabaseManager, symbol: str, force_update: bool = False):
-    
+
     if not force_update:
         with db_manager.get_session() as session:
             security = session.query(Security.info_last_updated).filter(Security.symbol == symbol).first()
@@ -233,6 +233,9 @@ def update_historical_data(db_manager: DatabaseManager, symbol: str, full_refres
             db_manager.bulk_upsert(CorporateAction, actions_to_insert,
                                    ['security_id', 'event_date', 'event_type'],
                                    constraint='_security_date_type_uc')
+
+        if full_refresh:
+            db_manager.update_security_full_refresh_timestamp(security_id)
 
     except Exception as e:
         logger.error(f"为 {symbol} 更新历史数据时出错: {e}", exc_info=True)
