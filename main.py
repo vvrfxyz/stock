@@ -24,13 +24,20 @@ def main():
     """主执行函数"""
     setup_logging()
 
-    # --- OPTIMIZATION START: 解析命令行参数以控制刷新模式 ---
-    is_full_refresh = '--full-refresh' in sys.argv
+    # --- 修改: 解析命令行参数以支持多种模式 ---
+    args = sys.argv[1:]
+    is_full_refresh = '--full-refresh' in args
+    # 筛选出非标志的参数，作为股票代码
+    target_symbols = [arg for arg in args if not arg.startswith('--')]
+
     if is_full_refresh:
         logger.warning("检测到 --full-refresh 参数，将对所有目标股票执行【全量数据更新】。")
+
+    if target_symbols:
+        logger.info(f"指定模式：将只处理以下股票: {', '.join(target_symbols)}")
     else:
-        logger.info("将执行默认的【增量更新】模式。使用 --full-refresh 可强制全量更新。")
-    # --- OPTIMIZATION END ---
+        logger.info("默认模式：将自动检测并更新所有数据落后的股票。")
+    # --- 修改结束 ---
 
     db_manager = None
     try:
@@ -39,16 +46,22 @@ def main():
         # (可选) 首次运行时，或修改模型后，运行此命令创建/更新表结构
         # db_manager.create_tables()
 
-        if is_full_refresh:
+        # --- 修改: 根据解析的参数确定要处理的股票列表 ---
+        symbols_to_process = []
+        if target_symbols:
+            # 如果命令行指定了股票代码，则只处理这些股票
+            symbols_to_process = target_symbols
+        elif is_full_refresh:
+            # 如果指定了全量刷新但未指定股票，则处理所有活跃股票
             with db_manager.get_session() as session:
                 results = session.query(Security.symbol).filter(Security.is_active == True).all()
                 symbols_to_process = [r[0] for r in results]
                 logger.info(f"全量刷新模式：找到 {len(symbols_to_process)} 个活跃股票进行处理。")
         else:
-            # 以当天日期为基准，找出所有数据落后的股票
+            # 默认情况，增量更新所有数据落后的股票
             today = date.today()
             symbols_to_process = db_manager.get_securities_to_update(target_date=today)
-        # --- OPTIMIZATION END ---
+        # --- 修改结束 ---
 
         if not symbols_to_process:
             logger.info("没有需要更新的股票。程序执行完毕。")
@@ -60,7 +73,8 @@ def main():
             # 1. 更新基本信息 (如果股票失效，会自动标记)
             update_stock_info(db_manager, symbol)
 
-            # 2. 更新历史数据，并传入刷新模式标志
+            # 2. 更新历史数据
+            # 即使只指定了股票代码，is_full_refresh 标志依然有效，用于强制全量更新
             update_historical_data(db_manager, symbol, full_refresh=is_full_refresh)
 
             logger.info(f"========== 完成处理 {symbol} ==========\n")
@@ -78,4 +92,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

@@ -48,6 +48,20 @@ class DatabaseManager:
         finally:
             session.close()
 
+    def get_daily_price_for_date(self, security_id: int, date_val: date) -> DailyPrice | None:
+        """
+        获取指定 security_id 和 date 的 DailyPrice 记录。
+        :param security_id: 证券ID。
+        :param date_val: 日期。
+        :return: DailyPrice 对象或 None。
+        """
+        with self.get_session() as session:
+            record = session.query(DailyPrice).filter_by(
+                security_id=security_id,
+                date=date_val
+            ).first()
+            return record
+
     def create_tables(self):
         logger.info("正在创建数据库表（如果不存在）...")
         Base.metadata.create_all(self.engine)
