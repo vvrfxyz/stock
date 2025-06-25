@@ -3,8 +3,9 @@ import os
 from contextlib import contextmanager
 from loguru import logger
 from dotenv import load_dotenv
+from datetime import date
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, desc
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -60,20 +61,17 @@ class DatabaseManager:
         Base.metadata.create_all(self.engine)
         logger.success("数据库表检查/创建完成。")
 
-    # --- 【关键修改】 ---
     def get_or_create_security_id(self, symbol: str, defaults: dict = None) -> int:
         """
         根据 symbol 获取或创建 Security 记录，并返回其 ID。
         :return: Security 记录的主键 ID (int)。
         """
         with self.get_session() as session:
-            # 尝试查找现有的记录
             security_id = session.query(Security.id).filter_by(symbol=symbol).scalar()
             if security_id:
                 logger.trace(f"在数据库中找到 Security: {symbol}, ID: {security_id}")
                 return security_id
 
-            # 如果不存在，则创建新记录
             logger.info(f"数据库中未找到 {symbol}，将创建新记录。")
             if defaults is None:
                 defaults = {}
@@ -81,11 +79,32 @@ class DatabaseManager:
             params = {'symbol': symbol, **defaults}
             security = Security(**params)
             session.add(security)
-            session.flush()  # 将更改写入数据库以获取 ID
+            session.flush()
 
             new_id = security.id
             logger.info(f"已为 {symbol} 创建 Security 记录，ID: {new_id}")
             return new_id
+
+    # --- OPTIMIZATION START: 新增方法 ---
+    def get_last_price_date(self, security_id: int) -> date | None:
+        """
+        查询指定 security_id 在数据库中的最新价格日期。
+        :param security_id: 证券的ID。
+        :return: 最新的日期 (datetime.date)，如果不存在则返回 None。
+        """
+        with self.get_session() as session:
+            last_record = session.query(DailyPrice.date).filter(
+                DailyPrice.security_id == security_id
+            ).order_by(desc(DailyPrice.date)).first()
+
+            if last_record:
+                logger.debug(f"找到 security_id={security_id} 的最新数据日期: {last_record[0]}")
+                return last_record[0]
+
+            logger.info(f"数据库中未找到 security_id={security_id} 的任何价格数据。")
+            return None
+
+    # --- OPTIMIZATION END ---
 
     def upsert_security_info(self, security_data: dict):
         stmt = pg_insert(Security).values(security_data)
@@ -111,3 +130,4 @@ class DatabaseManager:
             conn.execute(stmt)
             conn.commit()
         logger.success(f"成功批量更新/插入 {len(data)} 条记录到 {model_class.__tablename__}。")
+
