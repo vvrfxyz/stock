@@ -6,7 +6,8 @@ from loguru import logger
 from datetime import datetime, timedelta
 
 from db_manager import DatabaseManager
-from data_models.models import MarketType, AssetType, ActionType, DailyPrice, CorporateAction, SpecialAdjustment
+from data_models.models import MarketType, AssetType, ActionType, DailyPrice, CorporateAction, SpecialAdjustment, \
+    Security
 
 
 def _map_yfinance_ticker_to_market_type(symbol: str) -> tuple[MarketType, AssetType]:
@@ -25,7 +26,12 @@ def update_stock_info(db_manager: DatabaseManager, symbol: str):
         info = ticker.info
 
         if not info or info.get('quoteType') is None:
-            logger.warning(f"无法获取 {symbol} 的有效信息，可能已退市或代码无效。跳过。")
+            logger.warning(f"无法获取 {symbol} 的有效信息，可能已退市或代码无效。将is_active设为False。")
+            # --- OPTIMIZATION START: 如果股票无效，则在数据库中标记为非活跃 ---
+            security_id = db_manager.get_or_create_security_id(symbol)
+            with db_manager.get_session() as session:
+                session.query(Security).filter(Security.id == security_id).update({'is_active': False})
+            # --- OPTIMIZATION END ---
             return
 
         market, asset_type = _map_yfinance_ticker_to_market_type(symbol)
@@ -39,7 +45,9 @@ def update_stock_info(db_manager: DatabaseManager, symbol: str):
             'currency': info.get('currency'),
             'sector': info.get('sector'),
             'industry': info.get('industry'),
-            'is_active': True
+            'is_active': True,  # 确保获取到信息的股票是活跃的
+            'list_date': pd.to_datetime(info.get('firstTradeDateEpochUtc'), unit='s').date() if info.get(
+                'firstTradeDateEpochUtc') else None
         }
 
         security_data = {k: v for k, v in security_data.items() if v is not None}
@@ -50,7 +58,7 @@ def update_stock_info(db_manager: DatabaseManager, symbol: str):
 
 
 def reverse_engineer_adj_factors(df: pd.DataFrame) -> pd.DataFrame:
-    # ... (此函数内容无变化, 故省略以保持简洁)
+    # ... (此函数内容无变化)
     logger.info("开始简化计算复权因子 (v2 - 已修正)...")
     df_copy = df.copy()
     if 'Stock Splits' in df_copy.columns:
@@ -97,49 +105,50 @@ def reverse_engineer_adj_factors(df: pd.DataFrame) -> pd.DataFrame:
     return df_copy[final_ordered_cols]
 
 
-# --- OPTIMIZATION START: 修改函数签名和实现 ---
 def update_historical_data(db_manager: DatabaseManager, symbol: str, full_refresh: bool = False):
     """
     更新股票的历史价格数据。
     默认为增量更新，可选择全量刷新。
-    :param db_manager: DatabaseManager 实例。
-    :param symbol: 股票代码。
-    :param full_refresh: 若为 True，则强制获取全部历史数据。
+    成功后，更新 Security 表中的状态。
     """
     try:
+        # --- OPTIMIZATION: 在获取数据前先获取ID，并使用新的 get_last_price_date ---
         security_id = db_manager.get_or_create_security_id(symbol)
+        if not security_id:
+            logger.error(f"无法为 {symbol} 获取或创建 security_id，跳过历史数据更新。")
+            return
+
         ticker = yf.Ticker(symbol)
         start_date = None
 
         if full_refresh:
-            logger.info(f"开始为 {symbol} 执行【全量刷新】...")
-            # 使用 period='max' 进行全量获取
+            logger.info(f"开始为 {symbol} (ID: {security_id}) 执行【全量刷新】...")
             df = ticker.history(period="max", interval="1d", auto_adjust=False)
         else:
-            # 增量更新逻辑
             last_date = db_manager.get_last_price_date(security_id)
             if last_date:
-                # 从已知的最后一天开始获取，以覆盖当天可能的数据修正
-                start_date = last_date
-                logger.info(f"开始为 {symbol} 执行【增量更新】，从 {start_date} 开始...")
+                start_date = last_date - timedelta(days=2)  # 多获取几天以防数据修正
+                logger.info(f"开始为 {symbol} (ID: {security_id}) 执行【增量更新】，从 {start_date} 开始...")
                 df = ticker.history(start=start_date, interval="1d", auto_adjust=False)
             else:
-                # 数据库中无数据，自动执行首次全量获取
-                logger.info(f"数据库中无 {symbol} 数据，自动执行【首次全量获取】...")
+                logger.info(f"数据库中无 {symbol} (ID: {security_id}) 数据，自动执行【首次全量获取】...")
                 df = ticker.history(period="max", interval="1d", auto_adjust=False)
 
         if df.empty:
             logger.warning(f"{symbol} 在指定时间段内没有可用的历史价格数据。")
+            # --- OPTIMIZATION START: 如果没有获取到数据，但之前有，则更新状态为最后一天 ---
+            last_db_date = db_manager.get_last_price_date(security_id)
+            if last_db_date:
+                db_manager.update_security_latest_price_date(security_id, last_db_date)
+            # --- OPTIMIZATION END ---
             return
-# --- OPTIMIZATION END ---
 
-        # 以下数据处理和入库逻辑保持不变
         processed_df = reverse_engineer_adj_factors(df.copy())
         processed_df.reset_index(inplace=True)
 
-        prices_to_insert = []
-        for row in processed_df.to_dict('records'):
-            prices_to_insert.append({
+        prices_to_insert = [
+            # ... (字典推导式保持不变)
+            {
                 'security_id': security_id,
                 'date': row['Date'].date(),
                 'open': row['Open'],
@@ -151,10 +160,21 @@ def update_historical_data(db_manager: DatabaseManager, symbol: str, full_refres
                 'adj_factor': row.get('adj_factor'),
                 'event_factor': row.get('event_factor'),
                 'cal_event_factor': row.get('cal_event_factor')
-            })
+            } for row in processed_df.to_dict('records')
+        ]
+
+        if not prices_to_insert:
+            logger.warning(f"为 {symbol} 处理后没有价格数据可插入。")
+            return
 
         db_manager.bulk_upsert(DailyPrice, prices_to_insert, ['security_id', 'date'])
 
+        # --- OPTIMIZATION START: 数据入库后，更新状态 ---
+        latest_date_in_batch = max(p['date'] for p in prices_to_insert)
+        db_manager.update_security_latest_price_date(security_id, latest_date_in_batch)
+        # --- OPTIMIZATION END ---
+
+        # ... (CorporateAction 的处理逻辑保持不变) ...
         actions_to_insert = []
         actions_df = processed_df[(processed_df['Dividends'] > 0) | (
                 (processed_df['split_ratio'] > 0) & (processed_df['split_ratio'] != 1.0))]
@@ -173,6 +193,7 @@ def update_historical_data(db_manager: DatabaseManager, symbol: str, full_refres
             db_manager.bulk_upsert(CorporateAction, actions_to_insert,
                                    ['security_id', 'event_date', 'event_type'],
                                    constraint='_security_date_type_uc')
+
 
     except Exception as e:
         logger.error(f"为 {symbol} 更新历史数据时出错: {e}", exc_info=True)

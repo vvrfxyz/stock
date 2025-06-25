@@ -10,8 +10,7 @@ from sqlalchemy.sql import func
 
 Base = declarative_base()
 
-# 自定义 Enum 类型需要先在数据库中创建 (CREATE TYPE ...)，SQLAlchemy 只是引用它们
-# 如果不希望手动创建，可以传递 native_enum=False，但建议保持 native 以获得最佳性能
+
 class MarketType(enum.Enum):
     CNA = 'CNA'
     HK = 'HK'
@@ -20,12 +19,14 @@ class MarketType(enum.Enum):
     FOREX = 'FOREX'
     INDEX = 'INDEX'
 
+
 class AssetType(enum.Enum):
     STOCK = 'STOCK'
     ETF = 'ETF'
     INDEX = 'INDEX'
     CRYPTO = 'CRYPTO'
     FOREX = 'FOREX'
+
 
 class ActionType(enum.Enum):
     DIVIDEND = 'DIVIDEND'
@@ -48,7 +49,11 @@ class Security(Base):
     list_date = Column(Date)
     delist_date = Column(Date)
     last_updated = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
-    
+    # --- OPTIMIZATION START: 增加新字段以追踪数据更新状态 ---
+    price_data_latest_date = Column(Date, nullable=True, index=True, comment="日线价格数据覆盖的最新日期")
+    # --- OPTIMIZATION END ---
+
+
 class DailyPrice(Base):
     __tablename__ = 'daily_prices'
     security_id = Column(Integer, primary_key=True)
@@ -64,6 +69,7 @@ class DailyPrice(Base):
     event_factor = Column(Numeric(20, 6), nullable=False, server_default='1.0')
     cal_event_factor = Column(Numeric(20, 6), nullable=False, server_default='1.0')
 
+
 class CorporateAction(Base):
     __tablename__ = 'corporate_actions'
     id = Column(Integer, primary_key=True)
@@ -71,8 +77,9 @@ class CorporateAction(Base):
     event_date = Column(Date, nullable=False, index=True)
     event_type = Column(ENUM(ActionType, name='action_type'), nullable=False)
     value = Column(Numeric(20, 10), nullable=False)
-    
+
     __table_args__ = (UniqueConstraint('security_id', 'event_date', 'event_type', name='_security_date_type_uc'),)
+
 
 class SpecialAdjustment(Base):
     __tablename__ = 'special_adjustments'
@@ -81,8 +88,9 @@ class SpecialAdjustment(Base):
     event_date = Column(Date, nullable=False)
     adjustment_factor = Column(Numeric(20, 10), nullable=False)
     description = Column(Text)
-    
+
     __table_args__ = (UniqueConstraint('security_id', 'event_date', name='_security_date_uc'),)
+
 
 class HistoricalShare(Base):
     __tablename__ = 'historical_shares'
@@ -91,5 +99,6 @@ class HistoricalShare(Base):
     change_date = Column(Date, nullable=False, index=True)
     total_shares = Column(BigInteger, nullable=True)
     float_shares = Column(BigInteger, nullable=True)
-    
+
     __table_args__ = (UniqueConstraint('security_id', 'change_date', name='_security_change_date_uc'),)
+
