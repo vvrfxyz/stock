@@ -19,7 +19,16 @@ def _map_yfinance_ticker_to_market_type(symbol: str) -> tuple[MarketType, AssetT
     return MarketType.US, AssetType.STOCK
 
 
-def update_stock_info(db_manager: DatabaseManager, symbol: str):
+def update_stock_info(db_manager: DatabaseManager, symbol: str, force_update: bool = False):
+    
+    if not force_update:
+        with db_manager.get_session() as session:
+            security = session.query(Security.info_last_updated).filter(Security.symbol == symbol).first()
+            # 如果记录存在，且更新时间在30天内，则跳过
+            if security and security.info_last_updated > (datetime.now() - timedelta(days=30)):
+                logger.trace(f"[{symbol}] 的基本信息在30天内已更新，跳过此次API请求。")
+                return
+
     logger.info(f"开始为 {symbol} 获取基本信息...")
     try:
         ticker = yf.Ticker(symbol)

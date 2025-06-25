@@ -49,10 +49,8 @@ class Security(Base):
     list_date = Column(Date)
     delist_date = Column(Date)
     last_updated = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
-    # --- OPTIMIZATION START: 增加新字段以追踪数据更新状态 ---
+    info_last_updated = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
     price_data_latest_date = Column(Date, nullable=True, index=True, comment="日线价格数据覆盖的最新日期")
-    # --- OPTIMIZATION END ---
-
 
 class DailyPrice(Base):
     __tablename__ = 'daily_prices'
