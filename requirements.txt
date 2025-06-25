@@ -3,4 +3,4 @@ psycopg2-binary
 yfinance
 pandas
 loguru
-python-dotenv
+python-dotenvexchange_calendars

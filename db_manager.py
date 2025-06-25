@@ -182,6 +182,25 @@ class DatabaseManager:
             conn.commit()
         logger.success(f"成功更新/插入 Security 信息: {security_data.get('symbol')}")
 
+    def get_security_by_symbol(self, symbol: str) -> Security | None:
+        """通过股票代码获取完整的 Security 对象"""
+        with self.get_session() as session:
+            return session.query(Security).filter(Security.symbol == symbol).first()
+
+    def get_latest_trading_day(self, market: MarketType, as_of_date: date) -> date | None:
+        """
+        获取指定市场在 as_of_date 或之前的最后一个交易日。
+        :param market: 市场类型。
+        :param as_of_date: 查询的截止日期。
+        :return: 最后一个交易日的日期，如果日历中没有数据则返回 None。
+        """
+        with self.get_session() as session:
+            latest_trade_date = session.query(func.max(TradingCalendar.trade_date)).filter(
+                TradingCalendar.market == market,
+                TradingCalendar.trade_date <= as_of_date
+            ).scalar()
+            return latest_trade_date
+
     def bulk_upsert(self, model_class, data: list[dict], index_elements: list[str], constraint: str = None):
         if not data:
             logger.info(f"没有 {model_class.__tablename__} 数据需要更新。")

@@ -3,7 +3,7 @@ import numpy as np
 import yfinance as yf
 import pandas as pd
 from loguru import logger
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from db_manager import DatabaseManager
 from data_models.models import MarketType, AssetType, ActionType, DailyPrice, CorporateAction, SpecialAdjustment, \
@@ -23,9 +23,9 @@ def update_stock_info(db_manager: DatabaseManager, symbol: str, force_update: bo
 
     if not force_update:
         with db_manager.get_session() as session:
-            security = session.query(Security.info_last_updated).filter(Security.symbol == symbol).first()
+            security = session.query(Security.info_last_updated_at).filter(Security.symbol == symbol).first()
             # 如果记录存在，且更新时间在30天内，则跳过
-            if security and security.info_last_updated > (datetime.now() - timedelta(days=30)):
+            if security and security.info_last_updated_at > (datetime.now(timezone.utc) - timedelta(days=30)):
                 logger.trace(f"[{symbol}] 的基本信息在30天内已更新，跳过此次API请求。")
                 return
 

@@ -48,11 +48,14 @@ def populate_trading_calendars():
                 calendar = xcals.get_calendar(calendar_name)
 
                 # 获取指定范围内的所有有效交易日
-                # a.tz_localize(None).date 将带时区的时间戳转换为纯日期对象
-                valid_days = calendar.valid_days(
-                    start_date=f'{START_YEAR}-01-01',
-                    end_date=f'{END_YEAR}-12-31'
-                )
+                # calendar.schedule 是一个包含所有交易日的 DataFrame
+                schedule = calendar.schedule
+
+                # 筛选出指定年份范围内的日期
+                start_date_str = f'{START_YEAR}-01-01'
+                end_date_str = f'{END_YEAR}-12-31'
+                valid_days = schedule.loc[start_date_str:end_date_str].index
+
 
                 market_entries = [
                     {
@@ -78,7 +81,9 @@ def populate_trading_calendars():
         db_manager.bulk_upsert(
             model_class=TradingCalendar,
             data=all_calendar_entries,
-            # 使用你在 TradingCalendar 模型中定义的唯一约束名称
+            # 明确提供构成唯一约束的列
+            index_elements=['market', 'trade_date'],
+            # 同时提供约束名称，可以提高性能
             constraint='_market_trade_date_uc'
         )
 
@@ -93,5 +98,8 @@ def populate_trading_calendars():
 
 if __name__ == "__main__":
     # 配置日志，以便在控制台看到输出
-    logger.add(sys.stderr, level="INFO")
-    populate_trading_calendars()
+    if __name__ == "__main__":
+        # 配置日志，确保只有一个控制台输出
+        logger.remove()  # 移除所有已有的处理器
+        logger.add(sys.stderr, level="INFO")  # 添加我们想要的处理器
+        populate_trading_calendars()
