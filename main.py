@@ -7,11 +7,13 @@ from loguru import logger
 
 from db_manager import DatabaseManager
 from data_updater import update_stock_info, update_historical_data
-# 导入具体的数据源实现
+# 导入所有具体的数据源实现
 from data_sources.yfinance_source import YFinanceSource
+from data_sources.finnhub_source import FinnhubSource
 
 
 def setup_logging():
+    # ... 函数保持不变 ...
     """配置 Loguru 日志记录器。"""
     logger.remove()
     logger.add(sys.stderr, level="INFO",
@@ -38,6 +40,14 @@ def parse_arguments():
         action='store_true',  # 存储为 True/False
         help="对所有目标股票强制执行全量数据更新，忽略增量更新逻辑。"
     )
+    # --- 新增参数 ---
+    parser.add_argument(
+        '--source',
+        type=str,
+        choices=['yfinance', 'finnhub'],
+        default='yfinance',
+        help="选择主数据源 (默认为 yfinance)。将使用另一数据源进行对比。"
+    )
     return parser.parse_args()
 
 
@@ -48,6 +58,7 @@ def main():
 
     is_full_refresh = args.full_refresh
     target_symbols = [symbol.lower() for symbol in args.symbols]
+    primary_source_name = args.source
 
     if is_full_refresh:
         logger.warning("检测到 --full-refresh 参数，将对所有目标股票执行【全量数据更新】。")
@@ -60,10 +71,21 @@ def main():
     db_manager = None
     try:
         db_manager = DatabaseManager()
-        # 实例化数据源，未来若有其他源，在此处切换即可
-        data_source = YFinanceSource()
+
+        # --- 修改：实例化所有数据源 ---
+        logger.info("正在初始化所有数据源...")
+        all_sources = {
+            'yfinance': YFinanceSource(),
+            'finnhub': FinnhubSource()
+        }
+        primary_data_source = all_sources[primary_source_name]
+        secondary_data_source = all_sources['finnhub' if primary_source_name == 'yfinance' else 'yfinance']
+        logger.success(f"主数据源: {primary_data_source.__class__.__name__}, "
+                       f"对比数据源: {secondary_data_source.__class__.__name__}")
+
         today = date.today()
 
+        # ... 后续的 symbols_to_process 获取逻辑保持不变 ...
         if target_symbols:
             symbols_to_process = set(target_symbols)
             auto_full_refresh_symbols = set(db_manager.get_securities_for_auto_full_refresh()).intersection(
@@ -84,11 +106,12 @@ def main():
 
         logger.info(f"共找到 {len(symbols_to_process)} 支股票待处理。")
 
+
         for symbol in sorted(list(symbols_to_process)):
             logger.info(f"========== 开始处理 {symbol} ==========")
 
-            # 注入 data_source 依赖
-            update_stock_info(db_manager, symbol, data_source)
+            # 使用主数据源更新基本信息
+            update_stock_info(db_manager, symbol, primary_data_source)
 
             security_details = db_manager.get_security_details_for_update(symbol)
             if not security_details or not security_details.is_active:
@@ -97,6 +120,7 @@ def main():
 
             security_id, security_market, _ = security_details
 
+            # ... 后续的更新决策逻辑保持不变 ...
             latest_market_trade_date = db_manager.get_latest_trading_day(security_market, today - timedelta(days=1))
             if not latest_market_trade_date:
                 logger.error(f"无法获取 {security_market} 市场的交易日历信息，跳过 {symbol} 的价格更新。")
@@ -122,8 +146,14 @@ def main():
             if is_full_refresh_final and not is_full_refresh:
                 logger.info(f"[{symbol}] 触发自动全量更新周期。")
 
-            # 注入 data_source 依赖
-            update_historical_data(db_manager, symbol, data_source, full_refresh=is_full_refresh_final)
+            # --- 修改：调用更新函数时传入两个数据源 ---
+            update_historical_data(
+                db_manager,
+                symbol,
+                data_source=primary_data_source,
+                full_refresh=is_full_refresh_final,
+                secondary_source_for_comparison=secondary_data_source
+            )
             logger.info(f"========== 完成处理 {symbol} ==========\n")
 
     except Exception as e:
@@ -139,4 +169,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
