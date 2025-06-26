@@ -1,4 +1,11 @@
 # scripts/import_em_us_stocks.py
+import sys
+import os
+
+# 将项目根目录添加到Python路径中，以便可以导入其他模块
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, project_root)
+
 from data_models.models import Security, MarketType, AssetType
 from data_sources.yfinance_source import YFinanceSource
 from db_manager import DatabaseManager
@@ -6,18 +13,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from loguru import logger
 import json
-import sys
-import os
 import time  # 1. 导入 time 模块
 from datetime import datetime
 
-# 将项目根目录添加到Python路径中，以便可以导入其他模块
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.insert(0, project_root)
-
 
 # --- 配置区 ---
-JSON_FILE_PATH = os.path.join(project_root, 'us_stock_spot_data.json')
+JSON_FILE_PATH = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')), 'us_stock_spot_data.json')
 
 
 def setup_logging():
@@ -25,7 +26,7 @@ def setup_logging():
     logger.remove()
     logger.add(sys.stderr, level="INFO",
                format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>")
-    log_dir = os.path.join(project_root, "logs")
+    log_dir = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')), "logs")
     os.makedirs(log_dir, exist_ok=True)
     logger.add(os.path.join(
         log_dir, "import_em_us_{time}.log"), rotation="10 MB", retention="10 days", level="DEBUG")
