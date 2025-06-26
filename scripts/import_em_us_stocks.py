@@ -24,7 +24,7 @@ JSON_FILE_PATH = os.path.join(os.path.abspath(os.path.join(
 def setup_logging():
     """配置 Loguru 日志记录器"""
     logger.remove()
-    logger.add(sys.stderr, level="INFO",
+    logger.add(sys.stderr, level="DEBUG",
                format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>")
     log_dir = os.path.join(os.path.abspath(
         os.path.join(os.path.dirname(__file__), '..')), "logs")
@@ -183,7 +183,7 @@ def import_stocks(db_manager: DatabaseManager, yfinance_source: YFinanceSource, 
                 'list_date': yf_info.get('list_date'),
                 'is_active': stock_data.get('最新价') is not None and yf_info.get('regularMarketPrice') is not None
             }
-
+            logger.debug(f"准备创建 Security 对象，数据: {new_security_data}")
             try:
                 new_security = Security(**new_security_data)
                 session.add(new_security)

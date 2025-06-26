@@ -42,9 +42,10 @@ class DatabaseManager:
         session = self._session_factory()
         try:
             yield session
-            session.commit()
+            # session.commit()
         except Exception as e:
-            logger.error(f"Session 回滚，原因: {e}")
+            logger.error(f"Session 上下文管理器捕获到异常，将执行回滚。原因: {e}")
+            logger.critical(f"异常详情: {type(e).__name__} - {e}", exc_info=True)
             session.rollback()
             raise
         finally:
