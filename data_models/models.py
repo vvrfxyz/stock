@@ -81,6 +81,8 @@ class Security(Base):
                                        comment="上一次全量历史数据更新的成功时间")
     full_refresh_interval = Column(Integer, nullable=False, default=lambda: py_random.randint(25, 40),
                                    comment="自动全量刷新的随机周期（天）")
+    actions_last_updated_at = Column(TIMESTAMP(timezone=True), nullable=True,
+                                     comment="公司行动数据（分红/拆股）上次成功更新的时间")
     # MODIFIED: 调整唯一性约束，确保 (标准代码, 市场, 类型) 是唯一的
     __table_args__ = (UniqueConstraint('symbol', 'market', 'type', name='_symbol_market_type_uc'),)
 

@@ -87,6 +87,29 @@ class DatabaseManager:
             )
             logger.info(f"已更新 security_id={security_id} 的全量数据更新时间戳。")
 
+    def has_corporate_actions(self, security_id: int) -> bool:
+        """
+        快速检查指定的 security_id 是否在 CorporateAction 表中存在任何记录。
+
+        :param security_id: 证券ID。
+        :return: 如果存在记录则返回 True，否则返回 False。
+        """
+        with self.get_session() as session:
+            # 使用 .first() 是最高效的方式，因为它找到第一条记录后就会停止查询
+            exists = session.query(CorporateAction.id).filter(
+                CorporateAction.security_id == security_id
+            ).first()
+            return exists is not None
+
+    def update_security_actions_timestamp(self, security_id: int):
+        """当公司行动数据成功同步后，更新时间戳"""
+        with self.get_session() as session:
+            session.query(Security).filter(Security.id == security_id).update(
+                {'actions_last_updated_at': func.now()}
+            )
+            session.commit()  # 确保立即提交这个单一的更新
+            logger.debug(f"已更新 security_id={security_id} 的公司行动数据更新时间戳。")
+
     def create_tables(self):
         logger.info("正在创建数据库表（如果不存在）...")
         Base.metadata.create_all(self.engine)
