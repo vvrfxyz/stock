@@ -1,4 +1,13 @@
 # scripts/import_em_us_stocks.py
+from datetime import datetime
+import time  # 1. 导入 time 模块
+import json
+from loguru import logger
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from db_manager import DatabaseManager
+from data_sources.yfinance_source import YFinanceSource
+from data_models.models import Security, MarketType, AssetType
 import sys
 import os
 
@@ -6,19 +15,10 @@ import os
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, project_root)
 
-from data_models.models import Security, MarketType, AssetType
-from data_sources.yfinance_source import YFinanceSource
-from db_manager import DatabaseManager
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
-from loguru import logger
-import json
-import time  # 1. 导入 time 模块
-from datetime import datetime
-
 
 # --- 配置区 ---
-JSON_FILE_PATH = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')), 'us_stock_spot_data.json')
+JSON_FILE_PATH = os.path.join(os.path.abspath(os.path.join(
+    os.path.dirname(__file__), '..')), 'us_stock_spot_data.json')
 
 
 def setup_logging():
@@ -26,7 +26,8 @@ def setup_logging():
     logger.remove()
     logger.add(sys.stderr, level="INFO",
                format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>")
-    log_dir = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')), "logs")
+    log_dir = os.path.join(os.path.abspath(
+        os.path.join(os.path.dirname(__file__), '..')), "logs")
     os.makedirs(log_dir, exist_ok=True)
     logger.add(os.path.join(
         log_dir, "import_em_us_{time}.log"), rotation="10 MB", retention="10 days", level="DEBUG")
@@ -67,7 +68,7 @@ def get_yfinance_info_with_retry(yfinance_source: YFinanceSource, symbol: str) -
             logger.error(f"第 {attempt + 1} 次尝试获取 '{symbol}' 信息时出错: {e}")
             if attempt == 0:  # 如果是第一次失败
                 logger.warning("等待 60 秒后重试...")
-                time.sleep(60)
+                time.sleep(65)
             else:  # 如果是第二次失败
                 logger.critical("重试失败，yfinance API 可能无法访问。根据指令，终止脚本运行。")
                 sys.exit(1)  # 终止程序
