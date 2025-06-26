@@ -3,5 +3,6 @@ psycopg2-binary
 yfinance
 pandas
 loguru
-python-dotenvexchange_calendars
+python-dotenv
+exchange_calendars
 finnhub-python==2.4.23

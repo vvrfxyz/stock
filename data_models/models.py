@@ -1,6 +1,5 @@
-# data_models/models.py
 import enum
-import random as py_random  # 1. 导入标准的 random 模块并使用别名
+import random as py_random
 from sqlalchemy import (
     create_engine, Column, Integer, String, Date, Boolean, Numeric,
     ForeignKey, UniqueConstraint, Enum, BigInteger, Text, TIMESTAMP
@@ -8,15 +7,14 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ENUM
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.sql import func
-from sqlalchemy.sql.functions import random  # SQLAlchemy 的 random 保持不变
 
 Base = declarative_base()
 
 
 class MarketType(enum.Enum):
-    CNA = 'CNA'
-    HK = 'HK'
-    US = 'US'
+    CNA = 'CNA'  # 中国A股
+    HK = 'HK'  # 港股
+    US = 'US'  # 美股
     CRYPTO = 'CRYPTO'
     FOREX = 'FOREX'
     INDEX = 'INDEX'
@@ -28,6 +26,10 @@ class AssetType(enum.Enum):
     INDEX = 'INDEX'
     CRYPTO = 'CRYPTO'
     FOREX = 'FOREX'
+    PREFERRED_STOCK = 'PREFERRED_STOCK'
+    WARRANT = 'WARRANT'
+    OTC = 'OTC'
+    MUTUAL_FUND = 'MUTUAL_FUND'
 
 
 class ActionType(enum.Enum):
@@ -42,51 +44,79 @@ class TradingCalendar(Base):
     id = Column(Integer, primary_key=True)
     market = Column(ENUM(MarketType, name='market_type'), nullable=False, index=True)
     trade_date = Column(Date, nullable=False, index=True)
-
     __table_args__ = (UniqueConstraint('market', 'trade_date', name='_market_trade_date_uc'),)
+
 
 class Security(Base):
     __tablename__ = 'securities'
     id = Column(Integer, primary_key=True)
-    symbol = Column(String(20), unique=True, nullable=False, index=True)
+
+    # MODIFIED: symbol现在存储标准、通用的代码 (如 '600519', 'NVDA')
+    symbol = Column(String(30), nullable=False, index=True, comment="标准化的证券代码 (如 600519, NVDA, 00700)")
+
+    # NEW: 新增字段，专门用于存储东方财富的原始代码
+    em_code = Column(String(30), unique=True, nullable=True, index=True,
+                     comment="东方财富专用代码 (如 106600519, 105.NVDA)")
+
     name = Column(String(255))
-    market = Column(ENUM(MarketType, name='market_type'), nullable=False)
+    market = Column(ENUM(MarketType, name='market_type'), nullable=False, index=True)  # MODIFIED: 增加索引
+
+    # MODIFIED: 扩展了 AssetType 枚举，以容纳更丰富的证券类型
     type = Column(ENUM(AssetType, name='asset_type'), nullable=False)
-    exchange = Column(String(50))
+
+    exchange = Column(String(50), comment="交易所 (如 SSE, SZSE, NASDAQ, NYSE, HKEX)")
     currency = Column(String(10))
     sector = Column(String(100))
     industry = Column(String(100))
     is_active = Column(Boolean, default=True, index=True)
     list_date = Column(Date)
     delist_date = Column(Date)
-    # --- 核心状态追踪字段 ---
+
     last_updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(),
                              comment="记录行任意更新的时间")
     info_last_updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(),
-                                  comment="基本信息（info）上次成功更新的时间")
+                                  comment="基本信息上次成功更新的时间")
     price_data_latest_date = Column(Date, nullable=True, index=True, comment="日线价格数据覆盖的最新日期")
-
-    # 新增: 用于实现需求 2 (自动全量刷新)
     full_data_last_updated_at = Column(TIMESTAMP(timezone=True), nullable=True,
                                        comment="上一次全量历史数据更新的成功时间")
-    # 2. 修改 default lambda 函数以使用正确的 random 模块
     full_refresh_interval = Column(Integer, nullable=False, default=lambda: py_random.randint(25, 40),
                                    comment="自动全量刷新的随机周期（天）")
+    # MODIFIED: 调整唯一性约束，确保 (标准代码, 市场, 类型) 是唯一的
+    __table_args__ = (UniqueConstraint('symbol', 'market', 'type', name='_symbol_market_type_uc'),)
+
 
 class DailyPrice(Base):
     __tablename__ = 'daily_prices'
-    security_id = Column(Integer, primary_key=True)
+    # MODIFIED: 复合主键，与 Security 表的 id 关联
+    security_id = Column(Integer, ForeignKey('securities.id'), primary_key=True)
     date = Column(Date, primary_key=True, index=True)
+
     open = Column(Numeric(19, 6))
     high = Column(Numeric(19, 6))
     low = Column(Numeric(19, 6))
     close = Column(Numeric(19, 6))
-    volume = Column(BigInteger)
-    adj_close = Column(Numeric(19, 6), nullable=True)
-    turnover_rate = Column(Numeric(10, 6), nullable=True)
-    adj_factor = Column(Numeric(20, 6), nullable=False, server_default='1.0')
+    volume = Column(BigInteger, comment="成交量（股）")
+
+    # NEW: 新增成交额字段
+    amount = Column(Numeric(25, 6), nullable=True, comment="成交额")
+
+    # NEW: 新增平均价字段 (虽然可计算，但根据要求添加)
+    avg_price = Column(Numeric(19, 6), nullable=True, comment="平均价 (成交额/成交量)")
+
+    # MODIFIED: 字段已存在，确认其用途
+    turnover_rate = Column(Numeric(10, 6), nullable=True, comment="换手率(%)")
+
+    adj_close = Column(Numeric(19, 6), nullable=True, comment="后复权收盘价")
+    adj_factor = Column(Numeric(20, 6), nullable=False, server_default='1.0', comment="后复权因子")
+
+    # 以下字段保留，用于更精确的复权计算
     event_factor = Column(Numeric(20, 6), nullable=False, server_default='1.0')
     cal_event_factor = Column(Numeric(20, 6), nullable=False, server_default='1.0')
+    # 关联到 Security 表
+    security = relationship("Security")
+
+    # 定义复合主键
+    __table_args__ = (UniqueConstraint('security_id', 'date', name='_security_id_date_uc'),)
 
 
 class CorporateAction(Base):
