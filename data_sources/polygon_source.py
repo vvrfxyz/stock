@@ -1,22 +1,21 @@
-# data_sources/polygon_source.py
+# data_sources/polygon_source.py (最终优化版)
 import os
-import time
 import pandas as pd
 from loguru import logger
 from typing import Optional, List, Dict, Any
 from datetime import date, datetime
-import threading
 
 from polygon import RESTClient
 from requests.exceptions import HTTPError
 
 from .base import DataSourceInterface
-
+from utils.key_rate_limiter import KeyRateLimiter # 引入新的类
 
 def _parse_date_string(date_str: str) -> Optional[date]:
     """安全地将 YYYY-MM-DD 格式的字符串解析为 date 对象"""
     if not date_str: return None
     try:
+        # 支持带'Z'的ISO 8601格式
         if 'Z' in date_str:
             return datetime.fromisoformat(date_str.replace('Z', '+00:00')).date()
         return date.fromisoformat(date_str)
@@ -24,41 +23,36 @@ def _parse_date_string(date_str: str) -> Optional[date]:
         return None
 
 
-# --- Main Class ---
 class PolygonSource(DataSourceInterface):
     """
-    使用 Polygon.io 作为数据源的实现，内置 API Key 轮询机制。
+    使用 Polygon.io 作为数据源的实现，通过 KeyRateLimiter 进行精准速率控制。
     """
 
-    def __init__(self, delay_between_calls: float = 0.2):
-        api_keys_str = os.getenv("POLYGON_API_KEYS")
-        if not api_keys_str:
-            raise ValueError("环境变量 POLYGON_API_KEYS 未设置。")
-        self.api_keys: List[str] = [key.strip() for key in api_keys_str.split(',') if key.strip()]
-        if not self.api_keys:
-            raise ValueError("环境变量 POLYGON_API_KEYS 中没有找到有效的 API Key。")
-        self._key_index: int = 0
-        self._lock = threading.Lock()
-        self.delay = delay_between_calls
-        logger.info(f"[PolygonSource] 初始化成功，加载了 {len(self.api_keys)} 个 API Key。")
+    def __init__(self, rate_limiter: KeyRateLimiter):
+        """
+        初始化 PolygonSource。
+        :param rate_limiter: 一个配置好的 KeyRateLimiter 实例。
+        """
+        self.rate_limiter = rate_limiter
+        logger.info("[PolygonSource] 初始化成功，将使用 KeyRateLimiter 进行API调用。")
 
     def _get_client(self) -> RESTClient:
-        with self._lock:
-            key_to_use = self.api_keys[self._key_index]
-            self._key_index = (self._key_index + 1) % len(self.api_keys)
-            logger.trace(f"使用 Polygon API Key (索引: {self._key_index})")
+        """通过速率限制器获取一个key，并创建API客户端。"""
+        key_to_use = self.rate_limiter.acquire_key()
         return RESTClient(key_to_use)
 
     def get_security_info(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        获取单个证券的详细信息。
+        速率控制由 _get_client() 内部处理。
+        """
         client = self._get_client()
-        time.sleep(self.delay)
         try:
             logger.debug(f"正在为 {symbol.upper()} 调用 Polygon Ticker Details API...")
             details = client.get_ticker_details(symbol.upper())
             address = getattr(details, 'address', None)
             branding = getattr(details, 'branding', None)
-            # **核心修改**: 直接构建字典，不在这里过滤 None 值。
-            # 这确保了如果 Polygon 返回一个字段但其值为 None，这个 None 会被传递下去。
+
             update_data = {
                 'symbol': symbol.lower(),
                 'is_active': getattr(details, 'active', None),
@@ -88,7 +82,10 @@ class PolygonSource(DataSourceInterface):
             }
             return update_data
         except HTTPError as e:
-            if e.response.status_code == 404:
+            if e.response.status_code == 429:
+                # 理论上，由于我们的精准控制，这个错误不应该频繁出现
+                logger.critical(f"[{symbol}] 遭遇速率限制 (429)! KeyRateLimiter 未能完全避免。请检查配置或网络延迟。")
+            elif e.response.status_code == 404:
                 logger.warning(f"[{symbol}] 在 Polygon API 中未找到 (404)。")
             else:
                 logger.error(f"[{symbol}] 请求 Polygon API 时发生 HTTP 错误: {e.response.status_code} - {e}")
@@ -102,13 +99,12 @@ class PolygonSource(DataSourceInterface):
                             start: Optional[str] = None,
                             end: Optional[str] = None,
                             ) -> pd.DataFrame:
+        """获取历史日线数据。"""
         client = self._get_client()
-        time.sleep(self.delay)
 
         if end is None:
             end = date.today().strftime('%Y-%m-%d')
         if start is None:
-            # Polygon免费API限制2年数据，这里不设默认start，让调用者决定
             logger.warning("get_historical_data 未提供 start 日期，可能获取全部可用历史（最多2年）。")
 
         try:
@@ -119,7 +115,7 @@ class PolygonSource(DataSourceInterface):
                 timespan='day',
                 from_=start,
                 to=end,
-                adjusted=False,  # 获取原始价格，复权由我们自己计算
+                adjusted=False,
                 limit=50000
             )
             if not resp:
@@ -131,13 +127,10 @@ class PolygonSource(DataSourceInterface):
 
             df.rename(columns={
                 'o': 'Open', 'h': 'High', 'l': 'Low', 'c': 'Close', 'v': 'Volume',
-                'vw': 'vwap'  # 直接获取VWAP作为平均价
+                'vw': 'vwap'
             }, inplace=True)
 
-            # 计算成交额
             df['turnover'] = df['Volume'] * df['vwap']
-
-            # 为兼容旧流程，添加空的'Dividends'和'Stock Splits'列
             df['Dividends'] = 0.0
             df['Stock Splits'] = 0.0
 
@@ -145,5 +138,3 @@ class PolygonSource(DataSourceInterface):
         except Exception as e:
             logger.error(f"为 {symbol} 从 Polygon 获取历史数据时出错: {e}", exc_info=True)
             return pd.DataFrame()
-
-
