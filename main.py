@@ -5,6 +5,7 @@ import argparse
 from datetime import datetime, date, timedelta
 from loguru import logger
 
+from data_sources.polygon_source import PolygonSource
 from db_manager import DatabaseManager
 from data_updater import update_stock_info, update_historical_data
 # 导入数据源实现
@@ -46,6 +47,13 @@ def parse_arguments():
         default='US',
         help="在执行前检查此交易所代码的开盘状态 (例如: US, HK)。如果开盘则程序退出。默认为 'US'。"
     )
+    parser.add_argument(
+        '--source',
+        type=str,
+        default='yfinance',
+        choices=['yfinance', 'polygon'],  # <--- 添加 'polygon' 选项
+        help="选择数据源: yfinance 或 polygon. 默认为 yfinance."
+    )
     return parser.parse_args()
 
 
@@ -86,8 +94,17 @@ def main():
 
         # --- 修改：实例化数据源 ---
         logger.info("正在初始化数据源...")
-        # 数据源固定为 YFinanceSource，移除了选择和对比逻辑
-        data_source = YFinanceSource()
+        if args.source == 'polygon':
+            try:
+                data_source = PolygonSource()
+                logger.success(f"数据源已设置为: PolygonSource")
+            except ValueError as e:
+                logger.critical(f"初始化 PolygonSource 失败: {e}")
+                return
+        else:  # 默认为 yfinance
+            data_source = YFinanceSource()
+            logger.success(f"数据源已设置为: YFinanceSource")
+
         logger.success(f"数据源已设置为: {data_source.__class__.__name__}")
 
         today = date.today()
