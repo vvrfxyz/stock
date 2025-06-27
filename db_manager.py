@@ -182,14 +182,31 @@ class DatabaseManager:
             logger.info(f"找到 {len(symbols)} 个需要更新数据的股票。")
             return symbols
 
-
     def upsert_security_info(self, security_data: dict):
+        """
+        智能地更新或插入 Security 信息。
+        在冲突时，只更新 security_data 字典中提供的字段，而不会覆盖其他字段（如 em_code）。
+        """
         stmt = pg_insert(Security).values(security_data)
-        update_cols = {col.name: col for col in stmt.excluded if
-                       col.name not in ['symbol', 'id', 'price_data_latest_date']}
-        update_cols['info_last_updated_at'] = func.now()
-        stmt = stmt.on_conflict_do_update(index_elements=['symbol'], set_=update_cols)
+        # 核心修改：只更新传入字典中存在的键对应的列
+        # 1. 获取传入数据的所有键
+        keys_to_update = security_data.keys()
 
+        # 2. 构建一个只包含这些键的更新字典
+        #    我们从 `stmt.excluded` 中获取值，这是 SQLAlchemy on_conflict 的标准做法。
+        #    我们还排除了唯一约束的键，因为它们不能在 UPDATE 部分被更新。
+        update_cols = {
+            key: getattr(stmt.excluded, key)
+            for key in keys_to_update
+            if key not in ['symbol', 'market', 'type', 'id']  # 排除唯一约束和主键
+        }
+        # 3. 无论如何都要更新时间戳
+        update_cols['info_last_updated_at'] = func.now()
+        # 4. 构建完整的 on_conflict 语句
+        stmt = stmt.on_conflict_do_update(
+            index_elements=['symbol', 'market', 'type'],
+            set_=update_cols
+        )
         with self.engine.connect() as conn:
             conn.execute(stmt)
             conn.commit()
