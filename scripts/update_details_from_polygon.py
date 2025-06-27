@@ -68,9 +68,6 @@ def update_security_details(db_manager: DatabaseManager, polygon_source: Polygon
 
     if not update_data:
         logger.warning(f"[{symbol}] 无法从 PolygonSource 获取有效数据，跳过数据库更新。")
-        # 考虑如果 API 404，是否将 is_active 设为 False
-        if polygon_source.get_security_info(symbol) is None:  # 再次检查是否是 API 错误
-            db_manager.upsert_security_info({'symbol': symbol, 'is_active': False})
         return
 
     # 3. 如果 API 返回的数据中不包含 market 或 type，保留数据库中的旧值
@@ -127,10 +124,14 @@ def main():
         # 循环处理
         total = len(securities_to_process)
         for i, security in enumerate(securities_to_process):
-            logger.info(f"进度: {i + 1}/{total}")
-            # 将 polygon_source 实例传入
-            update_security_details(db_manager, polygon_source, security, force=args.force)
-            # 注意：延迟已在 PolygonSource 内部处理，这里不再需要 time.sleep()
+            try:
+                logger.info(f"进度: {i + 1}/{total}")
+                update_security_details(db_manager, polygon_source, security, force=args.force)
+            except Exception as e:
+                # 捕获处理单个股票时发生的所有异常 (包括之前的 KeyError)
+                # 记录错误，然后继续处理下一个股票，而不是终止整个脚本
+                logger.error(f"处理股票 {security.symbol} 时发生严重错误，已跳过。错误: {e}", exc_info=True)
+                continue  # 继续 for 循环的下一次迭代
 
     except ValueError as e:
         # 捕获 PolygonSource 初始化时的环境变量错误

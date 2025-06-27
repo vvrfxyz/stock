@@ -63,7 +63,7 @@ class PolygonSource(DataSourceInterface):
     使用 Polygon.io 作为数据源的实现，内置 API Key 轮询机制。
     """
 
-    def __init__(self, delay_between_calls: float = 6):
+    def __init__(self, delay_between_calls: float = 1):
         """
         初始化 PolygonSource。
         从环境变量 POLYGON_API_KEYS 中读取一个或多个逗号分隔的 API Key。
