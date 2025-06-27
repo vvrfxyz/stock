@@ -3,7 +3,7 @@ import os
 import time
 import pandas as pd
 from loguru import logger
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from datetime import date, datetime
 import threading
 
@@ -11,37 +11,6 @@ from polygon import RESTClient
 from requests.exceptions import HTTPError
 
 from .base import DataSourceInterface
-from data_models.models import MarketType, AssetType  # 确保可以从项目根目录导入
-
-
-# --- Helper Functions ---
-def _map_polygon_market(locale: str) -> Optional[MarketType]:
-    """将 Polygon 的 locale 映射到我们的 MarketType 枚举"""
-    if not locale: return None
-    locale_upper = locale.upper()
-    if locale_upper == 'US': return MarketType.US
-    if locale_upper == 'GLOBAL': return MarketType.US
-    return None
-
-
-def _map_polygon_asset_type(pg_type: str) -> Optional[AssetType]:
-    """将 Polygon 的 type 映射到我们的 AssetType 枚举"""
-    if not pg_type: return None
-    type_map = {
-        'CS': AssetType.STOCK,
-        'ETF': AssetType.ETF,
-        'ETN': AssetType.ETF,
-        'WARRANT': AssetType.WARRANT,
-        'INDEX': AssetType.INDEX,
-        'MUTUAL FUND': AssetType.MUTUAL_FUND,
-        'PREFERRED STOCK': AssetType.PREFERRED_STOCK,
-        'ADRC': AssetType.STOCK,
-    }
-    mapped_type = type_map.get(pg_type.upper())
-    if not mapped_type:
-        logger.warning(f"遇到未知的 Polygon asset type: '{pg_type}', 将其归类为 STOCK。")
-        return AssetType.STOCK
-    return mapped_type
 
 
 def _parse_date_string(date_str: str) -> Optional[date]:
@@ -61,7 +30,7 @@ class PolygonSource(DataSourceInterface):
     使用 Polygon.io 作为数据源的实现，内置 API Key 轮询机制。
     """
 
-    def __init__(self, delay_between_calls: float = 2):
+    def __init__(self, delay_between_calls: float = 0.2):
         api_keys_str = os.getenv("POLYGON_API_KEYS")
         if not api_keys_str:
             raise ValueError("环境变量 POLYGON_API_KEYS 未设置。")
@@ -80,7 +49,7 @@ class PolygonSource(DataSourceInterface):
             logger.trace(f"使用 Polygon API Key (索引: {self._key_index})")
         return RESTClient(key_to_use)
 
-    def get_security_info(self, symbol: str) -> Optional[Dict]:
+    def get_security_info(self, symbol: str) -> Optional[Dict[str, Any]]:
         client = self._get_client()
         time.sleep(self.delay)
         try:
@@ -88,15 +57,16 @@ class PolygonSource(DataSourceInterface):
             details = client.get_ticker_details(symbol.upper())
             address = getattr(details, 'address', None)
             branding = getattr(details, 'branding', None)
-
+            # **核心修改**: 直接构建字典，不在这里过滤 None 值。
+            # 这确保了如果 Polygon 返回一个字段但其值为 None，这个 None 会被传递下去。
             update_data = {
                 'symbol': symbol.lower(),
-                'is_active': getattr(details, 'active', False),
+                'is_active': getattr(details, 'active', None),
                 'name': getattr(details, 'name', None),
                 'exchange': getattr(details, 'primary_exchange', None),
                 'currency': getattr(details, 'currency_name', None),
-                'market': _map_polygon_market(getattr(details, 'locale', None)),
-                'type': _map_polygon_asset_type(getattr(details, 'type', None)),
+                'market': getattr(details, 'locale', None),
+                'type': getattr(details, 'type', None),
                 'list_date': _parse_date_string(getattr(details, 'list_date', None)),
                 'delist_date': _parse_date_string(getattr(details, 'delisted_utc', None)),
                 'cik': getattr(details, 'cik', None),
@@ -116,8 +86,7 @@ class PolygonSource(DataSourceInterface):
                 'logo_url': getattr(branding, 'logo_url', None) if branding else None,
                 'icon_url': getattr(branding, 'icon_url', None) if branding else None,
             }
-            # 清理 None 值
-            return {k: v for k, v in update_data.items() if v is not None}
+            return update_data
         except HTTPError as e:
             if e.response.status_code == 404:
                 logger.warning(f"[{symbol}] 在 Polygon API 中未找到 (404)。")
@@ -177,38 +146,4 @@ class PolygonSource(DataSourceInterface):
             logger.error(f"为 {symbol} 从 Polygon 获取历史数据时出错: {e}", exc_info=True)
             return pd.DataFrame()
 
-    def get_all_daily_prices(self, trade_date: str) -> pd.DataFrame:
-        """使用 Grouped Daily Aggregates 一次性获取指定日期的所有股票数据"""
-        client = self._get_client()
-        time.sleep(self.delay)
-        try:
-            logger.info(f"正在为日期 {trade_date} 获取所有股票的分组日线数据...")
-            aggs = client.get_grouped_daily_aggs(trade_date, adjusted=False)
-
-            data = [
-                {
-                    'symbol': agg.ticker.lower(),
-                    'date': datetime.fromtimestamp(agg.timestamp / 1000).date(),
-                    'open': agg.open,
-                    'high': agg.high,
-                    'low': agg.low,
-                    'close': agg.close,
-                    'volume': agg.volume,
-                    'vwap': agg.vwap,
-                    'turnover': agg.volume * agg.vwap if agg.vwap else 0,
-                }
-                for agg in aggs
-            ]
-
-            if not data:
-                logger.warning(f"日期 {trade_date} 未返回任何分组日线数据。")
-                return pd.DataFrame()
-
-            df = pd.DataFrame(data)
-            logger.success(f"成功获取 {len(df)} 条 {trade_date} 的日线数据。")
-            return df
-
-        except Exception as e:
-            logger.error(f"获取 {trade_date} 的分组日线数据时出错: {e}", exc_info=True)
-            return pd.DataFrame()
 

@@ -1,4 +1,3 @@
-# data_models/models.py
 import enum
 import random as py_random
 from sqlalchemy import (
@@ -8,63 +7,35 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ENUM
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.sql import func
-
 Base = declarative_base()
-
-
-class MarketType(enum.Enum):
-    CNA = 'CNA'
-    HK = 'HK'
-    US = 'US'
-    CRYPTO = 'CRYPTO'
-    FOREX = 'FOREX'
-    INDEX = 'INDEX'
-
-
-class AssetType(enum.Enum):
-    STOCK = 'STOCK'
-    ETF = 'ETF'
-    INDEX = 'INDEX'
-    CRYPTO = 'CRYPTO'
-    FOREX = 'FOREX'
-    PREFERRED_STOCK = 'PREFERRED_STOCK'
-    WARRANT = 'WARRANT'
-    OTC = 'OTC'
-    MUTUAL_FUND = 'MUTUAL_FUND'
-
-
+# 移除了 MarketType 枚举类
 class ActionType(enum.Enum):
     DIVIDEND = 'DIVIDEND'
     SPLIT = 'SPLIT'
     BONUS = 'BONUS'
-
-
 class TradingCalendar(Base):
     __tablename__ = 'trading_calendars'
     id = Column(Integer, primary_key=True)
-    market = Column(ENUM(MarketType, name='market_type'), nullable=False, index=True)
+    # market 字段类型修改为 String
+    market = Column(String(50), nullable=False, index=True)
     trade_date = Column(Date, nullable=False, index=True)
     __table_args__ = (UniqueConstraint('market', 'trade_date', name='_market_trade_date_uc'),)
-
-
 class Security(Base):
     __tablename__ = 'securities'
     id = Column(Integer, primary_key=True)
-
     # --- 核心标识符 ---
     symbol = Column(String(30), nullable=False, index=True,
                     comment="标准化的、小写的证券代码 (例如 'aapl', 'nvda', '00700')")
     em_code = Column(String(30), unique=True, nullable=True, index=True,
                      comment="东方财富专用代码, 用于关联 (例如 '105.NVDA')")
     name = Column(String(255), comment="公司或证券的官方全名")
-
     # --- 市场与分类 ---
-    market = Column(ENUM(MarketType, name='market_type'), nullable=False, index=True,
+    # market 字段类型修改为 String
+    market = Column(String(50), nullable=True, index=True,
                     comment="市场板块 (US, HK, CNA等)")
-    type = Column(ENUM(AssetType, name='asset_type'), nullable=False, comment="资产类型 (STOCK, ETF等)")
+    type = Column(String(50), nullable=True, comment="资产类型 (STOCK, ETF等)")
     exchange = Column(String(50), comment="主要上市交易所代码 (例如 'XNAS', 'NYSE', 'HKEX')")
     currency = Column(String(10), comment="交易货币 (例如 'USD', 'HKD')")
-
     # --- Polygon 提供的详细信息 ---
     cik = Column(String(20), nullable=True, index=True, comment="SEC CIK 中央索引码")
     composite_figi = Column(String(20), nullable=True, index=True, comment="复合金融工具全球标识符 (FIGI)")
@@ -76,22 +47,18 @@ class Security(Base):
     total_employees = Column(Integer, nullable=True, comment="员工总数")
     sic_code = Column(String(10), nullable=True, comment="标准行业分类(SIC)代码")
     industry = Column(String(255), nullable=True, comment="行业描述 (来自SIC描述)")
-
     # --- 地址信息 ---
     address_line1 = Column(String(255), nullable=True, comment="公司地址行1")
     city = Column(String(100), nullable=True, comment="公司所在城市")
     state = Column(String(100), nullable=True, comment="公司所在州/省")
     postal_code = Column(String(20), nullable=True, comment="邮政编码")
-
     # --- 品牌信息 ---
     logo_url = Column(Text, nullable=True, comment="公司Logo的URL")
     icon_url = Column(Text, nullable=True, comment="公司Icon的URL")
-
     # --- 状态与日期 ---
     is_active = Column(Boolean, default=True, index=True, comment="该证券是否仍在活跃交易")
     list_date = Column(Date, comment="上市日期")
     delist_date = Column(Date, comment="退市日期")
-
     # --- 维护时间戳 (由脚本显式管理) ---
     info_last_updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(),
                                   comment="非价格详情(名称/描述等)的上次更新时间")
@@ -100,13 +67,11 @@ class Security(Base):
                                        comment="上一次全量历史价格数据更新的成功时间")
     actions_last_updated_at = Column(TIMESTAMP(timezone=True), nullable=True,
                                      comment="公司行动数据(分红/拆股)的上次更新时间")
-
     # --- 自动刷新策略 ---
     full_refresh_interval = Column(Integer, nullable=False, default=lambda: py_random.randint(25, 40),
                                    comment="自动全量刷新的随机周期(天)")
-
     # --- 数据库约束 ---
-    __table_args__ = (UniqueConstraint('symbol', 'market', 'type', name='_symbol_market_type_uc'),)
+    __table_args__ = (UniqueConstraint('symbol', name='_symbol_market_type_uc'),)
 
 
 class DailyPrice(Base):
