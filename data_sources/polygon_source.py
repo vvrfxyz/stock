@@ -1,8 +1,9 @@
+# data_sources/polygon_source.py
 import os
 import time
 import pandas as pd
 from loguru import logger
-from typing import Optional, List
+from typing import Optional, List, Dict
 from datetime import date, datetime
 import threading
 
@@ -13,15 +14,13 @@ from .base import DataSourceInterface
 from data_models.models import MarketType, AssetType  # 确保可以从项目根目录导入
 
 
-# --- Helper Functions (从您的 update_details_from_polygon.py 脚本中提取并优化) ---
-
+# --- Helper Functions ---
 def _map_polygon_market(locale: str) -> Optional[MarketType]:
     """将 Polygon 的 locale 映射到我们的 MarketType 枚举"""
     if not locale: return None
     locale_upper = locale.upper()
     if locale_upper == 'US': return MarketType.US
-    if locale_upper == 'GLOBAL': return MarketType.US  # GLOBAL 通常指美国市场资产
-    # 可以根据需要添加其他市场的映射，例如 'ca' -> MarketType.CA
+    if locale_upper == 'GLOBAL': return MarketType.US
     return None
 
 
@@ -57,88 +56,59 @@ def _parse_date_string(date_str: str) -> Optional[date]:
 
 
 # --- Main Class ---
-
 class PolygonSource(DataSourceInterface):
     """
     使用 Polygon.io 作为数据源的实现，内置 API Key 轮询机制。
     """
 
-    def __init__(self, delay_between_calls: float = 1):
-        """
-        初始化 PolygonSource。
-        从环境变量 POLYGON_API_KEYS 中读取一个或多个逗号分隔的 API Key。
-
-        :param delay_between_calls: 每次API调用前的延迟（秒），用于主动限速。
-                                    例如，5个Key，每个Key限制60次/分钟，理论上每秒可调用5次。
-                                    0.2秒的延迟是比较安全的选择。
-        """
+    def __init__(self, delay_between_calls: float = 2):
         api_keys_str = os.getenv("POLYGON_API_KEYS")
         if not api_keys_str:
-            raise ValueError("环境变量 POLYGON_API_KEYS 未设置。请在 .env 文件中提供一个或多个逗号分隔的 API Key。")
-
+            raise ValueError("环境变量 POLYGON_API_KEYS 未设置。")
         self.api_keys: List[str] = [key.strip() for key in api_keys_str.split(',') if key.strip()]
         if not self.api_keys:
             raise ValueError("环境变量 POLYGON_API_KEYS 中没有找到有效的 API Key。")
-
         self._key_index: int = 0
-        self._lock = threading.Lock()  # 使用线程锁确保多线程环境下的安全
+        self._lock = threading.Lock()
         self.delay = delay_between_calls
-
         logger.info(f"[PolygonSource] 初始化成功，加载了 {len(self.api_keys)} 个 API Key。")
 
     def _get_client(self) -> RESTClient:
-        """
-        轮询获取下一个 API Key 并创建 RESTClient 实例。
-        这是一个线程安全的方法。
-        """
         with self._lock:
             key_to_use = self.api_keys[self._key_index]
-            # 更新索引，为下一次调用做准备
             self._key_index = (self._key_index + 1) % len(self.api_keys)
             logger.trace(f"使用 Polygon API Key (索引: {self._key_index})")
-
         return RESTClient(key_to_use)
 
-    def get_security_info(self, symbol: str) -> Optional[dict]:
-        """
-        获取单个证券的详细信息。
-        :param symbol: 证券代码。
-        :return: 包含信息的字典，如果无法获取则返回 None。
-        """
+    def get_security_info(self, symbol: str) -> Optional[Dict]:
         client = self._get_client()
-        time.sleep(self.delay)  # 在发起请求前主动延迟
-
+        time.sleep(self.delay)
         try:
             logger.debug(f"正在为 {symbol.upper()} 调用 Polygon Ticker Details API...")
-            details_response = client.get_ticker_details(symbol.upper())
-
-            # 将 Polygon 的响应对象映射为您需要的字典格式
-            address = getattr(details_response, 'address', None)
-            branding = getattr(details_response, 'branding', None)
+            details = client.get_ticker_details(symbol.upper())
+            address = getattr(details, 'address', None)
+            branding = getattr(details, 'branding', None)
 
             update_data = {
                 'symbol': symbol.lower(),
-                'is_active': getattr(details_response, 'active', False),
-            }
-
-            potential_updates = {
-                'name': getattr(details_response, 'name', None),
-                'exchange': getattr(details_response, 'primary_exchange', None),
-                'currency': getattr(details_response, 'currency_name', None),
-                'market': _map_polygon_market(getattr(details_response, 'locale', None)),
-                'type': _map_polygon_asset_type(getattr(details_response, 'type', None)),
-                'list_date': _parse_date_string(getattr(details_response, 'list_date', None)),
-                'delist_date': _parse_date_string(getattr(details_response, 'delisted_utc', None)),
-                'cik': getattr(details_response, 'cik', None),
-                'composite_figi': getattr(details_response, 'composite_figi', None),
-                'share_class_figi': getattr(details_response, 'share_class_figi', None),
-                'market_cap': getattr(details_response, 'market_cap', None),
-                'phone_number': getattr(details_response, 'phone_number', None),
-                'description': getattr(details_response, 'description', None),
-                'homepage_url': getattr(details_response, 'homepage_url', None),
-                'total_employees': getattr(details_response, 'total_employees', None),
-                'sic_code': getattr(details_response, 'sic_code', None),
-                'industry': getattr(details_response, 'sic_description', None),
+                'is_active': getattr(details, 'active', False),
+                'name': getattr(details, 'name', None),
+                'exchange': getattr(details, 'primary_exchange', None),
+                'currency': getattr(details, 'currency_name', None),
+                'market': _map_polygon_market(getattr(details, 'locale', None)),
+                'type': _map_polygon_asset_type(getattr(details, 'type', None)),
+                'list_date': _parse_date_string(getattr(details, 'list_date', None)),
+                'delist_date': _parse_date_string(getattr(details, 'delisted_utc', None)),
+                'cik': getattr(details, 'cik', None),
+                'composite_figi': getattr(details, 'composite_figi', None),
+                'share_class_figi': getattr(details, 'share_class_figi', None),
+                'market_cap': getattr(details, 'market_cap', None),
+                'phone_number': getattr(details, 'phone_number', None),
+                'description': getattr(details, 'description', None),
+                'homepage_url': getattr(details, 'homepage_url', None),
+                'total_employees': getattr(details, 'total_employees', None),
+                'sic_code': getattr(details, 'sic_code', None),
+                'industry': getattr(details, 'sic_description', None),
                 'address_line1': getattr(address, 'address1', None) if address else None,
                 'city': getattr(address, 'city', None) if address else None,
                 'state': getattr(address, 'state', None) if address else None,
@@ -146,21 +116,14 @@ class PolygonSource(DataSourceInterface):
                 'logo_url': getattr(branding, 'logo_url', None) if branding else None,
                 'icon_url': getattr(branding, 'icon_url', None) if branding else None,
             }
-
-            for key, value in potential_updates.items():
-                if value is not None:
-                    update_data[key] = value
-
-            return update_data
-
+            # 清理 None 值
+            return {k: v for k, v in update_data.items() if v is not None}
         except HTTPError as e:
             if e.response.status_code == 404:
                 logger.warning(f"[{symbol}] 在 Polygon API 中未找到 (404)。")
-            elif e.response.status_code == 429:
-                logger.error(f"[{symbol}] 请求过于频繁 (429 Too Many Requests)。请考虑增加 delay_between_calls 的值。")
             else:
                 logger.error(f"[{symbol}] 请求 Polygon API 时发生 HTTP 错误: {e.response.status_code} - {e}")
-            return None  # 在出错时返回 None
+            return None
         except Exception as e:
             logger.error(f"[{symbol}] 请求 Polygon API 时发生未知错误: {e}", exc_info=True)
             return None
@@ -169,77 +132,83 @@ class PolygonSource(DataSourceInterface):
                             symbol: str,
                             start: Optional[str] = None,
                             end: Optional[str] = None,
-                            interval: str = "1d",
                             ) -> pd.DataFrame:
-        """
-        获取历史市场数据。
-        注意：Polygon 的 period/interval 与 yfinance 不同，这里做适配。
-
-        :param symbol: 证券代码。
-        :param start: 开始日期 'YYYY-MM-DD'。
-        :param end: 结束日期 'YYYY-MM-DD'。如果为None，则默认为今天。
-        :param interval: 数据间隔，支持 '1d' (day), '1wk' (week), '1mo' (month)。
-        :return: 包含历史数据的 pandas DataFrame。
-        """
         client = self._get_client()
         time.sleep(self.delay)
 
-        # 转换 interval 到 Polygon 的 timespan
-        timespan_map = {'1d': 'day', '1wk': 'week', '1mo': 'month'}
-        if interval not in timespan_map:
-            logger.error(f"不支持的 interval: '{interval}'. PolygonSource 支持 '1d', '1wk', '1mo'。")
-            return pd.DataFrame()
-        timespan = timespan_map[interval]
-
-        # Polygon API 需要一个结束日期
         if end is None:
             end = date.today().strftime('%Y-%m-%d')
-
-        # Polygon API 对免费用户有2年的历史数据限制，这里设置一个默认的最早开始日期
         if start is None:
-            start = (date.today() - pd.Timedelta(days=730)).strftime('%Y-%m-%d')
+            # Polygon免费API限制2年数据，这里不设默认start，让调用者决定
+            logger.warning("get_historical_data 未提供 start 日期，可能获取全部可用历史（最多2年）。")
 
         try:
-            logger.debug(f"为 {symbol.upper()} 从 {start} 到 {end} 获取 {timespan} 数据...")
+            logger.debug(f"为 {symbol.upper()} 从 {start or '开始'} 到 {end} 获取日线数据...")
             resp = client.get_aggs(
                 ticker=symbol.upper(),
                 multiplier=1,
-                timespan=timespan,
+                timespan='day',
                 from_=start,
                 to=end,
-                adjusted=True,  # 使用 Polygon 的复权数据
-                limit=50000  # 设置一个较大的 limit
+                adjusted=False,  # 获取原始价格，复权由我们自己计算
+                limit=50000
             )
-
             if not resp:
                 return pd.DataFrame()
 
             df = pd.DataFrame(resp)
-            # Polygon 返回的 't' 是毫秒级 Unix 时间戳
-            df['Date'] = pd.to_datetime(df['t'], unit='ms').dt.tz_localize('UTC')
+            df['Date'] = pd.to_datetime(df['t'], unit='ms').dt.date
             df.set_index('Date', inplace=True)
 
-            # 重命名列以匹配 yfinance 的输出，方便后续处理
-            # 注意：Polygon 的 adjusted=True 数据不直接提供 Dividends 和 Stock Splits 列
-            # 如果您需要这些，需要另外调用其他API端点 (v3/reference/dividends, v3/reference/splits)
             df.rename(columns={
-                'o': 'Open',
-                'h': 'High',
-                'l': 'Low',
-                'c': 'Close',
-                'v': 'Volume',
-                'vw': 'VWAP'  # Volume Weighted Average Price
+                'o': 'Open', 'h': 'High', 'l': 'Low', 'c': 'Close', 'v': 'Volume',
+                'vw': 'vwap'  # 直接获取VWAP作为平均价
             }, inplace=True)
 
-            # 添加 yfinance 中存在的但 Polygon 不直接提供的列，并填充默认值
-            if 'Dividends' not in df.columns:
-                df['Dividends'] = 0.0
-            if 'Stock Splits' not in df.columns:
-                df['Stock Splits'] = 0.0
+            # 计算成交额
+            df['turnover'] = df['Volume'] * df['vwap']
 
-            return df[['Open', 'High', 'Low', 'Close', 'Volume', 'Dividends', 'Stock Splits']]
+            # 为兼容旧流程，添加空的'Dividends'和'Stock Splits'列
+            df['Dividends'] = 0.0
+            df['Stock Splits'] = 0.0
 
+            return df[['Open', 'High', 'Low', 'Close', 'Volume', 'vwap', 'turnover', 'Dividends', 'Stock Splits']]
         except Exception as e:
             logger.error(f"为 {symbol} 从 Polygon 获取历史数据时出错: {e}", exc_info=True)
+            return pd.DataFrame()
+
+    def get_all_daily_prices(self, trade_date: str) -> pd.DataFrame:
+        """使用 Grouped Daily Aggregates 一次性获取指定日期的所有股票数据"""
+        client = self._get_client()
+        time.sleep(self.delay)
+        try:
+            logger.info(f"正在为日期 {trade_date} 获取所有股票的分组日线数据...")
+            aggs = client.get_grouped_daily_aggs(trade_date, adjusted=False)
+
+            data = [
+                {
+                    'symbol': agg.ticker.lower(),
+                    'date': datetime.fromtimestamp(agg.timestamp / 1000).date(),
+                    'open': agg.open,
+                    'high': agg.high,
+                    'low': agg.low,
+                    'close': agg.close,
+                    'volume': agg.volume,
+                    'vwap': agg.vwap,
+                    'turnover': agg.volume * agg.vwap if agg.vwap else 0,
+                }
+                for agg in aggs
+            ]
+
+            if not data:
+                logger.warning(f"日期 {trade_date} 未返回任何分组日线数据。")
+                return pd.DataFrame()
+
+            df = pd.DataFrame(data)
+            logger.success(f"成功获取 {len(df)} 条 {trade_date} 的日线数据。")
+            return df
+
+        except Exception as e:
+            logger.error(f"获取 {trade_date} 的分组日线数据时出错: {e}", exc_info=True)
             return pd.DataFrame()
 

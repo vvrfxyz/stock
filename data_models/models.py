@@ -118,10 +118,15 @@ class DailyPrice(Base):
     low = Column(Numeric(19, 6))
     close = Column(Numeric(19, 6))
     volume = Column(BigInteger)
-    adj_close = Column(Numeric(19, 6), nullable=True)
-    adj_factor = Column(Numeric(20, 6), nullable=False, server_default='1.0')
-    event_factor = Column(Numeric(20, 6), nullable=False, server_default='1.0')
-    cal_event_factor = Column(Numeric(20, 6), nullable=False, server_default='1.0')
+
+    # --- 新增字段 ---
+    turnover = Column(Numeric(25, 4), nullable=True, comment="成交额")
+    vwap = Column(Numeric(19, 6), nullable=True, comment="成交量加权平均价 (VWAP), 可作为平均价")
+    turnover_rate = Column(Numeric(10, 6), nullable=True, comment="换手率 (需要总股本数据计算)")
+
+    # --- 复权相关字段 ---
+    adj_factor = Column(Numeric(20, 6), nullable=True, server_default='1.0')
+
     security = relationship("Security")
     __table_args__ = (UniqueConstraint('security_id', 'date', name='_security_id_date_uc'),)
 
@@ -154,3 +159,4 @@ class HistoricalShare(Base):
     total_shares = Column(BigInteger, nullable=True)
     float_shares = Column(BigInteger, nullable=True)
     __table_args__ = (UniqueConstraint('security_id', 'change_date', name='_security_change_date_uc'),)
+
