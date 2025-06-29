@@ -95,26 +95,39 @@ class DailyPrice(Base):
     security = relationship("Security")
     __table_args__ = (UniqueConstraint('security_id', 'date', name='_security_id_date_uc'),)
 
-
-class CorporateAction(Base):
-    __tablename__ = 'corporate_actions'
+class StockDividend(Base):
+    """存储股票分红信息"""
+    __tablename__ = 'stock_dividends'
     id = Column(Integer, primary_key=True)
-    security_id = Column(Integer, nullable=False)
-    event_date = Column(Date, nullable=False, index=True)
-    event_type = Column(ENUM(ActionType, name='action_type'), nullable=False)
-    value = Column(Numeric(20, 10), nullable=False)
-    __table_args__ = (UniqueConstraint('security_id', 'event_date', 'event_type', name='_security_date_type_uc'),)
-
-
-class SpecialAdjustment(Base):
-    __tablename__ = 'special_adjustments'
+    security_id = Column(Integer, ForeignKey('securities.id'), nullable=False, index=True)
+    # --- 关键日期 ---
+    ex_dividend_date = Column(Date, nullable=False, index=True, comment="除权日")
+    declaration_date = Column(Date, nullable=True, comment="公告日")
+    record_date = Column(Date, nullable=True, comment="股权登记日")
+    pay_date = Column(Date, nullable=True, comment="派息日")
+    # --- 分红详情 ---
+    cash_amount = Column(Numeric(20, 10), nullable=False, comment="每股分红金额")
+    currency = Column(String(10), nullable=False, comment="分红货币 (USD, HKD等)")
+    frequency = Column(Integer, nullable=True, comment="分红频率 (e.g., 0:一次性, 1:年, 2:半年, 4:季度)")
+    security = relationship("Security")
+    __table_args__ = (
+        UniqueConstraint('security_id', 'ex_dividend_date', 'cash_amount', name='_dividend_uc'),
+    )
+class StockSplit(Base):
+    """存储股票拆股/合股信息"""
+    __tablename__ = 'stock_splits'
     id = Column(Integer, primary_key=True)
-    security_id = Column(Integer, nullable=False)
-    event_date = Column(Date, nullable=False)
-    adjustment_factor = Column(Numeric(20, 10), nullable=False)
-    description = Column(Text)
-    __table_args__ = (UniqueConstraint('security_id', 'event_date', name='_security_date_uc'),)
-
+    security_id = Column(Integer, ForeignKey('securities.id'), nullable=False, index=True)
+    # --- 关键日期 ---
+    execution_date = Column(Date, nullable=False, index=True, comment="拆/合股执行日")
+    declaration_date = Column(Date, nullable=True, comment="公告日") # Polygon v1 Splits 有此数据
+    # --- 拆股详情 ---
+    split_to = Column(Numeric(20, 10), nullable=False, comment="拆股后的份数 (e.g., 2-for-1 split, a value of 2)")
+    split_from = Column(Numeric(20, 10), nullable=False, comment="拆股前的份数 (e.g., 2-for-1 split, a value of 1)")
+    security = relationship("Security")
+    __table_args__ = (
+        UniqueConstraint('security_id', 'execution_date', name='_split_uc'),
+    )
 
 class HistoricalShare(Base):
     __tablename__ = 'historical_shares'

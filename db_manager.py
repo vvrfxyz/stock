@@ -1,12 +1,16 @@
 # db_manager.py (已优化)
 import os
 from contextlib import contextmanager
+from datetime import date
+
 from loguru import logger
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, func
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-
+from sqlalchemy import update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from data_models.models import Base, Security, StockDividend, StockSplit, DailyPrice
 from data_models.models import Base, Security  # 移除了无用导入
 
 load_dotenv()
@@ -78,3 +82,122 @@ class DatabaseManager:
             conn.commit()
 
         logger.success(f"✅ 成功更新 Security (ID: {security_data['id']}, Symbol: {security_data.get('symbol', 'N/A')})")
+
+    def _batch_upsert(self, model, data_list: list[dict], index_elements: list[str]):
+        """通用批量插入/忽略冲突的方法"""
+        if not data_list:
+            return 0
+
+        stmt = pg_insert(model).values(data_list)
+        # 使用 on_conflict_do_nothing 策略，如果记录已存在则忽略
+        stmt = stmt.on_conflict_do_nothing(index_elements=index_elements)
+
+        with self.engine.connect() as conn:
+            result = conn.execute(stmt)
+            conn.commit()
+            return result.rowcount
+
+    def upsert_dividends(self, security_id: int, dividends_data: list[dict]):
+        """批量插入分红数据，如果已存在则忽略"""
+        if not dividends_data:
+            return
+        # 为每条记录添加 security_id
+        for item in dividends_data:
+            item['security_id'] = security_id
+
+        # 使用在 StockDividend 模型中定义的唯一约束字段
+        self._batch_upsert(StockDividend, dividends_data, ['security_id', 'ex_dividend_date', 'cash_amount'])
+        logger.debug(f"为 Security ID {security_id} 同步 {len(dividends_data)} 条分红记录。")
+
+    def upsert_splits(self, security_id: int, splits_data: list[dict]):
+        """批量插入拆股数据，如果已存在则忽略"""
+        if not splits_data:
+            return
+        for item in splits_data:
+            item['security_id'] = security_id
+
+        # 使用在 StockSplit 模型中定义的唯一约束字段
+        self._batch_upsert(StockSplit, splits_data, ['security_id', 'execution_date'])
+        logger.debug(f"为 Security ID {security_id} 同步 {len(splits_data)} 条拆股记录。")
+
+    def update_security_timestamp(self, security_id: int, field_name: str):
+        """更新 Security 表中指定的时间戳字段为当前时间"""
+        allowed_fields = [
+            'info_last_updated_at', 'price_data_latest_date',
+            'full_data_last_updated_at', 'actions_last_updated_at'
+        ]
+        if field_name not in allowed_fields:
+            raise ValueError(f"无效的时间戳字段名: {field_name}")
+        stmt = (
+            update(Security)
+            .where(Security.id == security_id)
+            .values({field_name: func.now()})
+        )
+        with self.engine.connect() as conn:
+            conn.execute(stmt)
+            conn.commit()
+
+    def bulk_update_records(self, records: list) -> int:
+        """
+        【推荐】通用的、高效的批量更新 ORM 对象列表的方法。
+        它使用 session.merge() 来处理更新。
+        :param records: 包含已修改数据的 ORM 对象列表（可以是任何模型）。
+        :return: 成功更新的记录数。
+        """
+        if not records:
+            return 0
+        with self.get_session() as session:
+            for record in records:
+                session.merge(record)
+            session.commit()
+        return len(records)
+
+    def upsert_daily_prices(self, price_data: list[dict]) -> int:
+        """
+        批量插入或更新日线价格数据 (基于UPSERT)。
+        此方法适用于需要高性能批量插入/更新的场景，如 akshare 脚本。
+        """
+        if not price_data:
+            return 0
+
+        stmt = pg_insert(DailyPrice).values(price_data)
+        # 动态构建更新集
+        update_keys = price_data[0].keys()
+        update_columns = {}
+        if 'open' in update_keys: update_columns['open'] = stmt.excluded.open
+        if 'high' in update_keys: update_columns['high'] = stmt.excluded.high
+        if 'low' in update_keys: update_columns['low'] = stmt.excluded.low
+        if 'close' in update_keys: update_columns['close'] = stmt.excluded.close
+        if 'volume' in update_keys: update_columns['volume'] = stmt.excluded.volume
+        if 'turnover' in update_keys: update_columns['turnover'] = stmt.excluded.turnover
+        if 'vwap' in update_keys: update_columns['vwap'] = stmt.excluded.vwap
+        if 'turnover_rate' in update_keys: update_columns['turnover_rate'] = stmt.excluded.turnover_rate
+        if not update_columns:
+            stmt = stmt.on_conflict_do_nothing(index_elements=['security_id', 'date'])
+        else:
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['security_id', 'date'],
+                set_=update_columns
+            )
+        with self.engine.connect() as conn:
+            result = conn.execute(stmt)
+            conn.commit()
+            return result.rowcount
+
+    def update_security_price_latest_date(self, security_id: int, latest_date: date, is_full_run: bool):
+        """
+        更新 Security 表中的价格数据最新日期和全量更新时间戳。
+        """
+        values_to_update = {
+            'price_data_latest_date': latest_date
+        }
+        if is_full_run:
+            values_to_update['full_data_last_updated_at'] = func.now()
+        stmt = (
+            update(Security)
+            .where(Security.id == security_id)
+            .values(values_to_update)
+        )
+        with self.engine.connect() as conn:
+            conn.execute(stmt)
+            conn.commit()
