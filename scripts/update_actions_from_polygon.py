@@ -40,13 +40,15 @@ def setup_logging():
         "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
         "<level>{level: <8}</level> | "
         "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+        "\n<level>{exception}</level>"  # <--- 在新的一行添加这个占位符
     )
-    logger.add(sys.stderr, level="INFO", format=log_format)
-
+    # 将终端日志级别临时设为 DEBUG，以便看到所有信息
+    logger.add(sys.stderr, level="DEBUG", format=log_format)
     log_dir = os.path.join(project_root, "logs")
     os.makedirs(log_dir, exist_ok=True)
+    # 确保文件日志也使用新的格式
     logger.add(os.path.join(log_dir, f"update_polygon_actions_{{time}}.log"), rotation="10 MB", retention="10 days",
-               level="DEBUG")
+               level="DEBUG", format=log_format)
     logger.info("日志记录器设置完成。")
 
 
@@ -108,9 +110,12 @@ def process_security(security: Security, polygon_source: PolygonSource, db_manag
 
         if dividends and security.currency:  # 仅当有分红数据和股票本身有货币单位时才尝试修复
             repaired_count = 0
+            # 从 security 记录中获取标准化的（大写的）货币单位
+            standard_currency = security.currency.upper()
             for item in dividends:
-                if not item.get('currency'):  # 如果 currency 是 None 或空字符串
-                    item['currency'] = security.currency  # 使用 security 表中的货币单位
+                # 如果 currency 是 None 或空字符串
+                if not item.get('currency'):
+                    item['currency'] = standard_currency  # 使用标准的大写货币单位
                     repaired_count += 1
             if repaired_count > 0:
                 logger.info(f"[{symbol}] 自动修复了 {repaired_count} 条分红记录的缺失货币单位为 '{security.currency}'。")
@@ -185,20 +190,34 @@ def main():
         logger.info(f"速率限制已启用: 每个Key最多 {POLYGON_RATE_LIMIT} 次 / {POLYGON_RATE_SECONDS} 秒。")
 
         results_counter = Counter()
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            future_to_security = {
-                executor.submit(process_security, security, polygon_source, db_manager): security
-                for security in securities_to_process
-            }
 
-            for future in tqdm(as_completed(future_to_security), total=total_count, desc="更新公司行动"):
-                try:
-                    symbol, status = future.result()
-                    results_counter[status] += 1
-                except Exception as exc:
-                    security = future_to_security[future]
-                    logger.error(f"任务 {security.symbol} 生成了未捕T获的异常: {exc}", exc_info=True)
-                    results_counter["FATAL_ERROR"] += 1
+        # --- 临时改为单线程循环进行调试 ---
+        logger.warning("！！！注意：当前为单线程调试模式！！！")
+        for security in tqdm(securities_to_process, desc="更新公司行动 (单线程调试)"):
+            try:
+                # 直接调用 process_security 函数，而不是通过 executor.submit
+                symbol, status = process_security(security, polygon_source, db_manager)
+                results_counter[status] += 1
+            except Exception as exc:
+                # 这里的异常将是原始的、未经包装的异常
+                logger.error(f"处理股票 {security.symbol} 时发生致命错误", exc_info=True)
+                results_counter["FATAL_ERROR"] += 1
+        # --- 单线程调试模式结束 ---
+
+        # with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        #     future_to_security = {
+        #         executor.submit(process_security, security, polygon_source, db_manager): security
+        #         for security in securities_to_process
+        #     }
+        #
+        #     for future in tqdm(as_completed(future_to_security), total=total_count, desc="更新公司行动"):
+        #         try:
+        #             symbol, status = future.result()
+        #             results_counter[status] += 1
+        #         except Exception as exc:
+        #             security = future_to_security[future]
+        #             logger.error(f"任务 {security.symbol} 生成了未捕T获的异常: {exc}", exc_info=True)
+        #             results_counter["FATAL_ERROR"] += 1
 
         logger.info("--- 任务执行统计 ---")
         logger.info(f"  成功 (有数据): {results_counter['SUCCESS']}")
