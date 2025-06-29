@@ -1,5 +1,5 @@
 # scripts/update_actions_from_polygon.py (新建文件)
-
+import json
 import os
 import sys
 import time
@@ -105,6 +105,22 @@ def process_security(security: Security, polygon_source: PolygonSource, db_manag
         # 1. 从API获取数据
         dividends = polygon_source.get_dividends(symbol)
         splits = polygon_source.get_splits(symbol)
+
+        if dividends and security.currency:  # 仅当有分红数据和股票本身有货币单位时才尝试修复
+            repaired_count = 0
+            for item in dividends:
+                if not item.get('currency'):  # 如果 currency 是 None 或空字符串
+                    item['currency'] = security.currency  # 使用 security 表中的货币单位
+                    repaired_count += 1
+            if repaired_count > 0:
+                logger.info(f"[{symbol}] 自动修复了 {repaired_count} 条分红记录的缺失货币单位为 '{security.currency}'。")
+
+        if dividends:
+            logger.debug(f"[{symbol}] 从 Polygon 获取到的分红数据 (即将入库):\n"
+                         f"{json.dumps(dividends, indent=2, default=str)}")
+        if splits:
+            logger.debug(f"[{symbol}] 从 Polygon 获取到的拆股数据 (即将入库):\n"
+                         f"{json.dumps(splits, indent=2, default=str)}")
 
         # 2. 存储数据到数据库
         if dividends:

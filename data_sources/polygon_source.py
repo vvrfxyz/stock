@@ -102,7 +102,8 @@ class PolygonSource(DataSourceInterface):
             logger.debug(f"为 {symbol.upper()} 获取全部分红数据...")
             # 使用分页器自动处理分页
             for dividend in client.list_dividends(symbol.upper(), limit=1000):
-                dividends_data.append({
+                # 预定义所有可能的键，确保每个字典结构一致
+                record = {
                     'ex_dividend_date': _parse_date_string(getattr(dividend, 'ex_dividend_date', None)),
                     'declaration_date': _parse_date_string(getattr(dividend, 'declaration_date', None)),
                     'record_date': _parse_date_string(getattr(dividend, 'record_date', None)),
@@ -110,7 +111,9 @@ class PolygonSource(DataSourceInterface):
                     'cash_amount': getattr(dividend, 'cash_amount', None),
                     'currency': getattr(dividend, 'currency', None),
                     'frequency': getattr(dividend, 'frequency', None),
-                })
+                }
+                dividends_data.append(record)
+                # 过滤掉无效记录，但此时所有字典的键都是完整的
             return [d for d in dividends_data if d['ex_dividend_date'] and d['cash_amount'] is not None]
         except Exception as e:
             logger.error(f"为 {symbol} 从 Polygon 获取分红数据时出错: {e}", exc_info=True)
@@ -178,13 +181,15 @@ class PolygonSource(DataSourceInterface):
             logger.debug(f"为 {symbol.upper()} 获取全部拆股数据...")
             # 使用分页器自动处理分页
             for split in client.list_splits(symbol.upper(), limit=1000):
-                splits_data.append({
+                # 预定义所有可能的键，确保每个字典结构一致
+                record = {
                     'execution_date': _parse_date_string(getattr(split, 'execution_date', None)),
-                    # declaration_date 在 v1 Splits API 中才有，这里先留空或设为None
-                    'declaration_date': None,
+                    'declaration_date': None,  # 始终包含此键
                     'split_to': getattr(split, 'split_to', None),
                     'split_from': getattr(split, 'split_from', None),
-                })
+                }
+                splits_data.append(record)
+                # 过滤掉无效记录
             return [s for s in splits_data if s['execution_date'] and s['split_to'] is not None]
         except Exception as e:
             logger.error(f"为 {symbol} 从 Polygon 获取拆股数据时出错: {e}", exc_info=True)
