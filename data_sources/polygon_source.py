@@ -222,12 +222,12 @@ class PolygonSource(DataSourceInterface):
                 return pd.DataFrame()
 
             df = pd.DataFrame(resp)
-            df['Date'] = pd.to_datetime(df['t'], unit='ms').dt.date
+            df['Date'] = pd.to_datetime(df['timestamp'], unit='ms').dt.date
             df.set_index('Date', inplace=True)
 
             df.rename(columns={
-                'o': 'Open', 'h': 'High', 'l': 'Low', 'c': 'Close', 'v': 'Volume',
-                'vw': 'vwap'
+                'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume',
+                'vmap': 'vwap'  # 修正 vwap 的列名
             }, inplace=True)
 
             df['turnover'] = df['Volume'] * df['vwap']

@@ -2,7 +2,7 @@
 import os
 from contextlib import contextmanager
 from datetime import date
-
+from sqlalchemy import create_engine, func, text
 from loguru import logger
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, func
@@ -201,3 +201,120 @@ class DatabaseManager:
         with self.engine.connect() as conn:
             conn.execute(stmt)
             conn.commit()
+
+    # ==============================================================================
+    #  【新增】原生SQL方法 (专供 update_actions_from_polygon.py 使用)
+    # ==============================================================================
+    def upsert_dividends_native_sql(self, security_id: int, dividends_data: list[dict]):
+        """
+        【原生SQL - 调试版】逐条插入分红数据，如果已存在则忽略。
+        如果单条记录插入失败，会打印详细的错误信息并继续处理下一条。
+        注意：此版本为调试优化，性能低于批量版本。
+        """
+        if not dividends_data:
+            return
+        # SQL模板只定义一次
+        sql_template = text("""
+            INSERT INTO stock_dividends (
+                security_id, ex_dividend_date, declaration_date, record_date, pay_date, 
+                cash_amount, currency, frequency
+            ) VALUES (
+                :security_id, :ex_dividend_date, :declaration_date, :record_date, :pay_date,
+                :cash_amount, :currency, :frequency
+            )
+            ON CONFLICT (security_id, ex_dividend_date, cash_amount) DO NOTHING
+        """)
+        success_count = 0
+        fail_count = 0
+        # 开启一次连接和事务，包裹整个循环，以提高效率
+        with self.engine.connect() as conn:
+            with conn.begin() as trans:
+                for item in dividends_data:
+                    # 为当前记录添加 security_id
+                    item['security_id'] = security_id
+
+                    try:
+                        # 对单条记录执行SQL
+                        conn.execute(sql_template, item)
+                        success_count += 1
+                    except Exception as e:
+                        fail_count += 1
+                        # --- 核心错误处理逻辑 ---
+                        # 1. 在控制台打印醒目的错误信息
+                        print("-" * 80)
+                        print(f"🚨 [DATABASE ERROR] Failed to insert a dividend record for security_id: {security_id}")
+
+                        # 2. 打印导致错误的SQL模板 (SQLAlchemy不会直接渲染值，这是为了安全)
+                        print("\n[SQL TEMPLATE]:")
+                        print(sql_template)
+
+                        # 3. 打印导致错误的具体数据
+                        print("\n[PROBLEM DATA]:")
+                        # 使用 json 更易读
+                        import json
+                        print(json.dumps(item, indent=2, default=str))  # default=str 处理日期等对象
+
+                        # 4. 打印具体的异常信息
+                        print(f"\n[EXCEPTION]:\n{e}")
+                        print("-" * 80)
+
+                        # 5. 在日志文件中记录完整的错误堆栈信息
+                        logger.error(
+                            f"Failed to insert dividend record for security_id={security_id}. Data: {item}",
+                            exc_info=True  # exc_info=True 会记录完整的错误堆栈
+                        )
+                        # 循环会继续，不会在此处中断
+        if fail_count > 0:
+            logger.warning(
+                f"[原生SQL] For Security ID {security_id}, "
+                f"processed {len(dividends_data)} dividend records. "
+                f"Succeeded: {success_count}, Failed: {fail_count}."
+            )
+        else:
+            logger.debug(
+                f"[原生SQL] For Security ID {security_id}, "
+                f"successfully processed {success_count} dividend records."
+            )
+    def upsert_splits_native_sql(self, security_id: int, splits_data: list[dict]):
+        """
+        【原生SQL】批量插入拆股数据，如果已存在则忽略。
+        使用 PostgreSQL 的 ON CONFLICT DO NOTHING。
+        """
+        if not splits_data:
+            return
+
+        for item in splits_data:
+            item['security_id'] = security_id
+        sql = text("""
+            INSERT INTO stock_splits (
+                security_id, execution_date, declaration_date, split_to, split_from
+            ) VALUES (
+                :security_id, :execution_date, :declaration_date, :split_to, :split_from
+            )
+            ON CONFLICT (security_id, execution_date) DO NOTHING
+        """)
+        with self.engine.connect() as conn:
+            with conn.begin() as trans:
+                conn.execute(sql, splits_data)
+        logger.debug(f"[原生SQL] 为 Security ID {security_id} 同步 {len(splits_data)} 条拆股记录。")
+
+    def update_security_timestamp_native_sql(self, security_id: int, field_name: str):
+        """
+        【原生SQL】更新 Security 表中指定的时间戳字段为当前时间。
+        """
+        allowed_fields = [
+            'info_last_updated_at', 'price_data_latest_date',
+            'full_data_last_updated_at', 'actions_last_updated_at'
+        ]
+        if field_name not in allowed_fields:
+            raise ValueError(f"无效的时间戳字段名: {field_name}")
+        # 使用 f-string 插入列名是安全的，因为我们已经通过白名单验证了 field_name
+        # 值（如 security_id）必须通过参数绑定传递
+        sql = text(f"""
+            UPDATE securities 
+            SET {field_name} = NOW() 
+            WHERE id = :security_id
+        """)
+        with self.engine.connect() as conn:
+            with conn.begin() as trans:
+                conn.execute(sql, {"security_id": security_id})

@@ -132,12 +132,15 @@ def main():
 
     # 硬编码日期范围以满足你的特定需求
     class Args:
-        start_date = "2023-06-29"
-        end_date = "2025-06-27"
+        start_date = "2025-06-29"
+        end_date = "2025-06-30"
         workers = MAX_CONCURRENT_WORKERS
 
     args = Args()
     logger.info(f"脚本将刷新从 {args.start_date} 到 {args.end_date} 的数据。")
+
+    # parser = create_parser()
+    # args = parser.parse_args()
 
     db_manager = None
     try:

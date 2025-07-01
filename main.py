@@ -4,6 +4,7 @@ import sys
 import argparse
 import time
 from datetime import datetime, timedelta
+from scripts.update_polygon_daily_prices import main as update_polygon_prices_main
 
 from loguru import logger
 
@@ -144,6 +145,16 @@ def run_update_em_prices(args):
     cli_args.extend(args.em_codes)
     execute_script(update_em_prices_main, cli_args)
 
+def run_update_polygon_prices(args):
+    logger.info("执行: 更新 Polygon 日线价格")
+    cli_args = []
+    if args.full_refresh: cli_args.append('--full-refresh')
+    if args.market: cli_args.extend(['--market', args.market])
+    if args.limit > 0: cli_args.extend(['--limit', str(args.limit)])
+    if args.workers: cli_args.extend(['--workers', str(args.workers)])
+    cli_args.extend(args.symbols) # 注意这里是 symbols
+    execute_script(update_polygon_prices_main, cli_args)
+
 
 def run_update_grouped_daily(args):
     logger.info("执行: 刷新 Polygon Grouped Daily 数据")
@@ -220,6 +231,15 @@ def main():
     # --- 定义 'migrate' 命令 ---
     p_migrate = subparsers.add_parser('migrate', help="执行数据库迁移（一次性操作）")
     p_migrate.set_defaults(func=run_migrate)
+
+    # --- 定义 'update_polygon_prices' 命令 ---
+    p_poly_prices = subparsers.add_parser('update_polygon_prices', help="单独更新 Polygon 的日线价格")
+    p_poly_prices.add_argument('symbols', nargs='*', help="要更新的股票代码列表。")
+    p_poly_prices.add_argument('--full-refresh', action='store_true', help="强制全量刷新。")
+    p_poly_prices.add_argument('--market', type=str, default='US', help="指定市场 (默认: US)。")
+    p_poly_prices.add_argument('--limit', type=int, default=0, help="限制处理的股票数量。")
+    p_poly_prices.add_argument('--workers', type=int, help="并发线程数。")
+    p_poly_prices.set_defaults(func=run_update_polygon_prices)
 
     args = parser.parse_args()
     args.func(args)
