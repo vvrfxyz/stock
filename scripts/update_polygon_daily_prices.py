@@ -27,7 +27,7 @@ from utils.key_rate_limiter import KeyRateLimiter
 # Polygon API 较为健壮，并发数可以设置得高一些
 MAX_CONCURRENT_WORKERS = 15
 # 更新检查周期，与 em 脚本保持一致
-INCREMENTAL_CHECK_DAYS = 2
+INCREMENTAL_CHECK_DAYS = 1
 # Polygon API 的速率限制配置
 POLYGON_RATE_LIMIT = 5
 POLYGON_RATE_SECONDS = 60
