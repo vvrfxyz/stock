@@ -142,3 +142,9 @@ log/
 
 # idea
 .idea/
+
+# local assistant config
+.claude/
+
+# macOS
+.DS_Store

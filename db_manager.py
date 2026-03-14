@@ -1,17 +1,15 @@
-# db_manager.py (已优化)
 import os
+import random
 from contextlib import contextmanager
 from datetime import date
-from sqlalchemy import create_engine, func, text
-from loguru import logger
+
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, func
-from sqlalchemy.orm import sessionmaker, Session
+from loguru import logger
+from sqlalchemy import create_engine, func, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy import update
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from data_models.models import Base, Security, StockDividend, StockSplit, DailyPrice
-from data_models.models import Base, Security  # 移除了无用导入
+from sqlalchemy.orm import Session, sessionmaker
+
+from data_models.models import DailyPrice, HistoricalShare, Security, StockDividend, StockSplit
 
 load_dotenv()
 
@@ -43,7 +41,7 @@ class DatabaseManager:
         finally:
             session.close()
 
-    def upsert_security_info(self, security_data: dict):
+    def upsert_security_info(self, security_data: dict) -> None:
         """
         智能地更新或插入 Security 信息 (UPSERT)。
         - 如果记录不存在，则插入新记录。
@@ -54,16 +52,35 @@ class DatabaseManager:
         if 'id' not in security_data:
             raise ValueError("更新数据必须包含 'id' 字段以定位记录。")
 
+        valid_columns = set(Security.__table__.columns.keys())
+        unknown_keys = set(security_data.keys()) - valid_columns
+        if unknown_keys:
+            logger.warning(f"upsert_security_info 收到未知字段，将被忽略: {sorted(unknown_keys)}")
+            for key in unknown_keys:
+                security_data.pop(key, None)
+
+        # Insert path must satisfy NOT NULL constraints.
+        # Keep it stable across updates by excluding from ON CONFLICT updates.
+        security_data.setdefault('full_refresh_interval', random.randint(25, 40))
+
         # 使用 SQLAlchemy 2.0 风格的 insert 语句
         stmt = pg_insert(Security).values(security_data)
 
-        # 定义冲突时的更新策略
-        # 1. 从传入的字典中提取需要更新的列名
-        #    排除主键 'id' 和唯一约束 'symbol'，因为它们用于冲突判断，不能在 set_ 中更新。
+        # 定义冲突时的更新策略：
+        # 仅更新 security_data 中明确提供的字段，避免将未提供字段覆盖为 NULL/DEFAULT。
+        protected_fields = {
+            'id',
+            'symbol',
+            'em_code',
+            'price_data_latest_date',
+            'full_data_last_updated_at',
+            'actions_last_updated_at',
+            'full_refresh_interval',
+        }
         update_columns = {
-            col.name: col
-            for col in stmt.excluded
-            if col.name not in ['id', 'symbol', 'em_code']  # 再次确保 em_code 不被意外更新
+            key: getattr(stmt.excluded, key)
+            for key in security_data.keys()
+            if key not in protected_fields
         }
 
         # 2. 无论如何都要更新时间戳
@@ -81,7 +98,62 @@ class DatabaseManager:
             conn.execute(final_stmt)
             conn.commit()
 
-        logger.success(f"✅ 成功更新 Security (ID: {security_data['id']}, Symbol: {security_data.get('symbol', 'N/A')})")
+        logger.success(
+            f"✅ 成功更新 Security (ID: {security_data['id']}, Symbol: {security_data.get('symbol', 'N/A')})"
+        )
+
+    def upsert_securities_by_symbol(self, securities_data: list[dict], touch_info_timestamp: bool = False) -> int:
+        """
+        基于 symbol 的批量 UPSERT，适合全市场 reference/universe 同步。
+        默认不更新 info_last_updated_at，避免把“基础引用数据刷新”误判成“详情刷新”。
+        """
+        if not securities_data:
+            return 0
+
+        valid_columns = set(Security.__table__.columns.keys())
+        cleaned_rows: list[dict] = []
+        for row in securities_data:
+            cleaned = {key: value for key, value in row.items() if key in valid_columns}
+            if "symbol" not in cleaned:
+                continue
+            cleaned.setdefault("full_refresh_interval", random.randint(25, 40))
+            cleaned_rows.append(cleaned)
+
+        if not cleaned_rows:
+            return 0
+
+        stmt = pg_insert(Security).values(cleaned_rows)
+        protected_fields = {
+            'id',
+            'symbol',
+            'em_code',
+            'price_data_latest_date',
+            'full_data_last_updated_at',
+            'actions_last_updated_at',
+            'full_refresh_interval',
+            'info_last_updated_at',
+        }
+        update_keys = set().union(*(row.keys() for row in cleaned_rows))
+        update_columns = {
+            key: getattr(stmt.excluded, key)
+            for key in update_keys
+            if key not in protected_fields
+        }
+        if touch_info_timestamp:
+            update_columns['info_last_updated_at'] = func.now()
+
+        if not update_columns:
+            final_stmt = stmt.on_conflict_do_nothing(index_elements=['symbol'])
+        else:
+            final_stmt = stmt.on_conflict_do_update(
+                index_elements=['symbol'],
+                set_=update_columns,
+            )
+
+        with self.engine.connect() as conn:
+            result = conn.execute(final_stmt)
+            conn.commit()
+            return result.rowcount
 
     def _batch_upsert(self, model, data_list: list[dict], index_elements: list[str]):
         """通用批量插入/忽略冲突的方法"""
@@ -97,35 +169,34 @@ class DatabaseManager:
             conn.commit()
             return result.rowcount
 
-    def upsert_dividends(self, security_id: int, dividends_data: list[dict]):
+    def upsert_dividends(self, security_id: int, dividends_data: list[dict]) -> int:
         """批量插入分红数据，如果已存在则忽略"""
         if not dividends_data:
-            return
+            return 0
         # 为每条记录添加 security_id
         for item in dividends_data:
             item['security_id'] = security_id
 
         # 使用在 StockDividend 模型中定义的唯一约束字段
-        self._batch_upsert(StockDividend, dividends_data, ['security_id', 'ex_dividend_date', 'cash_amount'])
+        rows_affected = self._batch_upsert(StockDividend, dividends_data, ['security_id', 'ex_dividend_date', 'cash_amount'])
         logger.debug(f"为 Security ID {security_id} 同步 {len(dividends_data)} 条分红记录。")
+        return rows_affected
 
-    def upsert_splits(self, security_id: int, splits_data: list[dict]):
+    def upsert_splits(self, security_id: int, splits_data: list[dict]) -> int:
         """批量插入拆股数据，如果已存在则忽略"""
         if not splits_data:
-            return
+            return 0
         for item in splits_data:
             item['security_id'] = security_id
 
         # 使用在 StockSplit 模型中定义的唯一约束字段
-        self._batch_upsert(StockSplit, splits_data, ['security_id', 'execution_date'])
+        rows_affected = self._batch_upsert(StockSplit, splits_data, ['security_id', 'execution_date'])
         logger.debug(f"为 Security ID {security_id} 同步 {len(splits_data)} 条拆股记录。")
+        return rows_affected
 
-    def update_security_timestamp(self, security_id: int, field_name: str):
-        """更新 Security 表中指定的时间戳字段为当前时间"""
-        allowed_fields = [
-            'info_last_updated_at', 'price_data_latest_date',
-            'full_data_last_updated_at', 'actions_last_updated_at'
-        ]
+    def update_security_timestamp(self, security_id: int, field_name: str) -> None:
+        """更新 Security 表中指定的 TIMESTAMP 字段为当前时间。"""
+        allowed_fields = ['info_last_updated_at', 'full_data_last_updated_at', 'actions_last_updated_at']
         if field_name not in allowed_fields:
             raise ValueError(f"无效的时间戳字段名: {field_name}")
         stmt = (
@@ -136,6 +207,20 @@ class DatabaseManager:
         with self.engine.connect() as conn:
             conn.execute(stmt)
             conn.commit()
+
+    def bulk_update_mappings(self, model, mappings: list[dict]) -> int:
+        """
+        高效批量更新（executemany UPDATE），适合已知主键且只更新部分列的场景。
+        :param model: SQLAlchemy ORM 模型类。
+        :param mappings: 每条更新的字典，必须包含主键字段。
+        :return: 尝试更新的记录数（不保证每条都实际命中行）。
+        """
+        if not mappings:
+            return 0
+        with self.get_session() as session:
+            session.bulk_update_mappings(model, mappings)
+            session.commit()
+        return len(mappings)
 
     def bulk_update_records(self, records: list) -> int:
         """
@@ -162,7 +247,7 @@ class DatabaseManager:
 
         stmt = pg_insert(DailyPrice).values(price_data)
         # 动态构建更新集
-        update_keys = price_data[0].keys()
+        update_keys = set().union(*(row.keys() for row in price_data))
         update_columns = {}
         if 'open' in update_keys: update_columns['open'] = stmt.excluded.open
         if 'high' in update_keys: update_columns['high'] = stmt.excluded.high
@@ -172,6 +257,7 @@ class DatabaseManager:
         if 'turnover' in update_keys: update_columns['turnover'] = stmt.excluded.turnover
         if 'vwap' in update_keys: update_columns['vwap'] = stmt.excluded.vwap
         if 'turnover_rate' in update_keys: update_columns['turnover_rate'] = stmt.excluded.turnover_rate
+        if 'adj_factor' in update_keys: update_columns['adj_factor'] = stmt.excluded.adj_factor
         if not update_columns:
             stmt = stmt.on_conflict_do_nothing(index_elements=['security_id', 'date'])
         else:
@@ -179,6 +265,33 @@ class DatabaseManager:
                 index_elements=['security_id', 'date'],
                 set_=update_columns
             )
+        with self.engine.connect() as conn:
+            result = conn.execute(stmt)
+            conn.commit()
+            return result.rowcount
+
+    def upsert_historical_shares(self, shares_data: list[dict]) -> int:
+        """
+        批量插入或更新历史股本数据 (UPSERT)。
+        冲突键: (security_id, change_date)
+        """
+        if not shares_data:
+            return 0
+
+        stmt = pg_insert(HistoricalShare).values(shares_data)
+        update_keys = set().union(*(row.keys() for row in shares_data))
+        update_columns = {}
+        if 'total_shares' in update_keys: update_columns['total_shares'] = stmt.excluded.total_shares
+        if 'float_shares' in update_keys: update_columns['float_shares'] = stmt.excluded.float_shares
+
+        if not update_columns:
+            stmt = stmt.on_conflict_do_nothing(index_elements=['security_id', 'change_date'])
+        else:
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['security_id', 'change_date'],
+                set_=update_columns
+            )
+
         with self.engine.connect() as conn:
             result = conn.execute(stmt)
             conn.commit()
@@ -205,14 +318,14 @@ class DatabaseManager:
     # ==============================================================================
     #  【新增】原生SQL方法 (专供 update_actions_from_polygon.py 使用)
     # ==============================================================================
-    def upsert_dividends_native_sql(self, security_id: int, dividends_data: list[dict]):
+    def upsert_dividends_native_sql(self, security_id: int, dividends_data: list[dict]) -> int:
         """
         【原生SQL - 调试版】逐条插入分红数据，如果已存在则忽略。
         如果单条记录插入失败，会打印详细的错误信息并继续处理下一条。
         注意：此版本为调试优化，性能低于批量版本。
         """
         if not dividends_data:
-            return
+            return 0
         # SQL模板只定义一次
         sql_template = text("""
             INSERT INTO stock_dividends (
@@ -224,18 +337,21 @@ class DatabaseManager:
             )
             ON CONFLICT (security_id, ex_dividend_date, cash_amount) DO NOTHING
         """)
+        inserted_count = 0
         success_count = 0
         fail_count = 0
         # 开启一次连接和事务，包裹整个循环，以提高效率
         with self.engine.connect() as conn:
-            with conn.begin() as trans:
+            with conn.begin():
                 for item in dividends_data:
                     # 为当前记录添加 security_id
                     item['security_id'] = security_id
 
                     try:
                         # 对单条记录执行SQL
-                        conn.execute(sql_template, item)
+                        result = conn.execute(sql_template, item)
+                        if result.rowcount and result.rowcount > 0:
+                            inserted_count += result.rowcount
                         success_count += 1
                     except Exception as e:
                         fail_count += 1
@@ -268,20 +384,22 @@ class DatabaseManager:
             logger.warning(
                 f"[原生SQL] For Security ID {security_id}, "
                 f"processed {len(dividends_data)} dividend records. "
-                f"Succeeded: {success_count}, Failed: {fail_count}."
+                f"Succeeded: {success_count}, Failed: {fail_count}, Inserted: {inserted_count}."
             )
         else:
             logger.debug(
                 f"[原生SQL] For Security ID {security_id}, "
-                f"successfully processed {success_count} dividend records."
+                f"successfully processed {success_count} dividend records. Inserted: {inserted_count}."
             )
-    def upsert_splits_native_sql(self, security_id: int, splits_data: list[dict]):
+        return inserted_count
+
+    def upsert_splits_native_sql(self, security_id: int, splits_data: list[dict]) -> int:
         """
         【原生SQL】批量插入拆股数据，如果已存在则忽略。
         使用 PostgreSQL 的 ON CONFLICT DO NOTHING。
         """
         if not splits_data:
-            return
+            return 0
 
         for item in splits_data:
             item['security_id'] = security_id
@@ -293,19 +411,22 @@ class DatabaseManager:
             )
             ON CONFLICT (security_id, execution_date) DO NOTHING
         """)
+        inserted_count = 0
         with self.engine.connect() as conn:
-            with conn.begin() as trans:
-                conn.execute(sql, splits_data)
-        logger.debug(f"[原生SQL] 为 Security ID {security_id} 同步 {len(splits_data)} 条拆股记录。")
+            with conn.begin():
+                result = conn.execute(sql, splits_data)
+                if result.rowcount and result.rowcount > 0:
+                    inserted_count = result.rowcount
+        logger.debug(
+            f"[原生SQL] 为 Security ID {security_id} 同步 {len(splits_data)} 条拆股记录。Inserted: {inserted_count}。"
+        )
+        return inserted_count
 
-    def update_security_timestamp_native_sql(self, security_id: int, field_name: str):
+    def update_security_timestamp_native_sql(self, security_id: int, field_name: str) -> None:
         """
         【原生SQL】更新 Security 表中指定的时间戳字段为当前时间。
         """
-        allowed_fields = [
-            'info_last_updated_at', 'price_data_latest_date',
-            'full_data_last_updated_at', 'actions_last_updated_at'
-        ]
+        allowed_fields = ['info_last_updated_at', 'full_data_last_updated_at', 'actions_last_updated_at']
         if field_name not in allowed_fields:
             raise ValueError(f"无效的时间戳字段名: {field_name}")
         # 使用 f-string 插入列名是安全的，因为我们已经通过白名单验证了 field_name
@@ -316,5 +437,5 @@ class DatabaseManager:
             WHERE id = :security_id
         """)
         with self.engine.connect() as conn:
-            with conn.begin() as trans:
+            with conn.begin():
                 conn.execute(sql, {"security_id": security_id})

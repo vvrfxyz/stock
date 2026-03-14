@@ -5,7 +5,7 @@ import sys
 import time
 import argparse
 import random
-from datetime import datetime, timedelta, date
+from datetime import timedelta, date
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 
@@ -23,12 +23,85 @@ if project_root not in sys.path:
 
 from db_manager import DatabaseManager
 from data_models.models import Security
+from utils.trading_calendar import get_last_completed_trading_date
 
 # --- 配置区 ---
 # Akshare 抓取网页，并发不宜过高，且需要随机延时以防封禁
 MAX_CONCURRENT_WORKERS = 4
-# 默认增量更新时，检查最近两天的数据是否已同步
-INCREMENTAL_CHECK_DAYS = 2
+MAX_AKSHARE_RETRIES = 3
+
+# Eastmoney 相关接口在中国大陆一般无需走系统代理；部分环境会自动读取系统代理导致请求不稳定。
+# 这里将 eastmoney 域名加入 NO_PROXY，避免 ProxyError / 503 等偶发问题。
+EASTMONEY_NO_PROXY_HOSTS = [
+    "63.push2his.eastmoney.com",
+    "push2his.eastmoney.com",
+    "eastmoney.com",
+]
+
+
+def _ensure_no_proxy_for_hosts(hosts: list[str]) -> None:
+    existing = (os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or "").strip()
+    if existing == "*":
+        return
+
+    parts = [p.strip() for p in existing.split(",") if p.strip()]
+    parts_lower = {p.lower() for p in parts}
+
+    updated = False
+    for host in hosts:
+        host_clean = (host or "").strip()
+        if not host_clean:
+            continue
+        if host_clean.lower() in parts_lower:
+            continue
+        parts.append(host_clean)
+        parts_lower.add(host_clean.lower())
+        updated = True
+
+    if not updated:
+        return
+
+    value = ", ".join(parts)
+    os.environ["NO_PROXY"] = value
+    os.environ["no_proxy"] = value
+
+
+def _fetch_em_hist_df(em_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_AKSHARE_RETRIES + 1):
+        try:
+            if attempt == 1:
+                time.sleep(random.uniform(1.0, 2.0))
+            df = akshare.stock_us_hist(
+                symbol=em_code,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                adjust="",
+            )
+            if df is None:
+                raise RuntimeError("akshare 返回 None")
+            return df
+        except TypeError as e:
+            # Akshare 对部分美股标的（如权证/特殊票据/已退市等）可能出现该异常；视为无数据。
+            if "NoneType" in str(e):
+                last_exc = e
+                if attempt < MAX_AKSHARE_RETRIES:
+                    time.sleep(min(2.0, 0.5 * attempt))
+                    continue
+                logger.warning(f"[{em_code}] 东方财富接口无数据/不支持（NoneType），已跳过。")
+                return pd.DataFrame()
+            raise
+        except Exception as e:
+            last_exc = e
+            if attempt < MAX_AKSHARE_RETRIES:
+                time.sleep(min(5.0, 1.0 * attempt))
+                continue
+            break
+
+    if last_exc:
+        raise last_exc
+    return pd.DataFrame()
 
 
 def setup_logging():
@@ -65,7 +138,9 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def get_securities_to_update(db_manager: DatabaseManager, args: argparse.Namespace) -> list[Security]:
+def get_securities_to_update(
+    db_manager: DatabaseManager, args: argparse.Namespace, end_trading_date: date
+) -> list[Security]:
     """根据命令行参数，从数据库查询需要更新日线数据的证券列表。"""
     with db_manager.get_session() as session:
         query = session.query(Security).filter(
@@ -78,8 +153,8 @@ def get_securities_to_update(db_manager: DatabaseManager, args: argparse.Namespa
             query = query.filter(Security.em_code.in_(args.em_codes))
 
         if not args.full_refresh:
-            # 增量模式：只选择那些数据不是最新的股票
-            latest_required_date = date.today() - timedelta(days=INCREMENTAL_CHECK_DAYS)
+            # 增量模式：仅处理数据落后于“最近一个已收盘交易日”的股票
+            latest_required_date = end_trading_date
             query = query.filter(
                 or_(
                     Security.price_data_latest_date.is_(None),
@@ -96,7 +171,12 @@ def get_securities_to_update(db_manager: DatabaseManager, args: argparse.Namespa
         return query.all()
 
 
-def process_security(security: Security, db_manager: DatabaseManager, full_refresh: bool) -> tuple[str, str, int]:
+def process_security(
+    security: Security,
+    db_manager: DatabaseManager,
+    full_refresh: bool,
+    end_trading_date: date,
+) -> tuple[str, str, int]:
     """
     处理单个美股的日线数据：API获取 -> 数据清洗 -> DB存储 -> 更新时间戳。
     """
@@ -105,7 +185,7 @@ def process_security(security: Security, db_manager: DatabaseManager, full_refre
 
     try:
         # 1. 确定获取数据的起止日期
-        end_date = datetime.now().strftime('%Y%m%d')
+        end_date = end_trading_date.strftime('%Y%m%d')
         if full_refresh or security.price_data_latest_date is None:
             start_date = '19700101'  # 从一个很早的日期开始，获取全部历史
             is_full_run = True
@@ -118,15 +198,11 @@ def process_security(security: Security, db_manager: DatabaseManager, full_refre
             logger.info(f"[{em_code}] 数据已是最新，无需更新。")
             return em_code, "SUCCESS_UP_TO_DATE", 0
 
-        # 2. 调用 Akshare API 获取数据（带随机延时）
-        time.sleep(random.uniform(1.0, 2.0))
-        df = akshare.stock_us_hist(symbol=em_code, period="daily", start_date=start_date, end_date=end_date, adjust="")
+        # 2. 调用 Akshare API 获取数据（带随机延时 + 重试）
+        df = _fetch_em_hist_df(em_code=em_code, start_date=start_date, end_date=end_date)
 
         if df.empty:
-            logger.info(f"[{em_code}] 在时间范围 {start_date}-{end_date} 未获取到新数据。")
-            # 即使没数据，如果是增量模式，也更新时间戳到昨天，避免频繁查询
-            if not full_refresh:
-                db_manager.update_security_price_latest_date(security.id, date.today() - timedelta(days=1), is_full_run)
+            logger.warning(f"[{em_code}] 在时间范围 {start_date}-{end_date} 未获取到数据。")
             return em_code, "SUCCESS_NO_NEW_DATA", 0
 
         # 3. 数据清洗和格式化
@@ -141,10 +217,18 @@ def process_security(security: Security, db_manager: DatabaseManager, full_refre
 
         # 4. 准备入库数据
         df['security_id'] = security.id
-        df['vwap'] = pd.Series(None, index=df.index, dtype='float64')
-
-        required_cols = ['security_id', 'date', 'open', 'high', 'low', 'close', 'volume', 'turnover', 'turnover_rate',
-                         'vwap']
+        # 注意：东方财富不提供 VWAP，因此不要覆盖数据库现有 vwap 值
+        required_cols = [
+            'security_id',
+            'date',
+            'open',
+            'high',
+            'low',
+            'close',
+            'volume',
+            'turnover',
+            'turnover_rate',
+        ]
         price_data = df[required_cols].to_dict('records')
 
         # 5. 存储到数据库
@@ -158,7 +242,7 @@ def process_security(security: Security, db_manager: DatabaseManager, full_refre
         return em_code, "SUCCESS", len(price_data)
 
     except Exception as e:
-        logger.error(f"处理股票 {em_code} 日线数据时发生严重错误: {e}", exc_info=True)
+        logger.opt(exception=e).error("处理股票 {} 日线数据时发生严重错误: {}", em_code, e)
         return em_code, "ERROR", 0
 
 
@@ -171,8 +255,12 @@ def main():
 
     db_manager = None
     try:
+        _ensure_no_proxy_for_hosts(EASTMONEY_NO_PROXY_HOSTS)
         db_manager = DatabaseManager()
-        securities_to_process = get_securities_to_update(db_manager, args)
+        end_trading_date = get_last_completed_trading_date(args.market)
+        logger.info(f"本次将更新至最近已收盘交易日: {end_trading_date}")
+
+        securities_to_process = get_securities_to_update(db_manager, args, end_trading_date=end_trading_date)
 
         if not securities_to_process:
             logger.success("✅ 根据您的条件，没有找到需要更新日线数据的股票。任务完成。")
@@ -188,7 +276,9 @@ def main():
 
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             future_to_security = {
-                executor.submit(process_security, security, db_manager, args.full_refresh): security
+                executor.submit(
+                    process_security, security, db_manager, args.full_refresh, end_trading_date
+                ): security
                 for security in securities_to_process
             }
 
@@ -211,7 +301,7 @@ def main():
         logger.info("----------------------")
 
     except Exception as e:
-        logger.critical(f"脚本执行过程中遇到未处理的严重错误: {e}", exc_info=True)
+        logger.opt(exception=e).critical("脚本执行过程中遇到未处理的严重错误: {}", e)
     finally:
         if db_manager:
             db_manager.close()
