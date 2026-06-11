@@ -24,6 +24,8 @@ from scripts.update_massive_actions import main as update_actions_main
 from scripts.update_grouped_daily import main as update_grouped_daily_main
 from scripts.update_massive_prices import main as update_massive_prices_main
 from scripts.sync_massive_universe import main as sync_massive_universe_main
+from scripts.sync_sec_identifiers import main as sync_sec_identifiers_main
+from scripts.update_sec_filings import main as update_sec_filings_main
 from scripts.update_massive_shares import main as update_massive_shares_main
 from scripts.update_massive_events import main as update_massive_events_main
 from scripts.update_massive_short_data import main as update_massive_short_data_main
@@ -215,6 +217,24 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
                 ["--market", market, "--all", "--force"],
             )
         )
+        steps.append(
+            ScheduledStep(
+                "sync_sec_identifiers",
+                sync_sec_identifiers_main,
+                ["--market", market],
+            )
+        )
+        steps.append(
+            ScheduledStep(
+                "update_sec_filings_recent",
+                update_sec_filings_main,
+                [
+                    "--market", market,
+                    "--all",
+                    "--since", (run_date - timedelta(days=14)).isoformat(),
+                ],
+            )
+        )
     if _is_first_weekday_of_month(run_date, 1):
         steps.append(
             ScheduledStep(
@@ -369,6 +389,31 @@ def run_sync_massive_universe(args):
     if getattr(args, 'skip_mark_missing_inactive', False):
         cli_args.append('--skip-mark-missing-inactive')
     execute_script(sync_massive_universe_main, cli_args)
+
+
+def run_sync_sec_identifiers(args):
+    logger.info("执行: 同步 SEC CIK 身份映射")
+    execute_script(sync_sec_identifiers_main, ['--market', args.market])
+
+
+def run_update_sec_filings(args):
+    logger.info("执行: 同步 SEC filing 索引")
+    cli_args = list(args.symbols)
+    if args.all:
+        cli_args.append('--all')
+    if args.market:
+        cli_args.extend(['--market', args.market])
+    if args.limit > 0:
+        cli_args.extend(['--limit', str(args.limit)])
+    if args.since:
+        cli_args.extend(['--since', args.since])
+    if args.forms:
+        cli_args.extend(['--forms', args.forms])
+    if getattr(args, 'all_forms', False):
+        cli_args.append('--all-forms')
+    if getattr(args, 'include_older_pages', False):
+        cli_args.append('--include-older-pages')
+    execute_script(update_sec_filings_main, cli_args)
 
 
 def run_cleanup_us_universe(args):
@@ -543,6 +588,21 @@ def main():
     p_sync_universe.add_argument('--limit', type=int, default=0, help="限制处理数量。")
     p_sync_universe.add_argument('--skip-mark-missing-inactive', action='store_true', help="跳过 inactive 标记。")
     p_sync_universe.set_defaults(func=run_sync_massive_universe)
+
+    p_sec_ids = subparsers.add_parser('sync_sec_identifiers', help="同步 SEC ticker->CIK 身份映射")
+    p_sec_ids.add_argument('--market', type=str, default='US', help="当前仅支持 US。")
+    p_sec_ids.set_defaults(func=run_sync_sec_identifiers)
+
+    p_sec_filings = subparsers.add_parser('update_sec_filings', help="同步 SEC EDGAR filing 索引")
+    p_sec_filings.add_argument('symbols', nargs='*', help="要处理的股票代码列表。")
+    p_sec_filings.add_argument('--all', action='store_true', help="处理所有有 CIK 的活跃证券。")
+    p_sec_filings.add_argument('--market', type=str, default='US', help="当前仅支持 US。")
+    p_sec_filings.add_argument('--limit', type=int, default=0, help="限制处理数量。")
+    p_sec_filings.add_argument('--since', type=str, default=None, help="只保留该日期之后的 filing。")
+    p_sec_filings.add_argument('--forms', type=str, default=None, help="逗号分隔 form 列表覆盖默认集。")
+    p_sec_filings.add_argument('--all-forms', action='store_true', help="不过滤 form type。")
+    p_sec_filings.add_argument('--include-older-pages', action='store_true', help="追加历史分页（深回填）。")
+    p_sec_filings.set_defaults(func=run_update_sec_filings)
 
     # --- 定义 'update_details' 命令 ---
     p_details = subparsers.add_parser('update_details', help="单独更新股票的详细信息 (来自Massive)")

@@ -18,6 +18,8 @@ from data_models.models import (
     CorporateAction,
     NewsArticle,
     NewsArticleInsight,
+    SecFiling,
+    SecurityIdentifier,
     SecuritySymbolHistory,
     ShortInterest,
     ShortVolume,
@@ -768,6 +770,82 @@ class DatabaseManager:
             result = conn.execute(stmt)
             conn.commit()
             return result.rowcount
+
+    def insert_missing_security_identifiers(self, rows_data: list[dict]) -> int:
+        """只插入库内不存在的 (security_id, id_type, id_value, source) 身份行。
+
+        不能走 ON CONFLICT：唯一约束含 start_date，而身份快照行的 start_date 为 NULL，
+        PG 默认 NULLS DISTINCT 导致冲突永不触发、每次运行都会重复插入。
+        """
+        rows = [_clean_for_model(SecurityIdentifier, row) for row in rows_data]
+        rows = [
+            row for row in rows
+            if row.get("security_id") and row.get("id_type") and row.get("id_value") and row.get("source")
+        ]
+        if not rows:
+            return 0
+
+        with self.engine.connect() as conn:
+            existing = {
+                (r.security_id, r.id_type, r.id_value, r.source)
+                for r in conn.execute(
+                    SecurityIdentifier.__table__.select().with_only_columns(
+                        SecurityIdentifier.security_id,
+                        SecurityIdentifier.id_type,
+                        SecurityIdentifier.id_value,
+                        SecurityIdentifier.source,
+                    ).where(SecurityIdentifier.id_type.in_({row["id_type"] for row in rows}))
+                )
+            }
+            fresh = [
+                row for row in rows
+                if (row["security_id"], row["id_type"], row["id_value"], row["source"]) not in existing
+            ]
+            if not fresh:
+                return 0
+            self._lock_model_sequence_sync(conn, SecurityIdentifier)
+            self._sync_model_id_sequence(conn, SecurityIdentifier)
+            for group in _group_rows_by_key_set(fresh):
+                conn.execute(pg_insert(SecurityIdentifier).values(group))
+            conn.commit()
+            return len(fresh)
+
+    def upsert_sec_filings(self, rows_data: list[dict]) -> int:
+        rows = [_clean_for_model(SecFiling, row) for row in rows_data]
+        rows = [
+            row for row in rows
+            if row.get("source") and row.get("accession_number") and row.get("form_type") and row.get("filing_date")
+        ]
+        if not rows:
+            return 0
+
+        # 同一 accession 在一批内可能出现两次（如双重上市类多 security 共用 CIK），保留首条。
+        deduped: dict[tuple, dict] = {}
+        for row in rows:
+            deduped.setdefault((row["source"], row["accession_number"]), row)
+        rows = list(deduped.values())
+
+        written = 0
+        with self.engine.connect() as conn:
+            self._lock_model_sequence_sync(conn, SecFiling)
+            self._sync_model_id_sequence(conn, SecFiling)
+            for group in _group_rows_by_key_set(rows):
+                stmt = pg_insert(SecFiling).values(group)
+                update_keys = set(group[0].keys())
+                update_columns = {
+                    key: getattr(stmt.excluded, key)
+                    for key in update_keys
+                    if key not in {"id", "source", "accession_number", "created_at", "available_at"}
+                }
+                update_columns["updated_at"] = func.now()
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["source", "accession_number"],
+                    set_=update_columns,
+                )
+                result = conn.execute(stmt)
+                written += result.rowcount
+            conn.commit()
+        return written
 
     def upsert_news_articles(self, articles: list[dict], symbol_to_id: dict[str, int] | None = None) -> tuple[int, int]:
         if not articles:

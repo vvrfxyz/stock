@@ -64,6 +64,7 @@ Required configuration:
 
 - `DATABASE_URL` in `.env`.
 - Massive API keys in `activation_value.txt`, one key per line.
+- `SEC_USER_AGENT` in `.env` for SEC EDGAR scripts (self-identifying UA required by SEC).
 
 Optional ClickHouse configuration:
 
@@ -85,6 +86,9 @@ python main.py update_massive_events META --force
 python main.py update_massive_short_data TSLA --force
 python main.py update_massive_news TSLA --force --lookback-days 7
 python main.py update_adjustment_factors AAPL
+
+python main.py sync_sec_identifiers                 # SEC ticker->CIK 映射
+python main.py update_sec_filings aapl              # SEC filing 索引；--all 全市场约 18 分钟
 
 python main.py init_clickhouse
 python main.py backfill_clickhouse_daily_bars --limit 10000
