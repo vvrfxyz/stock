@@ -1,7 +1,12 @@
 import unittest
 from datetime import date
 
-from data_sources.sec_edgar_source import SecEdgarSource, cik_to_10digit, normalize_cik
+from data_sources.sec_edgar_source import (
+    SecEdgarSource,
+    cik_to_10digit,
+    normalize_cik,
+    parse_company_facts,
+)
 
 
 class FakeResponse:
@@ -106,6 +111,68 @@ class FetchFilingsTests(unittest.TestCase):
         source_since = _source({"CIK0000320193.json": self.SUBMISSIONS})
         recent_only = source_since.fetch_filings("320193", since=date(2026, 1, 1))
         self.assertEqual([r["form_type"] for r in recent_only], ["4"])
+
+
+class ParseCompanyFactsTests(unittest.TestCase):
+    PAYLOAD = {
+        "facts": {
+            "us-gaap": {
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            # Q2 10-Q 同 accession 同 end 给 3 个月 + 6 个月两条（start 不同）
+                            {"start": "2025-12-28", "end": "2026-03-28", "val": 111184000000,
+                             "accn": "0000320193-26-000013", "fy": 2026, "fp": "Q2", "form": "10-Q",
+                             "filed": "2026-05-01", "frame": "CY2026Q1"},
+                            {"start": "2025-09-28", "end": "2026-03-28", "val": 213500000000,
+                             "accn": "0000320193-26-000013", "fy": 2026, "fp": "Q2", "form": "10-Q",
+                             "filed": "2026-05-01"},
+                        ]
+                    }
+                },
+                "Assets": {
+                    "units": {
+                        "USD": [
+                            # instant 型：无 start
+                            {"end": "2026-03-28", "val": 371082000000, "accn": "0000320193-26-000013",
+                             "fy": 2026, "fp": "Q2", "form": "10-Q", "filed": "2026-05-01",
+                             "frame": "CY2026Q1I"},
+                        ]
+                    }
+                },
+                "NotInWhitelist": {
+                    "units": {"USD": [{"end": "2026-03-28", "val": 1, "accn": "x", "filed": "2026-05-01"}]}
+                },
+            },
+        }
+    }
+    CONCEPTS = {"us-gaap": {"Revenues", "Assets"}}
+
+    def test_duration_pairs_with_same_end_both_kept(self):
+        rows = parse_company_facts(self.PAYLOAD, "0000320193", concepts=self.CONCEPTS)
+        revenues = [r for r in rows if r["concept"] == "Revenues"]
+        # 3 个月与 6 个月两条都保留——period_start 必须参与唯一键，否则丢一条
+        self.assertEqual(len(revenues), 2)
+        starts = {r["period_start"] for r in revenues}
+        self.assertEqual(starts, {date(2025, 12, 28), date(2025, 9, 28)})
+        for r in revenues:
+            self.assertFalse(r["is_instant"])
+
+    def test_instant_fact_uses_end_as_start(self):
+        rows = parse_company_facts(self.PAYLOAD, "0000320193", concepts=self.CONCEPTS)
+        assets = next(r for r in rows if r["concept"] == "Assets")
+        self.assertTrue(assets["is_instant"])
+        self.assertEqual(assets["period_start"], assets["period_end"])
+        self.assertEqual(assets["filed_date"], date(2026, 5, 1))
+
+    def test_whitelist_and_filed_since_filtering(self):
+        rows = parse_company_facts(self.PAYLOAD, "0000320193", concepts=self.CONCEPTS)
+        self.assertFalse(any(r["concept"] == "NotInWhitelist" for r in rows))
+
+        none_recent = parse_company_facts(
+            self.PAYLOAD, "0000320193", concepts=self.CONCEPTS, filed_since=date(2026, 6, 1)
+        )
+        self.assertEqual(none_recent, [])
 
 
 if __name__ == "__main__":

@@ -495,3 +495,41 @@ class NewsArticleInsight(Base):
     __table_args__ = (
         UniqueConstraint('source_article_id', 'ticker', name='_news_article_insight_article_ticker_uc'),
     )
+
+
+class SecFundamentalFact(Base):
+    """SEC XBRL companyfacts 的 curated 基本面事实。
+
+    一行 = 一个 (CIK, taxonomy, concept, unit, period, accession) 的申报值。
+    point-in-time 边界是 filed_date：任何因子计算只能使用 filed_date <= as_of 的行。
+    同一概念同一期间可能被后续申报修正（10-K/A 或下一期重述），按 filed_date
+    最新者为当前最优值——读取层负责选择，本表保留全部申报历史。
+    """
+    __tablename__ = 'sec_fundamental_facts'
+    id = Column(BigInteger, primary_key=True)
+    security_id = Column(BigInteger, ForeignKey('securities.id'), nullable=True, index=True)
+    cik = Column(String(20), nullable=False, index=True)
+    taxonomy = Column(String(20), nullable=False, comment="us-gaap / dei")
+    concept = Column(String(120), nullable=False, index=True, comment="XBRL 概念名（SEC 官方驼峰）")
+    unit = Column(String(40), nullable=False, comment="USD / shares / USD-per-shares 等")
+    period_start = Column(Date, nullable=False,
+                          comment="duration 型事实的期间起点；instant 型存 period_end（零长期间），保证唯一键非空")
+    period_end = Column(Date, nullable=False, index=True, comment="期间终点或 instant 时点")
+    is_instant = Column(Boolean, nullable=False, default=False, comment="True=时点值(资产负债表)；False=期间值")
+    value = Column(Numeric(28, 6), nullable=False)
+    fiscal_year = Column(Integer, nullable=True, comment="SEC fy 字段（申报口径财年）")
+    fiscal_period = Column(String(10), nullable=True, comment="FY/Q1/Q2/Q3/Q4")
+    form_type = Column(String(30), nullable=True, index=True)
+    accession_number = Column(String(32), nullable=False)
+    filed_date = Column(Date, nullable=False, index=True, comment="point-in-time 可见日：早于该日不可用")
+    frame = Column(String(30), nullable=True, comment="SEC frame 标签，如 CY2026Q1")
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    security = relationship("Security")
+    __table_args__ = (
+        UniqueConstraint(
+            'cik', 'taxonomy', 'concept', 'unit', 'period_start', 'period_end', 'accession_number',
+            name='_sec_fundamental_fact_uc',
+        ),
+    )

@@ -23,6 +23,7 @@ from utils.sec_config import get_sec_user_agent
 
 _TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
 _SUBMISSIONS_URL = "https://data.sec.gov/submissions/{filename}"
+_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik10}.json"
 _ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar/data"
 
 _DEFAULT_TIMEOUT = 30
@@ -196,3 +197,83 @@ class SecEdgarSource:
                     f"{_ARCHIVES_BASE}/{cik_int}/{accession_clean}/{primary_doc}" if primary_doc else None
                 ),
             }
+
+    # ------------------------------------------------------------------
+    # T2: XBRL companyfacts 基本面事实
+    # ------------------------------------------------------------------
+
+    def fetch_fundamental_facts(
+        self,
+        cik: str,
+        *,
+        concepts: dict[str, set[str]],
+        filed_since: date | None = None,
+    ) -> list[dict]:
+        """拉取一家公司的 curated XBRL 事实行。
+
+        404 表示该 CIK 没有 XBRL 财务数据（基金/信托/SPAC 壳），返回 []。
+        """
+        cik10 = cik_to_10digit(cik)
+        if cik10 is None:
+            return []
+        try:
+            payload = self._get_json(_COMPANYFACTS_URL.format(cik10=cik10))
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return []
+            raise
+        return parse_company_facts(payload, cik10, concepts=concepts, filed_since=filed_since)
+
+
+def parse_company_facts(
+    payload: dict,
+    cik10: str,
+    *,
+    concepts: dict[str, set[str]],
+    filed_since: date | None = None,
+) -> list[dict]:
+    """companyfacts JSON -> curated 事实行（API 与 bulk zip 共用）。
+
+    - concepts: {taxonomy: {concept,...}} 白名单（见 utils/sec_concepts.py）。
+    - filed_since: 只保留 filed >= 该日的事实；用于增量。
+    - instant 型事实（无 start）将 period_start 置为 period_end，is_instant=True，
+      保证唯一键 (cik,taxonomy,concept,unit,period_start,period_end,accession) 非空。
+    """
+    rows = []
+    facts = payload.get("facts") or {}
+    for taxonomy, wanted in concepts.items():
+        tax_facts = facts.get(taxonomy) or {}
+        for concept in wanted:
+            node = tax_facts.get(concept)
+            if not node:
+                continue
+            for unit, unit_facts in (node.get("units") or {}).items():
+                for fact in unit_facts:
+                    filed = _parse_date(fact.get("filed"))
+                    period_end = _parse_date(fact.get("end"))
+                    value = fact.get("val")
+                    accession = fact.get("accn")
+                    if filed is None or period_end is None or value is None or not accession:
+                        continue
+                    if filed_since and filed < filed_since:
+                        continue
+                    period_start = _parse_date(fact.get("start"))
+                    rows.append(
+                        {
+                            "cik": cik10,
+                            "taxonomy": taxonomy,
+                            "concept": concept,
+                            "unit": unit,
+                            "period_start": period_start or period_end,
+                            "period_end": period_end,
+                            "is_instant": period_start is None,
+                            "value": value,
+                            "fiscal_year": fact.get("fy"),
+                            "fiscal_period": fact.get("fp"),
+                            "form_type": fact.get("form"),
+                            "accession_number": accession,
+                            "filed_date": filed,
+                            "frame": fact.get("frame"),
+                        }
+                    )
+    return rows

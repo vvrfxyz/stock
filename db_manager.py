@@ -19,6 +19,7 @@ from data_models.models import (
     NewsArticle,
     NewsArticleInsight,
     SecFiling,
+    SecFundamentalFact,
     SecurityIdentifier,
     SecuritySymbolHistory,
     ShortInterest,
@@ -844,6 +845,54 @@ class DatabaseManager:
                 )
                 result = conn.execute(stmt)
                 written += result.rowcount
+            conn.commit()
+        return written
+
+    def upsert_sec_fundamental_facts(self, rows_data: list[dict]) -> int:
+        """写 curated XBRL 事实。值本身不可变（同一 accession 的申报值不会改），
+        冲突时只刷新 security_id 关联与 frame/fiscal 标签。批内按唯一键去重。"""
+        rows = [_clean_for_model(SecFundamentalFact, row) for row in rows_data]
+        rows = [
+            row for row in rows
+            if row.get("cik") and row.get("taxonomy") and row.get("concept") and row.get("unit")
+            and row.get("period_start") and row.get("period_end")
+            and row.get("accession_number") and row.get("filed_date") and row.get("value") is not None
+        ]
+        if not rows:
+            return 0
+
+        deduped: dict[tuple, dict] = {}
+        for row in rows:
+            key = (
+                row["cik"], row["taxonomy"], row["concept"], row["unit"],
+                row["period_start"], row["period_end"], row["accession_number"],
+            )
+            deduped[key] = row
+        rows = list(deduped.values())
+
+        written = 0
+        with self.engine.connect() as conn:
+            self._lock_model_sequence_sync(conn, SecFundamentalFact)
+            self._sync_model_id_sequence(conn, SecFundamentalFact)
+            for group in _group_rows_by_key_set(rows):
+                for start in range(0, len(group), 5000):
+                    chunk = group[start:start + 5000]
+                    stmt = pg_insert(SecFundamentalFact).values(chunk)
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=[
+                            'cik', 'taxonomy', 'concept', 'unit',
+                            'period_start', 'period_end', 'accession_number',
+                        ],
+                        set_={
+                            'security_id': stmt.excluded.security_id,
+                            'fiscal_year': stmt.excluded.fiscal_year,
+                            'fiscal_period': stmt.excluded.fiscal_period,
+                            'frame': stmt.excluded.frame,
+                            'updated_at': func.now(),
+                        },
+                    )
+                    result = conn.execute(stmt)
+                    written += result.rowcount
             conn.commit()
         return written
 
