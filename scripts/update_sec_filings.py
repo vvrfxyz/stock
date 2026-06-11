@@ -15,6 +15,7 @@ import sys
 import time
 from datetime import date, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 from loguru import logger
 from tqdm import tqdm
@@ -23,7 +24,7 @@ project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from data_models.models import Security
+from data_models.models import Security, SecurityIdentifier
 from data_sources.sec_edgar_source import SecEdgarSource, normalize_cik
 from db_manager import DatabaseManager
 from utils.script_logging import setup_logging as configure_script_logging
@@ -63,10 +64,12 @@ def resolve_forms(args: argparse.Namespace) -> set[str] | None:
 
 
 def get_target_securities(db_manager: DatabaseManager, args: argparse.Namespace) -> list:
+    """返回 (id, symbol, cik) 列表。CIK 优先取 SEC 官方映射（security_identifiers,
+    source='SEC'），其次 securities.cik（Massive，偶见给成子公司 CIK，见 sync 冲突告警）。"""
     with db_manager.get_session() as session:
         query = (
             session.query(Security.id, Security.symbol, Security.cik)
-            .filter(Security.market == "US", Security.cik.isnot(None))
+            .filter(Security.market == "US")
         )
         if args.symbols:
             query = query.filter(Security.symbol.in_([s.lower() for s in args.symbols]))
@@ -75,7 +78,20 @@ def get_target_securities(db_manager: DatabaseManager, args: argparse.Namespace)
         query = query.order_by(Security.id.asc())
         if args.limit > 0:
             query = query.limit(args.limit)
-        return query.all()
+        securities = query.all()
+
+        sec_cik_by_security = dict(
+            session.query(SecurityIdentifier.security_id, SecurityIdentifier.id_value)
+            .filter(SecurityIdentifier.id_type == "CIK", SecurityIdentifier.source == "SEC")
+            .all()
+        )
+
+    resolved = []
+    for sec in securities:
+        cik = sec_cik_by_security.get(sec.id) or sec.cik
+        if cik:
+            resolved.append(SimpleNamespace(id=sec.id, symbol=sec.symbol, cik=cik))
+    return resolved
 
 
 def main() -> int:
