@@ -2,10 +2,10 @@ import os
 import sys
 import time
 import argparse
-from datetime import timedelta
+from datetime import date, timedelta
 
 from loguru import logger
-from sqlalchemy import func
+from sqlalchemy import func, text
 
 # --- 路径设置 ---
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -28,6 +28,12 @@ def create_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("--limit", type=int, default=20, help="每项检查最多输出的样例数量 (默认: 20)")
+    parser.add_argument("--window-days", type=int, default=730,
+                        help="缺口/OHLC/跳变检查回看的天数 (默认: 730，即近 2 年)")
+    parser.add_argument("--jump-threshold", type=float, default=0.5,
+                        help="无事件大跳变的 |close/prev_close - 1| 阈值 (默认: 0.5)")
+    parser.add_argument("--gap-min-sessions", type=int, default=3,
+                        help="缺口检查中连续缺失交易日的最小会话数 (默认: 3，过滤个股正常停牌)")
     return parser
 
 
@@ -122,6 +128,197 @@ def check_symbol_normalization(session, limit: int) -> int:
     return bad_count
 
 
+def check_ohlc_validity(session, limit: int, window_start: date) -> int:
+    """OHLC 合法性：high >= low、high >= open/close、low <= open/close、价格非负、volume 非负。"""
+    sql = text(
+        """
+        SELECT dp.security_id, s.symbol, dp.date, dp.open, dp.high, dp.low, dp.close, dp.volume
+        FROM daily_prices dp
+        JOIN securities s ON s.id = dp.security_id
+        WHERE dp.date >= :window_start
+          AND dp.open IS NOT NULL AND dp.high IS NOT NULL
+          AND dp.low IS NOT NULL AND dp.close IS NOT NULL
+          AND (
+                dp.high < dp.low
+             OR dp.high < dp.open OR dp.high < dp.close
+             OR dp.low > dp.open OR dp.low > dp.close
+             OR dp.open <= 0 OR dp.close <= 0 OR dp.low <= 0
+             OR dp.volume < 0
+          )
+        ORDER BY dp.date DESC
+        """
+    )
+    rows = session.execute(sql, {"window_start": window_start}).all()
+    _report_rows(
+        f"OHLC 合法性（{window_start} 起）",
+        len(rows),
+        [
+            f"{r.symbol} {r.date} o={r.open} h={r.high} l={r.low} c={r.close} v={r.volume}"
+            for r in rows
+        ],
+        limit,
+    )
+    return len(rows)
+
+
+def check_calendar_gaps(session, limit: int, window_start: date, min_sessions: int) -> int:
+    """交易日缺口：在证券自身价格覆盖范围内，对照 XNYS 日历找连续缺失 >= min_sessions 的区间。
+
+    只检查活跃 CS/ETF；按"每证券实际 [max(min_date, window_start), max_date] 区间"对照，
+    避免把上市前/退市后误报为缺口。短缺口（< min_sessions）多为个股停牌，默认忽略。
+        """
+    sql = text(
+        """
+        WITH scope AS (
+            SELECT s.id AS security_id, s.symbol,
+                   GREATEST(MIN(dp.date), CAST(:window_start AS date)) AS check_start,
+                   MAX(dp.date) AS check_end
+            FROM securities s
+            JOIN daily_prices dp ON dp.security_id = s.id
+            WHERE s.is_active IS TRUE
+              AND upper(s.type) IN ('CS', 'ETF')
+              AND upper(s.market) = 'US'
+            GROUP BY s.id, s.symbol
+            HAVING MAX(dp.date) >= CAST(:window_start AS date)
+        ),
+        missing AS (
+            SELECT sc.security_id, sc.symbol, tc.trade_date,
+                   tc.trade_date
+                   - LAG(tc.trade_date) OVER (PARTITION BY sc.security_id ORDER BY tc.trade_date) AS prev_gap
+            FROM scope sc
+            JOIN trading_calendars tc
+              ON tc.exchange_mic = 'XNYS'
+             AND tc.is_open IS TRUE
+             AND tc.trade_date BETWEEN sc.check_start AND sc.check_end
+            LEFT JOIN daily_prices dp
+              ON dp.security_id = sc.security_id AND dp.date = tc.trade_date
+            WHERE dp.security_id IS NULL
+        ),
+        runs AS (
+            SELECT security_id, symbol, trade_date,
+                   SUM(CASE WHEN prev_gap IS NULL OR prev_gap > 7 THEN 1 ELSE 0 END)
+                       OVER (PARTITION BY security_id ORDER BY trade_date) AS run_id
+            FROM missing
+        )
+        SELECT security_id, symbol, MIN(trade_date) AS gap_start, MAX(trade_date) AS gap_end,
+               COUNT(*) AS missing_sessions
+        FROM runs
+        GROUP BY security_id, symbol, run_id
+        HAVING COUNT(*) >= :min_sessions
+        ORDER BY missing_sessions DESC, symbol
+        """
+    )
+    rows = session.execute(sql, {"window_start": window_start, "min_sessions": min_sessions}).all()
+    _report_rows(
+        f"交易日缺口（{window_start} 起，连续缺失 >= {min_sessions} 个交易日）",
+        len(rows),
+        [
+            f"{r.symbol} {r.gap_start} -> {r.gap_end} 缺 {r.missing_sessions} 个交易日"
+            for r in rows
+        ],
+        limit,
+    )
+    return len(rows)
+
+
+def check_split_jump_consistency(session, limit: int, window_start: date) -> int:
+    """拆股事件 vs 价格跳变互验：ex_date 当日 close/prev_close 应接近 split_from/split_to。
+
+    比值偏离预期超过 25% 视为可疑（正常波动叠加拆股的容差）。
+    """
+    sql = text(
+        """
+        WITH splits AS (
+            SELECT ca.security_id, s.symbol, ca.ex_date,
+                   ca.split_from, ca.split_to,
+                   (ca.split_from / ca.split_to) AS expected_ratio
+            FROM corporate_actions ca
+            JOIN securities s ON s.id = ca.security_id
+            WHERE ca.action_type = 'SPLIT'
+              AND ca.ex_date >= :window_start
+              AND ca.split_from > 0 AND ca.split_to > 0
+              AND s.is_active IS TRUE
+        ),
+        with_prices AS (
+            SELECT sp.*, dp.close AS ex_close,
+                   (SELECT dp2.close FROM daily_prices dp2
+                    WHERE dp2.security_id = sp.security_id AND dp2.date < sp.ex_date
+                      AND dp2.close IS NOT NULL
+                    ORDER BY dp2.date DESC LIMIT 1) AS prev_close
+            FROM splits sp
+            LEFT JOIN daily_prices dp
+              ON dp.security_id = sp.security_id AND dp.date = sp.ex_date
+        )
+        SELECT security_id, symbol, ex_date, split_from, split_to,
+               expected_ratio, prev_close, ex_close,
+               (ex_close / NULLIF(prev_close, 0)) AS actual_ratio
+        FROM with_prices
+        WHERE prev_close IS NOT NULL AND ex_close IS NOT NULL
+          AND ABS((ex_close / NULLIF(prev_close, 0)) / expected_ratio - 1) > 0.25
+        ORDER BY ex_date DESC
+        """
+    )
+    rows = session.execute(sql, {"window_start": window_start}).all()
+    _report_rows(
+        f"拆股日价格跳变与事件不符（{window_start} 起）",
+        len(rows),
+        [
+            f"{r.symbol} {r.ex_date} {r.split_from}:{r.split_to} 预期比值={float(r.expected_ratio):.4f} "
+            f"实际={float(r.actual_ratio):.4f} (prev={r.prev_close} ex={r.ex_close})"
+            for r in rows
+        ],
+        limit,
+    )
+    return len(rows)
+
+
+def check_unexplained_jumps(session, limit: int, window_start: date, threshold: float) -> int:
+    """无事件大跳变预警：|close/prev_close - 1| > threshold 且 ±1 个事实日内无拆股/分红事件。
+
+    只看活跃 CS/ETF、prev_close >= 1 美元（仙股噪声太大）。结果是"预警"而非"错误"。
+    """
+    sql = text(
+        """
+        WITH moves AS (
+            SELECT dp.security_id, s.symbol, dp.date, dp.close,
+                   LAG(dp.close) OVER (PARTITION BY dp.security_id ORDER BY dp.date) AS prev_close,
+                   LAG(dp.date) OVER (PARTITION BY dp.security_id ORDER BY dp.date) AS prev_date
+            FROM daily_prices dp
+            JOIN securities s ON s.id = dp.security_id
+            WHERE dp.date >= :window_start
+              AND dp.close IS NOT NULL
+              AND s.is_active IS TRUE
+              AND upper(s.type) IN ('CS', 'ETF')
+              AND upper(s.market) = 'US'
+        )
+        SELECT m.security_id, m.symbol, m.date, m.prev_close, m.close,
+               (m.close / NULLIF(m.prev_close, 0) - 1) AS pct_change
+        FROM moves m
+        WHERE m.prev_close >= 1
+          AND ABS(m.close / NULLIF(m.prev_close, 0) - 1) > :threshold
+          AND NOT EXISTS (
+              SELECT 1 FROM corporate_actions ca
+              WHERE ca.security_id = m.security_id
+                AND ca.ex_date BETWEEN m.prev_date AND m.date + 1
+          )
+        ORDER BY ABS(m.close / NULLIF(m.prev_close, 0) - 1) DESC
+        """
+    )
+    rows = session.execute(sql, {"window_start": window_start, "threshold": threshold}).all()
+    if not rows:
+        logger.success(f"✅ 无事件大跳变预警（{window_start} 起，阈值 {threshold:.0%}）: OK")
+        return 0
+    logger.warning(
+        f"⚠️ 无事件大跳变预警（{window_start} 起，阈值 {threshold:.0%}）: {len(rows)} 条"
+        f"（预警，需人工甄别：可能是真实暴涨暴跌、数据错误或漏录事件）"
+    )
+    for r in rows[:limit]:
+        logger.warning(
+            f"  - {r.symbol} {r.date} {r.prev_close} -> {r.close} ({float(r.pct_change):+.1%})"
+        )
+    return 0  # 预警不计入失败退出码
+
+
 def main():
     start_time = time.monotonic()
     setup_logging()
@@ -131,9 +328,18 @@ def main():
     try:
         db_manager = DatabaseManager()
         with db_manager.get_session() as session:
+            window_start = date.today() - timedelta(days=args.window_days)
             issues = 0
             issues += check_price_latest_date_consistency(session, limit=args.limit)
             issues += check_symbol_normalization(session, limit=args.limit)
+            issues += check_ohlc_validity(session, limit=args.limit, window_start=window_start)
+            issues += check_calendar_gaps(
+                session, limit=args.limit, window_start=window_start, min_sessions=args.gap_min_sessions
+            )
+            issues += check_split_jump_consistency(session, limit=args.limit, window_start=window_start)
+            check_unexplained_jumps(
+                session, limit=args.limit, window_start=window_start, threshold=args.jump_threshold
+            )
 
             if issues > 0:
                 logger.error(f"发现数据一致性问题（样例计数）: {issues}")

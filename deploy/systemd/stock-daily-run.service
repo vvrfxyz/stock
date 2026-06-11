@@ -2,6 +2,7 @@
 Description=Stock data scheduled update
 Wants=network-online.target docker.service
 After=network-online.target docker.service
+OnFailure=stock-notify-failure@%n.service
 
 [Service]
 Type=oneshot
