@@ -109,10 +109,14 @@ def load_db_bars(db_manager: DatabaseManager, symbol: str, window_start: date) -
 
 
 def load_split_events(db_manager: DatabaseManager, security_id: int) -> list[tuple[date, Decimal]]:
-    """split-only 单事件因子 (ex_date, split_from/split_to)，独立于 computed_adjustment_factors 重算。"""
+    """split-only 单事件因子 (ex_date, split_from/split_to)，独立于 computed_adjustment_factors 重算。
+
+    必须做经济去重：迁移遗留的 POLYGON 行与 MASSIVE 行可能记录同一事件
+    （唯一约束含 source），不去重会把同一拆股连乘两次。
+    """
     with db_manager.engine.connect() as conn:
         rows = conn.execute(text(
-            """SELECT ex_date, split_from, split_to FROM corporate_actions
+            """SELECT DISTINCT ex_date, split_from, split_to FROM corporate_actions
                WHERE security_id = :sid AND action_type='SPLIT'
                  AND split_from > 0 AND split_to > 0
                ORDER BY ex_date"""), {"sid": security_id}).all()

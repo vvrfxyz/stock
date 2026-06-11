@@ -18,6 +18,10 @@ def test_scheduled_update_runs_daily_tasks_every_day():
     assert "update_massive_prices" in names
     assert "update_massive_short_data" in names
     assert "update_open_close_summary" in names
+    assert "update_massive_actions_recent" in names
+    recent_step = next(step for step in steps if step.name == "update_massive_actions_recent")
+    assert "--recent-days" in recent_step.args
+    assert "--force" not in recent_step.args
     short_step = next(step for step in steps if step.name == "update_massive_short_data")
     assert "--force" not in short_step.args
 
@@ -27,6 +31,8 @@ def test_scheduled_update_staggers_weekly_tasks():
     sunday_names = _step_names(date(2026, 5, 17))
 
     assert "update_massive_shares" in saturday_names
+    assert "update_grouped_daily_recent" in saturday_names
+    assert "update_grouped_daily_recent" not in sunday_names
     assert "update_massive_actions" not in saturday_names
     assert "update_massive_actions" in sunday_names
     assert "update_massive_shares" not in sunday_names

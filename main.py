@@ -168,6 +168,11 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
             ["--market", market],
         ),
         ScheduledStep(
+            "update_massive_actions_recent",
+            update_actions_main,
+            ["--market", market, "--all", "--recent-days", "14"],
+        ),
+        ScheduledStep(
             "update_open_close_summary",
             update_open_close_summary_main,
             [
@@ -188,6 +193,18 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
                 "update_massive_shares",
                 update_massive_shares_main,
                 ["--market", market, "--all"],
+            )
+        )
+        grouped_start = shift_trading_date(market, end_trading_date, sessions=-5)
+        steps.append(
+            ScheduledStep(
+                "update_grouped_daily_recent",
+                update_grouped_daily_main,
+                [
+                    "--market", market,
+                    "--start-date", grouped_start.isoformat(),
+                    "--end-date", end_trading_date.isoformat(),
+                ],
             )
         )
     if run_date.weekday() == 6:
@@ -259,6 +276,7 @@ def run_update_actions(args):
     cli_args = []
     if args.all: cli_args.append('--all')
     if args.force: cli_args.append('--force')
+    if getattr(args, 'recent_days', 0): cli_args.extend(['--recent-days', str(args.recent_days)])
     if args.market: cli_args.extend(['--market', args.market])
     if args.limit > 0: cli_args.extend(['--limit', str(args.limit)])
     if args.workers: cli_args.extend(['--workers', str(args.workers)])
@@ -551,6 +569,7 @@ def main():
     p_actions.add_argument('--all', action='store_true', help="处理所有活跃股票。")
     p_actions.add_argument('--market', type=str, help="仅处理指定市场的股票。")
     p_actions.add_argument('--force', action='store_true', help="强制更新，忽略时间检查。")
+    p_actions.add_argument('--recent-days', type=int, default=0, help="只拉取最近 N 天的新事件。")
     p_actions.add_argument('--limit', type=int, default=0, help="限制处理的股票数量。")
     p_actions.add_argument('--workers', type=int, help="并发线程数。")
     p_actions.set_defaults(func=run_update_actions)
@@ -560,6 +579,7 @@ def main():
     p_massive_actions.add_argument('--all', action='store_true', help="处理所有活跃股票。")
     p_massive_actions.add_argument('--market', type=str, default='US', help="仅处理指定市场的股票。")
     p_massive_actions.add_argument('--force', action='store_true', help="强制更新，忽略时间检查。")
+    p_massive_actions.add_argument('--recent-days', type=int, default=0, help="只拉取最近 N 天的新事件。")
     p_massive_actions.add_argument('--limit', type=int, default=0, help="限制处理的股票数量。")
     p_massive_actions.add_argument('--workers', type=int, help="并发线程数。")
     p_massive_actions.set_defaults(func=run_update_actions)

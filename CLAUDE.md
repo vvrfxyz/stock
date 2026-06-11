@@ -90,7 +90,10 @@ python main.py init_clickhouse
 python main.py backfill_clickhouse_daily_bars --limit 10000
 
 python scripts/check_data_integrity.py --limit 5
+python scripts/audit_recent_data.py --sample-size 32   # vendor 对账抽样审计（耗 API 配额）
 ```
+
+Read adjusted prices via `utils/adjusted_prices.get_adjusted_daily_bars(session, symbol_or_id, start=, end=, as_of=)` — never store adjusted values back into fact tables.
 
 `daily_run` is only a compatibility alias for `update`.
 

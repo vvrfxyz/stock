@@ -56,6 +56,13 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--all", action="store_true", help="处理全部活跃保留类型证券。")
     parser.add_argument("--market", type=str, default="US", help="当前仅支持 US。")
     parser.add_argument("--force", action="store_true", help="强制刷新 Massive 可覆盖的最近 2 年窗口。")
+    parser.add_argument(
+        "--recent-days",
+        type=int,
+        default=0,
+        help="只拉取最近 N 天的新事件（忽略 90 天间隔，选取全部活跃证券）。"
+             "用于每日轻量补新，弥补周日全量被跳过时的事件缺口。",
+    )
     parser.add_argument("--limit", type=int, default=0, help="限制处理数量。")
     parser.add_argument("--workers", type=int, default=MAX_CONCURRENT_WORKERS, help="批次并发数。")
     return parser
@@ -72,7 +79,7 @@ def get_securities_to_update(db_manager: DatabaseManager, args: argparse.Namespa
         if args.symbols:
             query = query.filter(Security.symbol.in_([item.lower() for item in args.symbols]))
 
-        if not args.force:
+        if not args.force and not args.recent_days:
             update_before = datetime.now(timezone.utc) - timedelta(days=ACTIONS_UPDATE_INTERVAL_DAYS)
             query = query.filter(
                 or_(
@@ -87,7 +94,14 @@ def get_securities_to_update(db_manager: DatabaseManager, args: argparse.Namespa
         return query.all()
 
 
-def _get_batch_start_date(securities: list[Security], history_floor: date, force: bool) -> str:
+def _get_batch_start_date(
+    securities: list[Security],
+    history_floor: date,
+    force: bool,
+    recent_days: int = 0,
+) -> str:
+    if recent_days > 0:
+        return max(history_floor, date.today() - timedelta(days=recent_days)).isoformat()
     if force:
         return history_floor.isoformat()
 
@@ -200,10 +214,11 @@ def process_batch(
     db_manager: DatabaseManager,
     history_floor,
     force: bool,
+    recent_days: int = 0,
 ) -> tuple[Counter, list[Security]]:
     results_counter = Counter()
     changed: list[Security] = []
-    batch_start = _get_batch_start_date(securities, history_floor, force)
+    batch_start = _get_batch_start_date(securities, history_floor, force, recent_days)
     symbols = [security.symbol for security in securities]
 
     dividends = source.get_dividends_batch(symbols, start_date=batch_start, chunk_size=API_BATCH_SIZE)
@@ -278,7 +293,7 @@ def main() -> int:
 
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             future_to_batch = {
-                executor.submit(process_batch, batch, source, db_manager, history_floor, args.force): batch
+                executor.submit(process_batch, batch, source, db_manager, history_floor, args.force, args.recent_days): batch
                 for batch in batches
             }
             for future in tqdm(as_completed(future_to_batch), total=len(future_to_batch), desc="更新 Massive 公司行动"):
