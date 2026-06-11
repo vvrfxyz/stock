@@ -133,26 +133,40 @@ def _economic_action_key(action) -> tuple:
     )
 
 
-def _prefer_action(candidate, current):
-    if current is None:
-        return candidate
-    candidate_is_synthetic = _is_synthetic_source_event_id(getattr(candidate, "source_event_id", None))
-    current_is_synthetic = _is_synthetic_source_event_id(getattr(current, "source_event_id", None))
-    if current_is_synthetic and not candidate_is_synthetic:
-        return candidate
-    return current
-
-
 def dedupe_economic_actions(actions) -> tuple[list, int]:
-    deduped = {}
-    duplicate_count = 0
+    """按经济键（同日同金额/同比例）去重，但只移除合成 ID 替身：
+    - 组内存在真实 vendor ID 时，合成 ID 行（历史回填的替身）全部剔除；
+    - 多个不同真实 vendor ID 是真正的同日多笔事件（如 Ford 2025-02-18 常规+特别
+      分红同为 0.15），必须全部保留，否则累计因子缺一笔。
+    """
+    groups: dict[tuple, dict[str, list]] = {}
+    order: list[tuple] = []
     for action in actions:
         key = _economic_action_key(action)
-        preferred = _prefer_action(action, deduped.get(key))
-        if key in deduped:
-            duplicate_count += 1
-        deduped[key] = preferred
-    return list(deduped.values()), duplicate_count
+        if key not in groups:
+            groups[key] = {"real": [], "synthetic": []}
+            order.append(key)
+        bucket = "synthetic" if _is_synthetic_source_event_id(getattr(action, "source_event_id", None)) else "real"
+        groups[key][bucket].append(action)
+
+    deduped = []
+    duplicate_count = 0
+    for key in order:
+        group = groups[key]
+        real_by_id: dict[str, object] = {}
+        for action in group["real"]:
+            event_id = getattr(action, "source_event_id", None)
+            if event_id in real_by_id:
+                duplicate_count += 1
+            else:
+                real_by_id[event_id] = action
+        if real_by_id:
+            deduped.extend(real_by_id.values())
+            duplicate_count += len(group["synthetic"])
+        elif group["synthetic"]:
+            deduped.append(group["synthetic"][0])
+            duplicate_count += len(group["synthetic"]) - 1
+    return deduped, duplicate_count
 
 
 def _find_previous_close(price_dates: list[date], close_by_date: dict[date, Decimal], ex_date: date) -> Decimal | None:
@@ -224,6 +238,12 @@ def compute_adjustment_factor_rows(
             continue
         previous_close = None
         if (getattr(action, "action_type", "") or "").upper() == "DIVIDEND":
+            # 非 USD 分红（CAD/NOK/ILS 等跨上市公司）无法用 USD 收盘价折算因子——
+            # 混币种会产出 0.6x 量级的幻影跌幅。vendor 对这些事件同样不出因子行。
+            currency = (getattr(action, "currency", None) or "USD").upper()
+            if currency != "USD":
+                stats["SKIP_NON_USD_DIVIDEND"] += 1
+                continue
             previous_close = _find_previous_close(price_dates, close_by_date, ex_date)
         single_factor = _single_event_factor(action, previous_close)
         if single_factor is None:
@@ -311,12 +331,114 @@ def _load_actions_and_prices(db_manager: DatabaseManager, security_id: int, sour
     return actions, price_dates, close_by_date
 
 
+def evaluate_vendor_comparison(
+    rows: list[dict],
+    tolerance: Decimal,
+    as_of_date: date | None = None,
+) -> dict:
+    """对比 computed 与 vendor 因子。rows 需按 date 降序，每行含
+    date / action_type / single_event_factor / adjustment_factor / vendor_as_of。
+
+    Massive 的 historical_adjustment_factor 是"同类型事件链"：每个事件行 = 该事件及
+    之后所有同类型事件单因子的连乘——分红链不含拆股、拆股链不含分红，且不含
+    ex_date 在 as_of 之后的未来事件。computed 的 cumulative_factor 则是跨类型总链
+    （读取层复权口径），不能直接比；这里按 vendor 口径用 single_event_factor 重算。
+    """
+    from itertools import groupby
+
+    future_events = 0
+    eligible = []
+    for row in rows:
+        if not row["date"]:
+            continue
+        # vendor 是否包含某事件以 vendor 是否返回了该事件的参考行为准：ex_date 已到
+        # 的事件（含当日）vendor 会给行并计入链；尚未生效的未来事件无行、不计入。
+        # 仅当事件在 as_of 之后且 vendor 无行时才视为未来事件剔除——历史事件即使
+        # 缺 vendor 行（当时未抓到因子）也已真实发生，必须留在链中。
+        if as_of_date is not None and row["date"] > as_of_date and row["adjustment_factor"] is None:
+            future_events += 1
+            continue
+        eligible.append(row)
+
+    # 已滑出 730 天抓取窗口的事件其 vendor 行不再被刷新，链状态冻结在旧 as_of；
+    # 与当前链必然不一致（缺新事件），属预期陈旧而非数据错误，单独计数不算 fail。
+    latest_vendor_as_of = max(
+        (row["vendor_as_of"] for row in eligible if row["adjustment_factor"] is not None and row["vendor_as_of"]),
+        default=None,
+    )
+
+    stale_vendor = 0
+    vendor_unadjusted = 0
+    compared = []
+    chains: dict[str, Decimal] = {}
+    for _, group_iter in groupby(eligible, key=lambda r: r["date"]):
+        group = []
+        for row in group_iter:
+            action_type = (row["action_type"] or "").upper()
+            vendor_factor = _to_decimal(row["adjustment_factor"])
+            # vendor 对部分分派（如资本利得分派）用精确 1.0 占位表示不调整，
+            # 其链中该事件贡献 ×1；对账链按 vendor 口径跳过，单独计数。
+            if action_type == "DIVIDEND" and vendor_factor == 1:
+                vendor_unadjusted += 1
+                continue
+            group.append((row, action_type, vendor_factor))
+        date_factors: dict[str, Decimal] = {}
+        for row, action_type, _ in group:
+            single = _to_decimal(row["single_event_factor"]) or Decimal(1)
+            date_factors[action_type] = date_factors.get(action_type, Decimal(1)) * single
+        for action_type, date_factor in date_factors.items():
+            chains[action_type] = chains.get(action_type, Decimal(1)) * date_factor
+        vendor_rows_by_type: dict[str, list] = {}
+        for row, action_type, vendor_factor in group:
+            if vendor_factor is None:
+                continue
+            if latest_vendor_as_of and row["vendor_as_of"] and row["vendor_as_of"] < latest_vendor_as_of:
+                stale_vendor += 1
+                continue
+            vendor_rows_by_type.setdefault(action_type, []).append((row, vendor_factor))
+        for action_type, vendor_rows in vendor_rows_by_type.items():
+            expected = chains[action_type]
+            # 同日同类型多事件时 vendor 给日内顺序的后缀积，仅日内首事件等于全日积；
+            # 日内顺序对日线无意义，取与全日积最接近的行代表该组对账。
+            row, vendor_factor = min(vendor_rows, key=lambda rv: abs(expected - rv[1]))
+            compared.append({**row, "expected_factor": expected, "abs_diff": abs(expected - vendor_factor)})
+
+    if not compared:
+        return {
+            "matched": 0,
+            "failed": 0,
+            "max_abs_diff": None,
+            "rows": [],
+            "future_events": future_events,
+            "stale_vendor": stale_vendor,
+            "vendor_unadjusted": vendor_unadjusted,
+        }
+
+    compared.sort(key=lambda r: r["abs_diff"], reverse=True)
+    # 拆股链量级可达数万，纯绝对容忍对其过严；取绝对/相对容忍中的较大者。
+    failed = [
+        row
+        for row in compared
+        if row["abs_diff"] > max(tolerance, abs(_to_decimal(row["adjustment_factor"]) or Decimal(0)) * tolerance)
+    ]
+    return {
+        "matched": len(compared),
+        "failed": len(failed),
+        "max_abs_diff": compared[0]["abs_diff"],
+        "rows": compared[:10],
+        "future_events": future_events,
+        "stale_vendor": stale_vendor,
+        "vendor_unadjusted": vendor_unadjusted,
+    }
+
+
 def compare_with_vendor(
     db_manager: DatabaseManager,
     security_id: int,
     methodology_version: str,
     source: str,
     tolerance: Decimal,
+    as_of_date: date | None = None,
 ) -> dict:
     from sqlalchemy import text
 
@@ -327,10 +449,11 @@ def compare_with_vendor(
             c.factor_key,
             c.action_type,
             c.cumulative_factor,
+            c.single_event_factor,
             v.adjustment_factor,
-            ABS(c.cumulative_factor - v.adjustment_factor) AS abs_diff
+            v.as_of_date AS vendor_as_of
         FROM computed_adjustment_factors c
-        JOIN vendor_adjustment_factors v
+        LEFT JOIN vendor_adjustment_factors v
           ON v.security_id = c.security_id
          AND v.factor_type = c.factor_type
          AND v.factor_key = c.factor_key
@@ -338,7 +461,7 @@ def compare_with_vendor(
         WHERE c.security_id = :security_id
           AND c.methodology_version = :methodology_version
           AND c.factor_type = 'historical_adjustment'
-        ORDER BY abs_diff DESC, c.date DESC
+        ORDER BY c.date DESC
         """
     )
     with db_manager.engine.connect() as conn:
@@ -351,26 +474,7 @@ def compare_with_vendor(
             },
         ).mappings().all()
 
-    if not rows:
-        return {
-            "matched": 0,
-            "failed": 0,
-            "max_abs_diff": None,
-            "rows": [],
-        }
-
-    failed = [
-        row
-        for row in rows
-        if _to_decimal(row["abs_diff"]) is not None and _to_decimal(row["abs_diff"]) > tolerance
-    ]
-    max_abs_diff = _to_decimal(rows[0]["abs_diff"])
-    return {
-        "matched": len(rows),
-        "failed": len(failed),
-        "max_abs_diff": max_abs_diff,
-        "rows": rows[:10],
-    }
+    return evaluate_vendor_comparison([dict(row) for row in rows], tolerance, as_of_date)
 
 
 def refresh_vendor_daily_bar_factors(
@@ -432,7 +536,9 @@ def process_security(
         as_of_date=as_of_date,
     )
     inserted = db_manager.replace_computed_adjustment_factors(security.id, args.methodology_version, rows)
-    comparison = compare_with_vendor(db_manager, security.id, args.methodology_version, args.source, tolerance)
+    comparison = compare_with_vendor(
+        db_manager, security.id, args.methodology_version, args.source, tolerance, as_of_date=as_of_date
+    )
     if comparison.get("matched", 0) and comparison.get("failed", 0) == 0:
         status = "SUCCESS_MATCHED_VENDOR"
     elif comparison.get("matched", 0):
@@ -499,19 +605,21 @@ def main() -> int:
 
             if args.symbols and comparison.get("matched"):
                 logger.info(
-                    "[{}] matched={} failed={} max_abs_diff={}",
+                    "[{}] matched={} failed={} max_abs_diff={} future_events={}",
                     symbol,
                     comparison["matched"],
                     comparison["failed"],
                     comparison["max_abs_diff"],
+                    comparison.get("future_events", 0),
                 )
                 for row in comparison["rows"][:5]:
                     logger.info(
-                        "  {} {} vendor={} computed={} diff={}",
+                        "  {} {} vendor={} computed={} expected={} diff={}",
                         row["date"],
                         row["factor_key"],
                         row["adjustment_factor"],
                         row["cumulative_factor"],
+                        row.get("expected_factor"),
                         row["abs_diff"],
                     )
 
@@ -529,11 +637,12 @@ def main() -> int:
                 logger.warning("[{}] max_abs_diff={} failed={}", symbol, comparison["max_abs_diff"], comparison["failed"])
                 for row in comparison["rows"][:3]:
                     logger.warning(
-                        "  {} {} vendor={} computed={} diff={}",
+                        "  {} {} vendor={} computed={} expected={} diff={}",
                         row["date"],
                         row["factor_key"],
                         row["adjustment_factor"],
                         row["cumulative_factor"],
+                        row.get("expected_factor"),
                         row["abs_diff"],
                     )
         logger.info("--------------------------")
