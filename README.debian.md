@@ -2,6 +2,9 @@
 
 部署目录：`/home/wenruifeng/projects/stock`
 
+> 同步代码、迁移、故障排查的完整操作手册见 `docs/deployment.md`。
+> 该机器无法访问 github.com，必须从本地 SSH 直推同步。
+
 已准备的基础服务：
 - PostgreSQL 17.5 via Docker Compose: `stock-postgres`
 - ClickHouse 24.12 via Docker Compose: `stock-clickhouse`
