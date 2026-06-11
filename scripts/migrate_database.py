@@ -11,17 +11,35 @@ if project_root not in sys.path:
 # --- 路径设置结束 ---
 
 from db_manager import DatabaseManager
-from data_models.models import Base, Security, DailyPrice, StockDividend, StockSplit, TradingCalendar, HistoricalShare
+from data_models.models import (
+    Base,
+    DailyPrice,
+    CorporateAction,
+    Exchange,
+    HistoricalShare,
+    InstitutionalHolding,
+    InsiderTransaction,
+    SecFiling,
+    Security,
+    SecurityIdentifier,
+    SecuritySymbolHistory,
+    TradingCalendar,
+)
 
 # --- 配置 ---
 # 定义需要迁移的表，按照依赖关系排序 (Security 表通常最先)
 TABLES_TO_MIGRATE = [
     Security,
+    Exchange,
     TradingCalendar,
+    SecurityIdentifier,
+    SecFiling,
+    InsiderTransaction,
+    InstitutionalHolding,
     DailyPrice,
-    StockDividend,
-    StockSplit,
     HistoricalShare,
+    SecuritySymbolHistory,
+    CorporateAction,
 ]
 
 # 批量插入的大小
@@ -78,7 +96,7 @@ class DataMigrator:
                 logger.success(f"✅ 成功迁移 {total_rows} 条记录到表 '{table_name}'。")
 
             except Exception as e:
-                logger.error(f"迁移表 '{table_name}' 时发生错误: {e}", exc_info=True)
+                logger.opt(exception=e).error(f"迁移表 '{table_name}' 时发生错误: {e}")
                 target_session.rollback()
                 raise
 
@@ -116,4 +134,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

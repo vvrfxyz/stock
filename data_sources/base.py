@@ -36,6 +36,6 @@ class DataSourceInterface(abc.ABC):
         :param end: 结束日期，格式 'YYYY-MM-DD'，None 表示由数据源决定。
         :param adjusted: 是否使用复权数据（依数据源支持情况而定）。
         :return: 包含历史数据的 pandas DataFrame。
-                 建议列包括：'Open', 'High', 'Low', 'Close', 'Volume'（可选：'vwap', 'turnover' 等）。
+                 建议列包括：'Open', 'High', 'Low', 'Close', 'Volume'（可选：'vwap', 'trade_count' 等）。
         """
         raise NotImplementedError

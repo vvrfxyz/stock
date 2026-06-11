@@ -1,0 +1,39 @@
+# Documentation Index
+
+本文档目录只保留当前有效架构与运行说明。已放弃的数据源路径、旧事实表和历史复盘材料不再保留在主文档树中。
+
+## 当前有效文档
+
+- [Architecture](./architecture.md)
+  当前 PostgreSQL raw truth、Massive-only ingestion、复权 reference/cache、未来 ClickHouse 分工。
+
+- [Massive-only 重建与每日运行](./massive_rebuild_and_daily_run.md)
+  当前推荐命令、默认 `update` 链路、全量重建方式、单项维护入口。
+
+- [Debian 部署与 systemd timer](../README.debian.md)
+  每天 UTC+8 10:00 的生产定时、手动触发和日志检查命令。
+
+- [Massive 免费层日线能力](./massive_free_tier_daily_data.md)
+  当前 API key 已验证可拿到的数据范围、字段用途和不纳入范围。
+
+- [双库混合持久化架构方案](./polyglot_persistence_architecture.md)
+  PostgreSQL + ClickHouse 的目标形态和 ClickHouse Dictionary 方案。
+
+- [API Rate Limiting](./rate_limiting.md)
+  Massive 多 key 限流、429 处理和并发注意事项。
+
+## 归档证据
+
+- [Massive API Audit 2026-05-14](./archive/vendor_audits/massive_stock_api_audit_2026-05-14.md)
+  Vendor endpoint 能力和 key 权限边界的归档证据，不是当前 ingestion contract。
+
+## 当前事实层边界
+
+- `daily_prices` 不保存复权价格、复权因子、换手率、成交额或技术指标。
+- `corporate_actions` 是分红/拆股事件 truth。
+- `vendor_adjustment_factors` 是供应商 reference，不是 truth。
+- `computed_adjustment_factors` 是内部可重建 cache，不是 truth。
+- `historical_shares` / `historical_floats` 是换手率计算的点时输入。
+- `exchanges` 保存交易所/MIC 参考数据；`trading_calendars` 保存逐交易所逐日期 session，不能用 `exchanges` 取代。
+- `sec_filings` 是 SEC filing index foundation；`insider_transactions` 和 `institutional_holdings` 分别承载 Form 4/13-F 明细。
+- 金融报表和 ratios 当前不抓取。

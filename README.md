@@ -1,10 +1,12 @@
 # Stock Data Pipeline
 
-一个用于将美股/证券基础信息、公司行动（分红/拆股）和日线行情写入 PostgreSQL 的数据管道与命令行工具。
+一个 Greenfield 美股日线数据管道。当前主存储是 PostgreSQL，ClickHouse 作为未来矩阵计算与回测读取层；所有身份流转以 `security_id` 为锚点，`symbol` 只作为当前属性或历史属性。
+
+核心原则：数据库的事实层只保存 raw truth。日线行情只存供应商/交易所给出的原始事实字段；复权价格、换手率、技术指标、成交额等派生值不进入事实表。复权因子允许单独分层保存：供应商因子是 reference snapshot，内部因子是带版本和事件哈希的 reproducible cache。
 
 数据源：
-- Massive：US 股票详情、公司行动、日线聚合、Grouped Daily 刷新、shares/float
-- 东方财富（通过 `akshare`）：手动应急价格兜底
+- Massive：US 股票 universe、证券详情、公司行动、日线聚合、Grouped Daily、Daily Ticker Summary、shares/float。
+- 官方/参考源：交易所 MIC/日历与 SEC filing metadata 使用独立底层表承载；Massive 对应 endpoint 只作为补充和对账来源。
 
 ## Quickstart
 
@@ -12,44 +14,67 @@
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
+docker compose up -d clickhouse
 alembic upgrade head
-python main.py daily_run --market US
+python main.py init_clickhouse
+python main.py update --market US
 ```
 
 `.env` 至少需要：
-- `DATABASE_URL`：PostgreSQL 连接串
-- `MASSIVE_API_KEYS`：Massive API Key（多个 key 用英文逗号分隔）
+- `DATABASE_URL`：PostgreSQL 连接串。
+- `CLICKHOUSE_URL`：ClickHouse HTTP 地址，Docker 默认是 `http://localhost:8123`。
+- `CLICKHOUSE_DATABASE`：ClickHouse 数据库名，默认 `stock`。
+
+Massive API key 从项目根目录的 `activation_value.txt` 读取：
+- 默认路径：`activation_value.txt`。
+- 支持一行一个 key。
+- 空行和以 `#` 开头的注释行会被忽略。
 
 ## 常用命令
 
 ```bash
-# 标准每日增量流程（Universe -> 详情 -> 公司行动 -> Massive 个股/Grouped Daily -> shares -> turnover）
-python main.py daily_run --market US
+# 推荐的每日定时调度入口
+python main.py scheduled_update --market US
+
+# 轻量调试入口：只跑详情、公司行动、日线
+python main.py update --market US
+python main.py update AAPL
+
+# 初始化 ClickHouse schema
+docker compose up -d clickhouse
+python main.py init_clickhouse
+
+# 将 PostgreSQL daily_prices 既有历史回填到 ClickHouse
+python main.py backfill_clickhouse_daily_bars --limit 10000
+
+# Massive 免费层能力范围内的全量重建（最近 2 年窗口）
+python main.py rebuild_massive_dataset --market US
 
 # 同步 Massive universe
 python main.py sync_massive_universe --market US
 
-# 单独更新详情/公司行动
+# 单项调试入口（一般不需要日常手动跑）
 python main.py update_details AAPL NVDA --workers 4
 python main.py update_actions --market US --workers 4
-# 默认：update_actions 完成后会自动重算 adj_factor
 
-# 单独更新价格
+# 单项调试 raw 日线事实
 python main.py update_massive_prices AAPL --full-refresh
 python main.py update_grouped_daily --market US --start-date 2026-03-01 --end-date 2026-03-10
-python main.py update_em_prices --market US
+python main.py update_open_close_summary AAPL --start-date 2026-03-13 --end-date 2026-03-13
 
-# 复权因子（前复权 + total return：含拆股+现金分红）
-python main.py recalc_adj_factor AAPL
-
-# 补全公司行动历史（当 Massive 免费层 2 年窗口之外存在缺口时，用 YFinance 补齐；默认仅插入缺失日期）
-python main.py backfill_actions AAPL --recalc-adj-factor
-
-# 历史股本 & 换手率重建（优先 float_shares，否则 total_shares）
+# 历史股本 / float 事实
 python main.py update_massive_shares AAPL --full-refresh
-python main.py rebuild_turnover_rate --market US
 
-# 清理非普通股 / ETF / ADR 证券（默认 dry-run）
+# 辅助 raw facts
+python main.py update_massive_events META --force
+python main.py update_massive_short_data TSLA --force
+python main.py update_massive_news TSLA --force --lookback-days 7
+
+# 复权因子 reference/cache，对账用；不会写入 daily_prices
+python main.py update_adjustment_factors AAPL
+python main.py update_adjustment_factors AAPL --refresh-vendor-daily-bars --daily-start-date 2026-02-01 --daily-end-date 2026-05-13
+
+# 清理非普通股 / ETF 证券（默认 dry-run）
 python main.py cleanup_us_universe
 python main.py cleanup_us_universe --apply
 
@@ -57,39 +82,59 @@ python main.py cleanup_us_universe --apply
 python scripts/migrate_database.py
 ```
 
+`update` 默认顺序：
+1. `update_details`：自动检测是否需要更新股票基本信息（默认 30 天间隔）。
+2. `update_actions`：自动判断是否需要拉取最新分红/拆股（默认 90 天间隔或缺失）。
+3. `update_massive_prices`：自动补齐当前缺失的日线 raw bar。
+
+`scheduled_update` 是推荐的 cron 入口，顺序执行并复用同一进程内的 Massive key 限流状态：
+- 每天：`update_massive_prices`、`update_massive_short_data` 增量、最近已完成交易日的 `update_open_close_summary --all`。
+- 每周六：`update_massive_shares --all`。
+- 每周日：`update_massive_actions --all --force`。
+- 每月第一个周二：`update_massive_events --all --force`。
+- 每月第一个周三：`update_massive_details --all --force`。
+
+Debian 部署使用 systemd timer，每天 UTC+8 `10:00` 运行
+`scripts/run_daily_cron.sh`，实际执行同一个 `scheduled_update` 入口。安装和排障命令见
+`README.debian.md`。
+
+需要一次性重拉 Massive 可覆盖窗口时，仍然使用各单项命令的 `--force` 或
+`--full-refresh` 参数；默认日更路径不会走全量刷新。
+
+`daily_run` 仅作为兼容别名保留，等同于 `update`。
+
 ## 目录结构
 
-- `main.py`：CLI 中央控制器（集成调用 `scripts/` 的各个任务）
-- `scripts/`：各类更新/维护脚本（`update_*`, `migrate_database.py`, `calibrate_price_latest_date.py`）
-- `data_models/models.py`：SQLAlchemy ORM 模型（schema）
-- `db_manager.py`：`DatabaseManager`（session/upsert/批量写入）
-- `data_sources/`：外部数据源适配器（当前主要为 Massive）
-- `alembic/`：数据库迁移
-- `logs/`：运行日志（loguru 旋转写入）
+- `main.py`：CLI 中央控制器。
+- `scripts/`：各类更新/维护脚本。
+- `data_models/models.py`：SQLAlchemy ORM schema。
+- `db_manager.py`：`DatabaseManager` session/upsert/批量写入。
+- `data_sources/`：外部数据源适配器，当前主要为 Massive。
+- `utils/`：小型复用工具。
+- `alembic/`：数据库迁移。
+- `sql/clickhouse/`：ClickHouse DDL。
+- `logs/`：运行日志。
 
-## 开发提示
+## 数据一致性约定
 
-- 语法检查：`python -m compileall .`
-- 一致性检查（只读）：`python scripts/check_data_integrity.py`
-- schema 变更：更新 `data_models/models.py` 并生成/应用 Alembic revision（`alembic revision --autogenerate ...` / `alembic upgrade head`）
-
-## 数据一致性约定（重要）
-
-- 价格更新脚本默认只更新到最近一个**已收盘**交易日（避免时区差异与盘中数据）。
-- 只写“数据源确实提供”的字段，避免把未知字段写成 `NULL` 覆盖既有值：
-  - 东方财富更新不应覆盖 `daily_prices.vwap`；
-  - Massive 日线更新不应覆盖 `daily_prices.turnover_rate`；
-  - Grouped Daily 刷新仅更新已存在记录，并保持 `turnover_rate` 等字段原样。
-
-- `daily_prices.adj_factor`：
-  - 定义：前复权（最新交易日=1）+ total return（拆股+现金分红）。
-  - 用法：`adj_close = close * adj_factor`（OHLC 同理）。
+- 当前已实现数据都是日线级别，主存储统一使用 PostgreSQL；字段类型保持 ClickHouse 兼容，方便未来迁移到列式存储和分钟级数据。
+- 新增表或字段优先选择能直接映射到 ClickHouse 的口径，例如 `BIGINT/Int64`、`DATE/Date`、`TIMESTAMPTZ/DateTime64`、`NUMERIC(P,S)/Decimal(P,S)`。
+- 未来上分钟线时，沿用 `security_id + timestamp + OHLCV + VWAP + trade_count + source + ingested_at` 的口径，避免重新解释日线字段。
+- `daily_prices` 只保存 raw bar：`open/high/low/close/volume/vwap/trade_count/pre_market/after_hours`。
+- `daily_prices` 不保存 `adj_factor`、`split_adj_factor`、`turnover_rate`、`turnover` 或技术指标。
+- `vendor_adjustment_factors` 保存供应商返回的复权因子 reference，例如 Massive 的 `historical_adjustment_factor` 或 adjusted/raw close 比值。
+- `computed_adjustment_factors` 保存内部按 `corporate_actions + daily_prices` 重算的 cache，使用 `methodology_version` 和 `event_hash` 标记口径。
+- `corporate_actions` 是复权引擎唯一事件来源，保留 `DIVIDEND` / `SPLIT` 的供应商事件身份，允许同一 `ex_date` 存在多笔不同事件。
+- `historical_shares` 是换手率计算的点时股本事实来源，使用 `security_id + filing_date + source` 去重。
+- `exchanges` 以 MIC 作为交易所身份锚点；`trading_calendars` 保留逐交易所逐日期 session，不被 `exchanges` 取代。
+- `sec_filings` 是 SEC filing index foundation；Form 4 明细进入 `insider_transactions`，13-F 明细进入 `institutional_holdings`。
+- 价格更新脚本默认只更新到最近一个已收盘交易日，避免时区差异和盘中数据污染。
 
 ## 更多文档
 
+- 文档目录：`docs/README.md`
 - 架构与约定：`docs/architecture.md`
-- 复权因子口径：`docs/adj_factor.md`
-- 公司行动补全：`docs/actions_backfill.md`
+- 双库混合持久化目标架构：`docs/polyglot_persistence_architecture.md`
+- Massive 免费层日线能力：`docs/massive_free_tier_daily_data.md`
+- Massive-only 重建与每日运行：`docs/massive_rebuild_and_daily_run.md`
 - 变更记录：`CHANGELOG.md`
-- 事后分析（预防性）：`docs/postmortems/2026-03-11-security-upsert-overwrite.md`
-- 事后分析（预防性）：`docs/postmortems/2026-03-11-adj-factor-mismatch-incomplete-actions.md`

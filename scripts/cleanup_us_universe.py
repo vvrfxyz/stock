@@ -12,34 +12,33 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from data_models.models import DailyPrice, HistoricalShare, Security, StockDividend, StockSplit
+from data_models.models import (
+    ComputedAdjustmentFactor,
+    CorporateAction,
+    DailyPrice,
+    HistoricalFloat,
+    HistoricalShare,
+    NewsArticleInsight,
+    Security,
+    SecuritySymbolHistory,
+    ShortInterest,
+    ShortVolume,
+    VendorAdjustmentFactor,
+)
 from db_manager import DatabaseManager
 from utils.massive_config import ALLOWED_US_SECURITY_TYPES, enforce_us_market
+from utils.script_logging import setup_logging as configure_script_logging
 
 DELETE_BATCH_SIZE = 500
 
 
 def setup_logging():
-    logger.remove()
-    log_format = (
-        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-        "<level>{level: <8}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
-    )
-    logger.add(sys.stderr, level="INFO", format=log_format)
-    log_dir = os.path.join(project_root, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    logger.add(
-        os.path.join(log_dir, f"cleanup_us_universe_{{time}}.log"),
-        rotation="10 MB",
-        retention="10 days",
-        level="DEBUG",
-    )
+    configure_script_logging("cleanup_us_universe")
 
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="清理 US universe 中非普通股 / ETF / ADR 的证券及其关联数据。",
+        description="清理 US universe 中非普通股 / ETF 的证券及其关联数据。",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("--market", type=str, default="US", help="当前仅支持 US。")
@@ -69,13 +68,30 @@ def get_targets(db_manager: DatabaseManager, args: argparse.Namespace) -> list[S
 
 def collect_related_counts(db_manager: DatabaseManager, security_ids: list[int]) -> dict[str, int]:
     if not security_ids:
-        return {"daily_prices": 0, "dividends": 0, "splits": 0, "historical_shares": 0}
+        return {
+            "daily_prices": 0,
+            "vendor_adjustment_factors": 0,
+            "computed_adjustment_factors": 0,
+            "corporate_actions": 0,
+            "historical_shares": 0,
+            "historical_floats": 0,
+            "symbol_history": 0,
+            "short_interests": 0,
+            "short_volumes": 0,
+            "news_article_insights": 0,
+        }
     with db_manager.get_session() as session:
         return {
             "daily_prices": session.query(func.count()).select_from(DailyPrice).filter(DailyPrice.security_id.in_(security_ids)).scalar() or 0,
-            "dividends": session.query(func.count()).select_from(StockDividend).filter(StockDividend.security_id.in_(security_ids)).scalar() or 0,
-            "splits": session.query(func.count()).select_from(StockSplit).filter(StockSplit.security_id.in_(security_ids)).scalar() or 0,
+            "vendor_adjustment_factors": session.query(func.count()).select_from(VendorAdjustmentFactor).filter(VendorAdjustmentFactor.security_id.in_(security_ids)).scalar() or 0,
+            "computed_adjustment_factors": session.query(func.count()).select_from(ComputedAdjustmentFactor).filter(ComputedAdjustmentFactor.security_id.in_(security_ids)).scalar() or 0,
+            "corporate_actions": session.query(func.count()).select_from(CorporateAction).filter(CorporateAction.security_id.in_(security_ids)).scalar() or 0,
             "historical_shares": session.query(func.count()).select_from(HistoricalShare).filter(HistoricalShare.security_id.in_(security_ids)).scalar() or 0,
+            "historical_floats": session.query(func.count()).select_from(HistoricalFloat).filter(HistoricalFloat.security_id.in_(security_ids)).scalar() or 0,
+            "symbol_history": session.query(func.count()).select_from(SecuritySymbolHistory).filter(SecuritySymbolHistory.security_id.in_(security_ids)).scalar() or 0,
+            "short_interests": session.query(func.count()).select_from(ShortInterest).filter(ShortInterest.security_id.in_(security_ids)).scalar() or 0,
+            "short_volumes": session.query(func.count()).select_from(ShortVolume).filter(ShortVolume.security_id.in_(security_ids)).scalar() or 0,
+            "news_article_insights": session.query(func.count()).select_from(NewsArticleInsight).filter(NewsArticleInsight.security_id.in_(security_ids)).scalar() or 0,
         }
 
 
@@ -84,15 +100,21 @@ def run_apply(db_manager: DatabaseManager, security_ids: list[int]) -> Counter:
     for batch_ids in _iter_id_batches(security_ids):
         with db_manager.get_session() as session:
             deleted["daily_prices"] += session.execute(delete(DailyPrice).where(DailyPrice.security_id.in_(batch_ids))).rowcount or 0
-            deleted["dividends"] += session.execute(delete(StockDividend).where(StockDividend.security_id.in_(batch_ids))).rowcount or 0
-            deleted["splits"] += session.execute(delete(StockSplit).where(StockSplit.security_id.in_(batch_ids))).rowcount or 0
+            deleted["vendor_adjustment_factors"] += session.execute(delete(VendorAdjustmentFactor).where(VendorAdjustmentFactor.security_id.in_(batch_ids))).rowcount or 0
+            deleted["computed_adjustment_factors"] += session.execute(delete(ComputedAdjustmentFactor).where(ComputedAdjustmentFactor.security_id.in_(batch_ids))).rowcount or 0
+            deleted["corporate_actions"] += session.execute(delete(CorporateAction).where(CorporateAction.security_id.in_(batch_ids))).rowcount or 0
             deleted["historical_shares"] += session.execute(delete(HistoricalShare).where(HistoricalShare.security_id.in_(batch_ids))).rowcount or 0
+            deleted["historical_floats"] += session.execute(delete(HistoricalFloat).where(HistoricalFloat.security_id.in_(batch_ids))).rowcount or 0
+            deleted["symbol_history"] += session.execute(delete(SecuritySymbolHistory).where(SecuritySymbolHistory.security_id.in_(batch_ids))).rowcount or 0
+            deleted["short_interests"] += session.execute(delete(ShortInterest).where(ShortInterest.security_id.in_(batch_ids))).rowcount or 0
+            deleted["short_volumes"] += session.execute(delete(ShortVolume).where(ShortVolume.security_id.in_(batch_ids))).rowcount or 0
+            deleted["news_article_insights"] += session.execute(delete(NewsArticleInsight).where(NewsArticleInsight.security_id.in_(batch_ids))).rowcount or 0
             deleted["securities"] += session.execute(delete(Security).where(Security.id.in_(batch_ids))).rowcount or 0
             session.commit()
     return deleted
 
 
-def main():
+def main() -> int:
     start_time = time.monotonic()
     setup_logging()
     parser = create_parser()
@@ -104,7 +126,7 @@ def main():
         targets = get_targets(db_manager, args)
         if not targets:
             logger.success("没有命中需要清理的证券。")
-            return
+            return 0
 
         security_ids = [item.id for item in targets]
         type_counter = Counter((item.type or "NULL") for item in targets)
@@ -114,11 +136,17 @@ def main():
         for type_code, count in type_counter.most_common():
             logger.info("  type={} count={}", type_code, count)
         logger.info(
-            "  关联数据: daily_prices={} dividends={} splits={} historical_shares={}",
+            "  关联数据: daily_prices={} vendor_adjustment_factors={} computed_adjustment_factors={} corporate_actions={} historical_shares={} historical_floats={} symbol_history={} short_interests={} short_volumes={} news_insights={}",
             related_counts["daily_prices"],
-            related_counts["dividends"],
-            related_counts["splits"],
+            related_counts["vendor_adjustment_factors"],
+            related_counts["computed_adjustment_factors"],
+            related_counts["corporate_actions"],
             related_counts["historical_shares"],
+            related_counts["historical_floats"],
+            related_counts["symbol_history"],
+            related_counts["short_interests"],
+            related_counts["short_volumes"],
+            related_counts["news_article_insights"],
         )
         logger.info("  样例:")
         for item in targets[: args.sample_size]:
@@ -126,19 +154,27 @@ def main():
 
         if not args.apply:
             logger.warning("当前为 dry-run；如需真实删除，请添加 --apply。")
-            return
+            return 0
 
         deleted = run_apply(db_manager, security_ids)
         logger.success(
-            "删除完成: securities={} daily_prices={} dividends={} splits={} historical_shares={}",
+            "删除完成: securities={} daily_prices={} vendor_adjustment_factors={} computed_adjustment_factors={} corporate_actions={} historical_shares={} historical_floats={} symbol_history={} short_interests={} short_volumes={} news_insights={}",
             deleted["securities"],
             deleted["daily_prices"],
-            deleted["dividends"],
-            deleted["splits"],
+            deleted["vendor_adjustment_factors"],
+            deleted["computed_adjustment_factors"],
+            deleted["corporate_actions"],
             deleted["historical_shares"],
+            deleted["historical_floats"],
+            deleted["symbol_history"],
+            deleted["short_interests"],
+            deleted["short_volumes"],
+            deleted["news_article_insights"],
         )
+        return 0
     except Exception as e:
         logger.opt(exception=e).critical("cleanup_us_universe 执行失败: {}", e)
+        return 1
     finally:
         if db_manager:
             db_manager.close()
@@ -146,4 +182,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

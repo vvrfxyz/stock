@@ -16,22 +16,11 @@ if project_root not in sys.path:
 
 from db_manager import DatabaseManager
 from data_models.models import Security, DailyPrice
+from utils.script_logging import setup_logging as configure_script_logging
 
 
 def setup_logging():
-    """配置 Loguru 日志记录器"""
-    logger.remove()
-    log_format = (
-        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-        "<level>{level: <8}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
-    )
-    logger.add(sys.stderr, level="INFO", format=log_format)
-    log_dir = os.path.join(project_root, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    logger.add(os.path.join(log_dir, f"calibrate_price_date_{{time}}.log"), rotation="10 MB", retention="10 days",
-               level="DEBUG")
-    logger.info("日志记录器设置完成。")
+    configure_script_logging("calibrate_price_date")
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -125,7 +114,7 @@ def calibrate_latest_price_dates(db_manager: DatabaseManager, dry_run: bool = Fa
                 logger.success(f"✅ 校准完成！成功更新了 {rows_affected} 条记录。")
 
     except Exception as e:
-        logger.error(f"校准过程中发生错误: {e}", exc_info=True)
+        logger.opt(exception=e).error(f"校准过程中发生错误: {e}")
 
 
 def main():
@@ -140,7 +129,7 @@ def main():
         db_manager = DatabaseManager()
         calibrate_latest_price_dates(db_manager, dry_run=args.dry_run)
     except Exception as e:
-        logger.critical(f"脚本执行过程中遇到未处理的严重错误: {e}", exc_info=True)
+        logger.opt(exception=e).critical(f"脚本执行过程中遇到未处理的严重错误: {e}")
     finally:
         if db_manager:
             db_manager.close()

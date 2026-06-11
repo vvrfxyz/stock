@@ -15,24 +15,11 @@ if project_root not in sys.path:
 
 from db_manager import DatabaseManager
 from data_models.models import Security, DailyPrice
+from utils.script_logging import setup_logging as configure_script_logging
 
 
 def setup_logging():
-    logger.remove()
-    log_format = (
-        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-        "<level>{level: <8}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
-    )
-    logger.add(sys.stderr, level="INFO", format=log_format)
-    log_dir = os.path.join(project_root, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    logger.add(
-        os.path.join(log_dir, f"check_data_integrity_{{time}}.log"),
-        rotation="10 MB",
-        retention="10 days",
-        level="DEBUG",
-    )
+    configure_script_logging("check_data_integrity")
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -135,74 +122,6 @@ def check_symbol_normalization(session, limit: int) -> int:
     return bad_count
 
 
-def check_adj_factor_integrity(session, limit: int) -> int:
-    """
-    adj_factor 基础一致性检查：
-    - daily_prices.adj_factor 不应为 NULL
-    - 每个 security 的最新交易日（MAX(date)）adj_factor 应为 1
-    """
-    issue_count = 0
-
-    # A) 任意行 adj_factor 为 NULL
-    null_query = (
-        session.query(Security.id, Security.symbol, DailyPrice.date)
-        .join(DailyPrice, DailyPrice.security_id == Security.id)
-        .filter(DailyPrice.adj_factor.is_(None))
-    )
-    null_count = null_query.count()
-    null_rows = null_query.order_by(Security.id.asc(), DailyPrice.date.desc()).limit(limit).all()
-    if null_count > 0:
-        issue_count += null_count
-        _report_rows(
-            "daily_prices.adj_factor 为 NULL（样例）",
-            null_count,
-            [f"id={r.id} symbol={r.symbol} date={r.date}" for r in null_rows],
-            limit,
-        )
-    else:
-        logger.success("✅ daily_prices.adj_factor 非 NULL: OK")
-
-    # B) 最新交易日 adj_factor != 1
-    latest_subq = (
-        session.query(
-            DailyPrice.security_id,
-            func.max(DailyPrice.date).label("max_date"),
-        )
-        .group_by(DailyPrice.security_id)
-        .subquery("latest_dates")
-    )
-    latest_factor_query = (
-        session.query(
-            Security.id,
-            Security.symbol,
-            latest_subq.c.max_date,
-            DailyPrice.adj_factor,
-        )
-        .join(latest_subq, Security.id == latest_subq.c.security_id)
-        .join(
-            DailyPrice,
-            (DailyPrice.security_id == latest_subq.c.security_id) & (DailyPrice.date == latest_subq.c.max_date),
-        )
-        .filter(
-            (DailyPrice.adj_factor.is_(None)) | (DailyPrice.adj_factor != 1)
-        )
-    )
-    bad_latest_count = latest_factor_query.count()
-    bad_latest_rows = latest_factor_query.order_by(Security.id.asc()).limit(limit).all()
-    if bad_latest_count > 0:
-        issue_count += bad_latest_count
-        _report_rows(
-            "最新交易日 adj_factor 不为 1（样例）",
-            bad_latest_count,
-            [f"id={r.id} symbol={r.symbol} date={r.max_date} adj_factor={r.adj_factor}" for r in bad_latest_rows],
-            limit,
-        )
-    else:
-        logger.success("✅ 最新交易日 adj_factor = 1: OK")
-
-    return issue_count
-
-
 def main():
     start_time = time.monotonic()
     setup_logging()
@@ -215,7 +134,6 @@ def main():
             issues = 0
             issues += check_price_latest_date_consistency(session, limit=args.limit)
             issues += check_symbol_normalization(session, limit=args.limit)
-            issues += check_adj_factor_integrity(session, limit=args.limit)
 
             if issues > 0:
                 logger.error(f"发现数据一致性问题（样例计数）: {issues}")

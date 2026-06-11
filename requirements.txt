@@ -1,13 +1,10 @@
-akshare
 exchange_calendars
 loguru
 numpy
 pandas
-polygon-api-client
 psycopg2-binary
 python-dotenv
 requests
 alembic
 sqlalchemy
 tqdm
-yfinance==1.2.0

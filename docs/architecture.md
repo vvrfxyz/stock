@@ -1,80 +1,177 @@
 # Architecture
 
-本项目是一个以 PostgreSQL 为中心的股票数据落库流水线，`main.py` 负责调度，`scripts/` 负责具体任务，`db_manager.py` 统一 DB 写入逻辑，`data_sources/` 负责外部数据源适配。
+本项目按 Greenfield raw truth 原则设计：PostgreSQL 负责证券身份、元数据、事件事实和当前日线事实；ClickHouse 负责未来大规模矩阵读取和回测扫描。全系统以 `security_id` 作为 durable identity，`symbol` 只是当前代码或历史代码属性。
 
 ## 数据源与职责边界
 
 - Massive
-  - `securities` Universe / 基本信息（名称、交易所、描述等）
-  - 公司行动：分红、拆股
-  - 日线价格（OHLCV、VWAP、turnover）
-  - Grouped Daily：用于对指定日期范围进行“已存在记录”的回填/刷新（用于修正最新交易日）
-  - `historical_shares`：通过 Ticker Overview 的 outstanding shares 与 Float 接口补齐 `total_shares` / `float_shares`
-- 东方财富（`akshare`）
-  - 日线价格应急兜底
-  - 不作为默认主链路
-- YFinance（补全/回填）
-  - 公司行动历史补全（分红/拆股）：用于 Massive 免费层 2 年窗口之外的缺口补齐（`python main.py backfill_actions ...`）
+  - `securities`：Universe / 证券详情。
+  - `security_symbol_history`：ticker events / symbol history。
+  - `corporate_actions`：分红、拆股事件事实。
+  - `daily_prices`：日线 OHLCV、VWAP、trade_count、盘前/盘后价格。
+  - `historical_shares`：total shares / float shares 的点时事实。
+  - `historical_floats`：free float effective-date 事实。
+  - `short_interests` / `short_volumes`：做空相关日线/结算日事实。
+  - `news_articles` / `news_article_insights`：新闻和 ticker sentiment metadata。
 
-关键原则：**只写自己真正“有来源保证”的字段**。例如：
-- 东方财富不提供 VWAP，所以不应把 `daily_prices.vwap` 写成 `NULL` 覆盖既有值。
-- Massive 不直接提供换手率，所以价格更新任务不应把 `daily_prices.turnover_rate` 写成 `NULL` 覆盖既有值。
+- Official/reference sources
+  - `exchanges`：以 ISO 10383 MIC 为交易所身份锚点，Massive exchange reference 可作为补充字段。
+  - `trading_calendars`：以交易所官方交易日历为 truth；Massive market status/upcoming holidays 只作为运行时检查或补充监控。
+  - `sec_filings`：SEC EDGAR filing index metadata，Massive filings index 可作为结构化补充和对账来源。
+  - `insider_transactions`：Form 3/4/5 ownership transaction 明细，优先保留 accession 可追溯性。
+  - `institutional_holdings`：13-F holdings 明细，使用 CUSIP/issuer/title 映射到 `security_id`，映射不确定时允许 `security_id` 为空。
+  - `security_identifiers`：CUSIP/CIK/FIGI/ISIN 等证券标识符的点时映射层。
 
-## 核心表语义（约束/不变量）
+关键原则：事实表只写数据源或交易事实直接提供的字段。派生值不进入事实表，包括复权价格、换手率、成交额和技术指标。复权因子可以保存，但必须单独分层：供应商因子是 reference，内部因子是可重建 cache，不是 source-of-truth。
 
-- `securities.symbol`
-  - 约定：标准化小写（例如 `aapl`）。
-  - 用作脚本输入标识符。
-- `securities.info_last_updated_at`
-  - 语义：证券“非价格详情”最后一次成功刷新时间。
-  - 仅由详情脚本更新。
-- `securities.price_data_latest_date`
-  - 语义：该证券在 `daily_prices` 中**实际覆盖到的最新日期**（应与 `MAX(daily_prices.date)` 对齐）。
-  - 仅由价格写入脚本在成功写入后更新；必要时可用 `scripts/calibrate_price_latest_date.py` 纠偏。
-- `daily_prices.vwap`
-  - 可能为 `NULL`（例如仅由东方财富落库时）；由 Massive 系列任务补齐/修正。
-- `daily_prices.turnover_rate`
-  - 由 `historical_shares` 与 `daily_prices.volume` 重建得出。
-  - 口径：优先 `float_shares`，否则 `total_shares`，否则保持 `NULL`。
-- `daily_prices.adj_factor`
-  - 定义：前复权（最新交易日=1）+ total return（拆股+现金分红）。
-  - 用法：查询侧 `adj_close = close * adj_factor`（OHLC 同理）。
-  - 维护：由 `scripts/recalc_adj_factor.py` 统一回填；`update_actions` 默认在 actions 有新增落库时自动触发重算。
+## PostgreSQL 与 ClickHouse 边界
+
+- PostgreSQL 是元数据、事件和日线 raw fact 的事务中心。
+- ClickHouse 当前只保留 `raw_daily_bars` / `canonical_daily_bars`，并通过 Dictionary 读取 PostgreSQL 维度。
+- PostgreSQL 字段要保持 ClickHouse 友好：`BIGINT -> Int64`、`DATE -> Date`、`TIMESTAMPTZ -> DateTime64`、`NUMERIC(P,S) -> Decimal(P,S)`。
+- 分钟级数据尚未落地；未来新增分钟线时，沿用 `security_id + timestamp + OHLCV + VWAP + trade_count + source + ingested_at`。
+
+## 核心表语义
+
+- `securities`
+  - `id` 是全局证券身份，所有事实表都引用它。
+  - `current_symbol` 是当前最新代码，不作为历史回测的 durable key。
+  - `price_data_latest_date` 与 `daily_prices.max(date)` 对齐，用于增量调度。
+
+- `security_symbol_history`
+  - 记录代码变更历史，用于避免 symbol 变更带来的幸存者偏差和未来函数。
+
+- `daily_prices`
+  - 保存 PostgreSQL 侧 raw 日线事实。
+  - 字段只包含 `open/high/low/close/volume/vwap/trade_count/pre_market/after_hours`。
+  - 不保存 `adj_factor`、`split_adj_factor`、`turnover_rate`、`turnover` 或技术指标。
+
+- `vendor_adjustment_factors`
+  - 保存供应商提供或可直接从供应商 adjusted/raw 响应得到的复权 reference。
+  - Massive 分红/拆股的 `historical_adjustment_factor` 按 `factor_key = dividend:<source_event_id>` 或 `split:<source_event_id>` 落库，便于和内部计算精确对账。
+  - 该表不参与 truth 判定；供应商修正时可以覆盖为新的 snapshot。
+
+- `computed_adjustment_factors`
+  - 保存内部由 `corporate_actions + daily_prices` 计算出的复权因子 cache。
+  - 当前 `raw_actions_v1` 口径：拆股因子为 `split_from / split_to`；现金分红因子为 `(前一交易日 raw close - cash_amount) / 前一交易日 raw close`。
+  - `cumulative_factor` 表示“该事件及之后所有事件”的累计因子，用于对齐 Massive `historical_adjustment_factor`。
+  - `methodology_version` 和 `event_hash` 用来保证可复现；事件修正后按证券重建即可。
+
+- `corporate_actions`
+  - 保存分红和拆股的事件真相。
+  - `ex_date` 是回测和复权计算的核心日期。
+  - `source_event_id` 是供应商事件身份，允许同一 `ex_date` 有多笔不同分红事件。
+
 - `historical_shares`
-  - 历史股本（来源：Massive Overview / Float）。
-  - Massive 免费层只覆盖最近约 2 年；更老历史保留只读，不主动回刷。
+  - 保存股本点时事实。
+  - `filing_date` 表示这条股本事实何时可被使用，是防未来函数边界。
+  - `period_end_date` 表示这条事实归属的报告/快照周期。
+  - `total_shares` 必填，`float_shares` 可选。
 
-## Trading-date（交易日）策略
+- `historical_floats`
+  - 保存 Massive float endpoint 返回的 effective-date free float。
+  - 与 `historical_shares` 一起作为未来换手率/流通盘分析输入。
 
-所有“日线价格更新”任务都应更新到最近一个**已收盘**的交易日（close-aware），避免：
-- 在美股交易中途把当日未收盘数据写入数据库；
-- 因为时区（例如在 Asia/Shanghai 运行）导致日期偏移。
+- `short_interests`
+  - 保存 settlement-date short interest、days to cover 和平均成交量。
+  - 适合做拥挤度、空头压力和 squeeze 风险特征。
 
-本项目使用 `exchange_calendars`（`utils/trading_calendar.py`）计算最近已完成交易日，并在增量更新时以该日期作为 `end_date`。
+- `short_volumes`
+  - 保存每日 short volume、total volume 和交易场所分解。
+  - `short_volume_ratio` 来自供应商字段或可审计映射，不作为本地 turnover 替代品。
 
-## Daily 工作流（`python main.py daily_run`）
+- `news_articles` / `news_article_insights`
+  - 保存 Massive 新闻 metadata 和 ticker sentiment insights。
+  - 用于未来事件驱动、情绪因子和风控过滤。
 
-默认顺序：
-1. `sync_massive_universe`：同步 Massive 活跃 US universe，只保留 `CS / ETF / ADRC`
-2. `update_details`：更新证券详情（Massive）
-3. `update_actions`：更新分红/拆股（Massive）
-4. `update_massive_prices`：按 symbol 增量刷新最近 2 年窗口内日线
-5. `update_grouped_daily`：回刷最近 5 个已收盘交易日的已存在记录（Massive Grouped Daily）
-6. `update_massive_shares`：刷新 current-quarter shares / float
-7. `rebuild_turnover_rate`：重建最近 5 个交易日换手率
+- `exchanges`
+  - 保存交易所/MIC 参考数据。
+  - `mic` 是 ISO 10383 市场代码，例如 `XNAS`、`XNYS`。
+  - Massive `primary_exchange`、SEC/交易所官方资料和未来 ClickHouse dictionary 都应对齐到这个字段。
 
-第 5 步的目的：用 Massive 的市场全量聚合对“最新交易日”数据做一次精确修正，同时不破坏 `turnover_rate` 等派生字段。
+- `trading_calendars`
+  - 主键为 `(exchange_mic, trade_date)`。
+  - 区域/资产市场属性从 `exchanges` 读取，避免在 calendar facts 上重复存储。
+  - `is_open`、`is_half_day`、`open_at`、`close_at` 和 `timezone` 描述当日 session。
+  - 官方交易所日历是 truth；Massive `marketstatus/upcoming` 不适合做完整历史日历。
 
-复权因子建议维护方式：
-- 常规：`update_actions` 默认在成功更新公司行动后自动触发对应证券的 `adj_factor` 重算（如需跳过：`--skip-recalc-adj-factor`）；
-- 需要全量校验或口径调整时：手动跑 `python main.py recalc_adj_factor ...`。
+- `security_identifiers`
+  - 保存 `security_id` 与 CUSIP/CIK/FIGI/ISIN 等标识符的点时映射。
+  - 这是 13-F、SEC filing 和多供应商数据对齐的基础。
+
+- `sec_filings`
+  - 保存 SEC filing index metadata，不保存全文。
+  - `accession_number` 是 filing 的稳定锚点。
+  - 回测特征必须使用 `accepted_at` 或 `available_at` 作为点时可用边界，不能用报告期结束日偷看未来。
+
+- `insider_transactions`
+  - 保存 Form 3/4/5 结构化交易明细。
+  - 对策略最有价值的是公开市场买卖；RSU 授予、期权行权、赠与等必须按 `transaction_code` 分层处理。
+
+- `institutional_holdings`
+  - 保存 13-F 机构持仓明细。
+  - 13-F 的用途是研究机构持仓、拥挤度、季度调仓、资金偏好和大持有人变化。
+  - 披露有延迟，并且以 CUSIP/issuer/title 为主，不保证能直接映射到当前 ticker。
+
+## SEC 接入策略
+
+SEC 底层 schema 一次打好，包括 filing index、identifier mapping、Form 3/4/5 内部人交易和 13-F 持仓明细。采集执行仍然分步骤接入：先 filings index，再 Form 4，再 13-F。原因不是 schema 做不到一次性，而是三类数据的质量风险不同：
+
+- filing index 以 CIK/accession 为锚点，最稳定，适合先作为总目录。
+- Form 4 是逐交易行数据，同一个 filing 里可能有授予、行权、卖出、赠与等多种语义，必须按 `transaction_code` 分层后才能做策略特征。
+- 13-F 以 CUSIP/issuer/class 为主，不直接给 `security_id`；映射层没校验前，允许先落原始 holdings，后续再补 `security_id`。
+
+因此“底层结构一次完成”和“生产采集分阶段验证”并不冲突：前者保证未来不用反复改主 schema，后者避免把未验证的 vendor 结构化结果直接变成策略 truth。
+
+## 自动更新工作流
+
+推荐 cron 入口：
+
+```bash
+python main.py scheduled_update --market US
+```
+
+`scheduled_update` 顺序执行：
+1. 每天：日线、short data、最近已完成交易日的盘前/盘后。
+2. 每周六：shares / float。
+3. 每周日：分红 / 拆股。
+4. 每月第一个周二：ticker events / symbol history。
+5. 每月第一个周三：证券详情。
+
+日更路径只跑增量；各单项采集脚本的 `--force` / `--full-refresh` 保留为手动全量回补入口。
+
+轻量调试入口：
+
+```bash
+python main.py update --market US
+python main.py update AAPL
+```
+
+`daily_run` 仅作为旧入口兼容别名保留，等同于 `update`。
+
+常用单项维护命令：
+
+```bash
+python main.py update_massive_shares AAPL --full-refresh
+python main.py update_massive_events META --force
+python main.py update_massive_short_data TSLA --force
+python main.py update_massive_news TSLA --force --lookback-days 7
+python main.py update_adjustment_factors AAPL
+```
+
+## 派生值策略
+
+- 复权价格：回测/分析启动时读取 `corporate_actions` 或 `computed_adjustment_factors` cache，在内存中动态生成。
+- 复权因子：`corporate_actions` 是 truth；`vendor_adjustment_factors` 是 reference；`computed_adjustment_factors` 是 reproducible cache。
+- 换手率：回测/分析读取 `historical_shares` 和 `daily_prices.volume` 后动态计算。
+- 技术指标：从 raw/canonical bar 在计算层生成；如需缓存，必须明确标注为 cache，而不是事实表。
+  Massive 提供 SMA/EMA/MACD/RSI endpoint，但项目不把这些数值写入事实表。后续可以写一个校验小工具：同一 ticker/date/window/series_type 下，用本地 raw/canonical bars 手动计算指标，并和 Massive 返回值对账，用于发现复权口径、窗口边界或数据缺口问题。
+- 成交额：如果供应商没有原始返回，不通过 `volume * vwap` 写回事实表。
+- 财报/ratios：当前不抓取，也不纳入默认 schema 使用路径。
 
 ## 数据一致性与故障恢复
 
-- `scripts/check_data_integrity.py`
-  - 只读一致性检查（例如 `price_data_latest_date` 与 `daily_prices` 的 MAX(date) 对齐性、symbol 规范等）。
-- `scripts/calibrate_price_latest_date.py`
-  - 以 `daily_prices` 实际数据回算 `securities.price_data_latest_date`，用于纠偏。
-- 对于“无数据返回”的情况：
-  - 不应把 `price_data_latest_date` 人为推进（否则会掩盖缺口并导致永久漏数）。
-  - 应保留现状并在日志中显式提示，方便排查数据源延迟/缺失。
+- 日线价格更新到最近一个已收盘交易日，避免盘中数据污染。
+- `scripts/check_data_integrity.py` 做只读一致性检查。
+- `scripts/calibrate_price_latest_date.py` 可用 `daily_prices` 实际数据回算 `securities.price_data_latest_date`。
+- 对于数据源无返回的情况，不推进 `price_data_latest_date`，避免掩盖缺口。

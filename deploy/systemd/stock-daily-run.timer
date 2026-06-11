@@ -1,0 +1,12 @@
+[Unit]
+Description=Run stock data scheduled update daily at 10:00 UTC+8
+
+[Timer]
+# UTC+8 market-ops time; equivalent to 02:00 UTC on this server.
+OnCalendar=*-*-* 10:00:00 Asia/Shanghai
+AccuracySec=1min
+Persistent=true
+Unit=stock-daily-run.service
+
+[Install]
+WantedBy=timers.target

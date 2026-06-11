@@ -1,25 +1,36 @@
 from __future__ import annotations
 
-import os
+from functools import lru_cache
+from pathlib import Path
 from datetime import date, timedelta
 from typing import Iterable, TypeVar
 
 T = TypeVar("T")
 
-ALLOWED_US_SECURITY_TYPES = ("CS", "ETF", "ADRC")
+ALLOWED_US_SECURITY_TYPES = ("CS", "ETF")
 MASSIVE_RATE_LIMIT = 5
 MASSIVE_RATE_SECONDS = 60
 MASSIVE_FREE_HISTORY_DAYS = 730
 MASSIVE_BASE_URL = "https://api.massive.com"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MASSIVE_KEYS_FILE = PROJECT_ROOT / "activation_value.txt"
 
 
+@lru_cache(maxsize=1)
 def get_massive_api_keys() -> list[str]:
-    raw = os.getenv("MASSIVE_API_KEYS") or os.getenv("POLYGON_API_KEYS")
-    if not raw:
-        raise ValueError("环境变量 MASSIVE_API_KEYS 未设置（兼容读取 POLYGON_API_KEYS）。")
-    keys = [item.strip() for item in raw.split(",") if item.strip()]
+    if not MASSIVE_KEYS_FILE.exists():
+        raise ValueError(f"Massive key 文件不存在: {MASSIVE_KEYS_FILE}")
+
+    raw = MASSIVE_KEYS_FILE.read_text(encoding="utf-8")
+    keys: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        keys.extend(item.strip() for item in stripped.split(",") if item.strip())
+
     if not keys:
-        raise ValueError("MASSIVE_API_KEYS 为空。")
+        raise ValueError(f"Massive key 文件为空: {MASSIVE_KEYS_FILE}")
     return keys
 
 

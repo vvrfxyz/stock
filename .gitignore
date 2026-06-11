@@ -148,3 +148,9 @@ log/
 
 # macOS
 .DS_Store
+
+# Massive API keys (never commit)
+activation_value.txt
+
+# Local data artifacts
+*.csv

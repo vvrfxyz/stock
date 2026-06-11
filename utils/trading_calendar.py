@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import os
+from bisect import bisect_left, bisect_right
 from datetime import date, datetime, time, timedelta, timezone
 from functools import lru_cache
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from dotenv import load_dotenv
 from loguru import logger
+from sqlalchemy import create_engine, text
 
 try:
     import exchange_calendars as xc
@@ -77,6 +82,66 @@ def _get_market_close_datetime(market: str, now: datetime) -> tuple[datetime, da
     return close_dt, market_now.date()
 
 
+@lru_cache(maxsize=None)
+def _get_db_session_dates(market: str) -> tuple[date, ...]:
+    market_upper = _require_supported_market(market)
+    exchange_mic = _MARKET_TO_CALENDAR[market_upper]
+
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        return ()
+
+    engine = None
+    try:
+        engine = create_engine(db_url, pool_pre_ping=True)
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT trade_date
+                    FROM trading_calendars
+                    WHERE exchange_mic = :exchange_mic
+                      AND is_open IS TRUE
+                    ORDER BY trade_date
+                    """
+                ),
+                {"exchange_mic": exchange_mic},
+            )
+            return tuple(row[0] for row in rows)
+    except Exception as exc:  # pragma: no cover - environment dependent
+        logger.debug("Failed to load trading calendar from database: {}", exc)
+        return ()
+    finally:
+        if engine is not None:
+            engine.dispose()
+
+
+def _previous_db_session_on_or_before(market: str, session_date: date) -> date | None:
+    sessions = _get_db_session_dates(market)
+    if not sessions:
+        return None
+    index = bisect_right(sessions, session_date) - 1
+    if index < 0:
+        return None
+    return sessions[index]
+
+
+def _shift_db_sessions(market: str, session_date: date, sessions: int) -> date | None:
+    dates = _get_db_session_dates(market)
+    if not dates:
+        return None
+
+    index = bisect_left(dates, session_date)
+    if index >= len(dates) or dates[index] != session_date:
+        return None
+
+    shifted_index = index + sessions
+    if shifted_index < 0 or shifted_index >= len(dates):
+        return None
+    return dates[shifted_index]
+
+
 def _get_last_completed_trading_date_fallback(market: str, now: datetime) -> date:
     close_dt, market_date = _get_market_close_datetime(market, now)
     candidate = market_date if now.astimezone(close_dt.tzinfo) > close_dt else market_date - timedelta(days=1)
@@ -112,6 +177,11 @@ def get_last_completed_trading_date(market: str, now: datetime | None = None) ->
             missing.append("exchange_calendars")
         if pd is None:
             missing.append("pandas")
+        close_dt, market_date = _get_market_close_datetime(market, now)
+        candidate = market_date if now.astimezone(close_dt.tzinfo) > close_dt else market_date - timedelta(days=1)
+        db_session = _previous_db_session_on_or_before(market, candidate)
+        if db_session is not None:
+            return db_session
         _warn_fallback_once(", ".join(missing))
         return _get_last_completed_trading_date_fallback(market, now)
 
@@ -138,6 +208,9 @@ def shift_trading_date(market: str, session_date: date, sessions: int) -> date:
             missing.append("exchange_calendars")
         if pd is None:
             missing.append("pandas")
+        shifted = _shift_db_sessions(market, session_date, sessions)
+        if shifted is not None:
+            return shifted
         _warn_fallback_once(", ".join(missing))
         return _shift_weekdays(session_date, sessions)
 

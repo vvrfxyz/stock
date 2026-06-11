@@ -1,9 +1,22 @@
-# utils/key_rate_limiter.py (新建文件)
 import time
 import threading
 import collections
-from typing import List
+from dataclasses import dataclass, field
+from typing import Deque, Dict, List, Optional, Tuple
 from loguru import logger
+
+
+@dataclass
+class _RateLimiterState:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    history: Dict[str, Deque[float]] = field(default_factory=dict)
+    blocked_until: Dict[str, float] = field(default_factory=dict)
+    rr_index: int = 0
+    global_blocked_until: float = 0.0
+
+
+_GLOBAL_STATE_LOCK = threading.Lock()
+_GLOBAL_STATES: Dict[Tuple[str, int, int], _RateLimiterState] = {}
 
 
 class KeyRateLimiter:
@@ -12,7 +25,7 @@ class KeyRateLimiter:
     它确保每个key的使用频率不超过指定的速率。
     """
 
-    def __init__(self, keys: List[str], rate_limit: int, per_seconds: int):
+    def __init__(self, keys: List[str], rate_limit: int, per_seconds: int, *, scope: str = "default"):
         """
         初始化速率限制器。
         :param keys: API Key列表。
@@ -21,17 +34,66 @@ class KeyRateLimiter:
         """
         if not keys:
             raise ValueError("API Key列表不能为空。")
-        self.keys = keys
-        self.rate_limit = rate_limit
-        self.per_seconds = per_seconds
-        # 为每个key创建一个双端队列，用于存储最近的请求时间戳
-        # maxlen=rate_limit 自动保证队列只保留最近的N次记录
-        self.history = {key: collections.deque(maxlen=self.rate_limit) for key in self.keys}
-        self.lock = threading.Lock()
+        unique_keys = list(dict.fromkeys(key.strip() for key in keys if key and key.strip()))
+        if not unique_keys:
+            raise ValueError("API Key列表不能为空。")
+        scope = (scope or "default").strip()
+        if not scope:
+            scope = "default"
+
+        self.keys = unique_keys
+        self.rate_limit = int(rate_limit)
+        self.per_seconds = int(per_seconds)
+        self.scope = scope
+
+        config_key = (self.scope, self.rate_limit, self.per_seconds)
+        with _GLOBAL_STATE_LOCK:
+            state = _GLOBAL_STATES.get(config_key)
+            if state is None:
+                state = _RateLimiterState()
+                _GLOBAL_STATES[config_key] = state
+        self._state = state
+
+        # 将 key 注入共享 state，确保跨脚本/跨步骤复用同一份“最近请求历史”。
+        with self._state.lock:
+            for key in self.keys:
+                if key not in self._state.history:
+                    self._state.history[key] = collections.deque(maxlen=self.rate_limit)
+                self._state.blocked_until.setdefault(key, 0.0)
+
+        # 兼容旧字段（外部若有调试引用）
+        self.history = self._state.history
+        self.lock = self._state.lock
         logger.info(
-            f"KeyRateLimiter 初始化成功: {len(keys)}个Key, "
+            f"KeyRateLimiter 初始化成功(scope={self.scope}): {len(self.keys)}个Key, "
             f"每个Key限制为 {rate_limit}次 / {per_seconds}秒。"
         )
+
+    def block_key(self, api_key: str, duration_seconds: float) -> None:
+        """
+        将某个 key 标记为临时不可用（例如收到 429 后）。
+        仅影响当前进程内的后续请求调度。
+        """
+        if not api_key:
+            return
+        duration_seconds = max(0.0, float(duration_seconds))
+        if duration_seconds <= 0:
+            return
+        now = time.monotonic()
+        with self._state.lock:
+            current_until = self._state.blocked_until.get(api_key, 0.0)
+            self._state.blocked_until[api_key] = max(current_until, now + duration_seconds)
+
+    def block_all(self, duration_seconds: float) -> None:
+        """
+        将整个 scope 的所有 key 暂时标记为不可用（例如遇到账户级 429 或服务端要求 Retry-After）。
+        """
+        duration_seconds = max(0.0, float(duration_seconds))
+        if duration_seconds <= 0:
+            return
+        now = time.monotonic()
+        with self._state.lock:
+            self._state.global_blocked_until = max(self._state.global_blocked_until, now + duration_seconds)
 
     def acquire_key(self) -> str:
         """
@@ -39,41 +101,61 @@ class KeyRateLimiter:
         如果所有key都在冷却中，此方法将阻塞并等待，直到有key可用。
         """
         while True:
-            with self.lock:
+            with self._state.lock:
                 now = time.monotonic()
-                best_key = None
-                min_wait_time = float('inf')
 
-                # 遍历所有key，寻找一个立即可用的
-                for key in self.keys:
-                    key_history = self.history[key]
+                if not self.keys:
+                    raise ValueError("API Key列表不能为空。")
 
-                    # 条件1: key的使用次数未达到上限
-                    if len(key_history) < self.rate_limit:
-                        best_key = key
-                        break  # 找到一个立即可用的，无需再找
+                global_wait = max(0.0, self._state.global_blocked_until - now)
+                if global_wait > 0:
+                    wait_duration = global_wait + 0.01
+                    wait_reason = "global throttle"
+                else:
+                    best_wait_time = float("inf")
+                    best_key_index = 0
 
-                    # 条件2: key已达到上限，但最旧的请求已过冷却期
-                    oldest_request_time = key_history[0]
-                    if now - oldest_request_time > self.per_seconds:
-                        best_key = key
-                        break  # 找到一个立即可用的，无需再找
+                    # 从 rr_index 开始扫描，避免所有线程永远打在第一个 key 上。
+                    start_index = self._state.rr_index % len(self.keys)
+                    for offset in range(len(self.keys)):
+                        idx = (start_index + offset) % len(self.keys)
+                        key = self.keys[idx]
+                        key_history = self._state.history[key]
 
-                # 如果找到了可用的key
-                if best_key:
-                    self.history[best_key].append(now)
-                    logger.trace(f"线程 {threading.get_ident()} 获取到Key: ...{best_key[-4:]}")
-                    return best_key
+                        # 清理过期的请求时间戳，降低误判风险（maxlen 很小，成本可忽略）。
+                        while key_history and (now - key_history[0]) >= self.per_seconds:
+                            key_history.popleft()
 
-                # 如果没有立即可用的key，计算最短等待时间
-                for key in self.keys:
-                    oldest_request_time = self.history[key][0]
-                    wait_time = (oldest_request_time + self.per_seconds) - now
-                    if wait_time < min_wait_time:
-                        min_wait_time = wait_time
+                        blocked_until = self._state.blocked_until.get(key, 0.0)
+                        block_wait = max(0.0, blocked_until - now)
 
-            # 在锁之外等待，允许其他线程在等待期间检查状态
-            wait_duration = max(0, min_wait_time) + 0.01  # 加一点点缓冲
-            logger.trace(f"所有Key均在冷却中，线程 {threading.get_ident()} 将等待 {wait_duration:.2f} 秒。")
+                        if len(key_history) < self.rate_limit and block_wait <= 0:
+                            key_history.append(now)
+                            self._state.rr_index = idx + 1
+                            logger.trace(f"线程 {threading.get_ident()} 获取到Key: ...{key[-4:]}")
+                            return key
+
+                        # 计算该 key 的最短等待时间（被 block 或者速率窗口未释放）。
+                        window_wait = 0.0
+                        if len(key_history) >= self.rate_limit:
+                            oldest_request_time = key_history[0]
+                            window_wait = max(0.0, (oldest_request_time + self.per_seconds) - now)
+                        wait_time = max(block_wait, window_wait)
+
+                        if wait_time < best_wait_time:
+                            best_wait_time = wait_time
+                            best_key_index = idx
+
+                    # 没有立即可用的 key：在锁外 sleep，避免阻塞其它线程更新状态。
+                    wait_duration = max(0.0, best_wait_time) + 0.01
+                    wait_reason = "keys cooling"
+                    # 下一次优先从更可能解锁的 key 附近开始扫描，提高命中概率。
+                    self._state.rr_index = best_key_index + 1
+
+            logger.trace(
+                "KeyRateLimiter 等待({})，线程 {} 将等待 {:.2f} 秒。",
+                wait_reason,
+                threading.get_ident(),
+                wait_duration,
+            )
             time.sleep(wait_duration)
-

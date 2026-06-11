@@ -23,29 +23,16 @@ from utils.massive_config import (
     enforce_us_market,
     get_massive_api_keys,
 )
+from utils.script_logging import setup_logging as configure_script_logging
 
 
 def setup_logging():
-    logger.remove()
-    log_format = (
-        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-        "<level>{level: <8}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
-    )
-    logger.add(sys.stderr, level="INFO", format=log_format)
-    log_dir = os.path.join(project_root, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    logger.add(
-        os.path.join(log_dir, f"sync_massive_universe_{{time}}.log"),
-        rotation="10 MB",
-        retention="10 days",
-        level="DEBUG",
-    )
+    configure_script_logging("sync_massive_universe")
 
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="同步 Massive 活跃美股 universe，只保留普通股 / ETF / ADR。",
+        description="同步 Massive 活跃美股 universe，只保留普通股 / ETF。",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("--market", type=str, default="US", help="市场，当前仅支持 US。")
@@ -58,7 +45,7 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main():
+def main() -> int:
     start_time = time.monotonic()
     setup_logging()
     parser = create_parser()
@@ -68,7 +55,7 @@ def main():
     try:
         enforce_us_market(args.market)
         api_keys = get_massive_api_keys()
-        rate_limiter = KeyRateLimiter(api_keys, MASSIVE_RATE_LIMIT, MASSIVE_RATE_SECONDS)
+        rate_limiter = KeyRateLimiter(api_keys, MASSIVE_RATE_LIMIT, MASSIVE_RATE_SECONDS, scope="massive")
         source = MassiveSource(rate_limiter=rate_limiter)
         db_manager = DatabaseManager()
 
@@ -77,7 +64,7 @@ def main():
             reference_rows = reference_rows[: args.limit]
         if not reference_rows:
             logger.warning("Massive 未返回任何可保留的活跃 US ticker。")
-            return
+            return 0
 
         upsert_rows = [source._build_reference_payload(item) for item in tqdm(reference_rows, desc="整理 ticker 引用数据")]
         changed = db_manager.upsert_securities_by_symbol(upsert_rows, touch_info_timestamp=False)
@@ -107,8 +94,10 @@ def main():
             changed,
             marked_inactive,
         )
+        return 0
     except Exception as e:
         logger.opt(exception=e).critical("sync_massive_universe 执行失败: {}", e)
+        return 1
     finally:
         if db_manager:
             db_manager.close()
@@ -116,4 +105,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
