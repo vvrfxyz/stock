@@ -13,6 +13,17 @@ CURATED_CONCEPTS: dict[str, set[str]] = {
         "RevenueFromContractWithCustomerExcludingAssessedTax",
         "RevenueFromContractWithCustomerIncludingAssessedTax",
         "SalesRevenueNet",  # 旧 taxonomy（2018 前)
+        # 营收瀑布链补全（XBRL US fundamental accounting concepts 的标准营收族：
+        # 旧 taxonomy 商品/服务拆分 + 金融/行业总营收概念，银行保险券商不报 Revenues）
+        "SalesRevenueGoodsNet",
+        "SalesRevenueServicesNet",
+        "RevenuesNetOfInterestExpense",
+        "RegulatedAndUnregulatedOperatingRevenue",
+        "InterestAndDividendIncomeOperating",
+        "HealthCareOrganizationRevenue",
+        "RealEstateRevenueNet",
+        "OilAndGasRevenue",
+        "FinancialServicesRevenue",
         "CostOfRevenue",
         "CostOfGoodsAndServicesSold",
         "GrossProfit",

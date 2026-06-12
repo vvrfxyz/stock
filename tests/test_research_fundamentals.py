@@ -1,4 +1,8 @@
-"""research.fundamentals 的 point-in-time TTM/时点指标构造语义测试（纯合成数据）。"""
+"""research.fundamentals 的 point-in-time TTM/时点指标构造语义测试（纯合成数据）。
+
+v2 口径：重述感知——同一 period 的多次申报构成 vintage 序列，
+as-of t 取 filed_date <= t 的最新 vintage。
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -46,7 +50,7 @@ def test_ttm_from_ytd_plus_prior_fy_minus_prior_ytd():
     ttm = events[events["period_end"] == pd.Timestamp("2024-09-30")]
     assert len(ttm) == 1
     assert ttm.iloc[0]["value"] == 80.0 + 100.0 - 70.0
-    # 可见日取三分量 filed_date 的最大值
+    # 三分量齐备的时点 = 最后一个分量的 filed_date
     assert ttm.iloc[0]["visible_date"] == pd.Timestamp("2024-11-01")
 
 
@@ -68,6 +72,17 @@ def test_revenue_coalesce_prefers_higher_priority_concept():
     events = build_metric_events(facts)
     assert len(events) == 1
     assert events.iloc[0]["value"] == 500.0
+
+
+def test_financial_revenue_concept_covers_banks():
+    # 银行只报 RevenuesNetOfInterestExpense，也应产出 revenue_ttm
+    facts = _facts(
+        _f(2, "RevenuesNetOfInterestExpense", "2023-01-01", "2023-12-31", "2024-02-25", 320.0)
+    )
+    events = build_metric_events(facts)
+    assert len(events) == 1
+    assert events.iloc[0]["metric"] == "revenue_ttm"
+    assert events.iloc[0]["value"] == 320.0
 
 
 def test_ttm_components_must_share_concept():
@@ -146,3 +161,65 @@ def test_late_filed_older_period_dropped_for_monotonic_asof():
     )
     events = build_metric_events(facts)
     assert events["period_end"].tolist() == [pd.Timestamp("2024-06-30")]
+
+
+# --- v2：重述感知 ---
+
+
+def test_restated_annual_emits_second_vintage_event():
+    facts = _facts(
+        _f(1, "NetIncomeLoss", "2023-01-01", "2023-12-31", "2024-02-20", 100.0),
+        # 一年后重述（下一年 10-K 的比较期重列）
+        _f(1, "NetIncomeLoss", "2023-01-01", "2023-12-31", "2025-02-18", 92.0),
+    )
+    events = build_metric_events(facts)
+    assert len(events) == 2
+    dates = pd.DatetimeIndex(pd.to_datetime(["2024-06-30", "2025-06-30"]))
+    panel = asof_panel(events, dates=dates, max_staleness_days=600)
+    col = panel["net_income_ttm"][1]
+    assert col.loc["2024-06-30"] == 100.0  # 重述前看到原始值
+    assert col.loc["2025-06-30"] == 92.0  # 重述后看到新值
+
+
+def test_restated_ytd_component_reemits_ttm():
+    facts = _facts(
+        _f(1, "NetIncomeLoss", "2024-01-01", "2024-09-30", "2024-11-01", 80.0),
+        _f(1, "NetIncomeLoss", "2023-01-01", "2023-12-31", "2024-02-20", 100.0),
+        _f(1, "NetIncomeLoss", "2023-01-01", "2023-09-30", "2023-11-05", 70.0),
+        # Q3 YTD 在 12 月被修正
+        _f(1, "NetIncomeLoss", "2024-01-01", "2024-09-30", "2024-12-10", 75.0),
+    )
+    events = build_metric_events(facts)
+    ttm = events[
+        (events["period_end"] == pd.Timestamp("2024-09-30"))
+        & (events["metric"] == "net_income_ttm")
+    ].sort_values("visible_date")
+    assert len(ttm) == 2
+    assert ttm["value"].tolist() == [110.0, 105.0]
+    assert ttm["visible_date"].tolist() == [
+        pd.Timestamp("2024-11-01"),
+        pd.Timestamp("2024-12-10"),
+    ]
+
+
+def test_unchanged_revision_does_not_duplicate_event():
+    # build 层兜底：同值的重复 vintage 不应产出第二条事件
+    facts = _facts(
+        _f(1, "NetIncomeLoss", "2024-01-01", "2024-09-30", "2024-11-01", 80.0),
+        _f(1, "NetIncomeLoss", "2023-01-01", "2023-12-31", "2024-02-20", 100.0),
+        _f(1, "NetIncomeLoss", "2023-01-01", "2023-12-31", "2025-02-18", 100.0),
+        _f(1, "NetIncomeLoss", "2023-01-01", "2023-09-30", "2023-11-05", 70.0),
+    )
+    events = build_metric_events(facts)
+    ttm = events[events["period_end"] == pd.Timestamp("2024-09-30")]
+    assert len(ttm) == 1  # FY 同值"重述"不触发新 TTM 事件
+
+
+def test_same_day_multiple_filings_keep_last():
+    facts = _facts(
+        _f(1, "Assets", "2024-06-30", "2024-06-30", "2024-08-01", 11.0),
+        _f(1, "Assets", "2024-06-30", "2024-06-30", "2024-08-01", 12.0),
+    )
+    events = build_metric_events(facts)
+    assert len(events) == 1
+    assert events.iloc[0]["value"] == 12.0
