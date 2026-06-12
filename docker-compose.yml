@@ -19,28 +19,5 @@ services:
       timeout: 5s
       retries: 12
 
-  clickhouse:
-    image: clickhouse/clickhouse-server:24.12
-    container_name: stock-clickhouse
-    restart: unless-stopped
-    environment:
-      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-stock}
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
-      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
-    ports:
-      - "${CLICKHOUSE_BIND:-0.0.0.0}:${CLICKHOUSE_HTTP_PORT:-8123}:8123"
-      - "${CLICKHOUSE_BIND:-0.0.0.0}:${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
-    volumes:
-      - clickhouse-data:/var/lib/clickhouse
-      - clickhouse-logs:/var/log/clickhouse-server
-    healthcheck:
-      test: ["CMD-SHELL", "clickhouse-client --user \"$${CLICKHOUSE_USER:-default}\" --password \"$${CLICKHOUSE_PASSWORD:-}\" --query 'SELECT 1'"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-
 volumes:
   postgres-data:
-  clickhouse-data:
-  clickhouse-logs:

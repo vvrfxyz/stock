@@ -61,7 +61,7 @@ class Security(Base):
         nullable=False,
         index=True,
         default=_default_current_symbol,
-        comment="当前最新证券代码；polyglot 架构中供 ClickHouse Dictionary 暴露",
+        comment="当前最新证券代码",
     )
     name = Column(String(255), comment="公司或证券的官方全名")
     # --- 市场与分类 ---
@@ -91,7 +91,7 @@ class Security(Base):
     homepage_url = Column(String(255), nullable=True, comment="公司官网地址")
     total_employees = Column(Integer, nullable=True, comment="员工总数")
     sic_code = Column(String(10), nullable=True, comment="标准行业分类(SIC)代码")
-    sector = Column(String(100), nullable=True, comment="行业板块，供 ClickHouse Dictionary 过滤")
+    sector = Column(String(100), nullable=True, comment="行业板块")
     industry = Column(String(255), nullable=True, comment="行业描述 (来自SIC描述)")
     # --- 地址信息 ---
     address_line1 = Column(String(255), nullable=True, comment="公司地址行1")

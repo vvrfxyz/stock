@@ -13,7 +13,6 @@ if project_root not in sys.path:
 from data_models.models import Security
 from data_sources.massive_source import MassiveSource
 from db_manager import DatabaseManager
-from utils.clickhouse_client import ClickHouseClient
 from utils.massive_config import get_massive_history_floor
 from utils.massive_task import (
     build_standard_parser,
@@ -119,7 +118,6 @@ def process_security(
     security: Security,
     source: MassiveSource,
     db_manager: DatabaseManager,
-    clickhouse_client: ClickHouseClient,
     full_refresh: bool,
     end_trading_date: date,
 ) -> tuple[str, str, int]:
@@ -189,7 +187,6 @@ def process_security(
                 }
             )
         db_manager.upsert_daily_prices(rows)
-        clickhouse_client.write_daily_bars(rows, source="MASSIVE", vendor_symbol=symbol)
         latest_date_in_db = db_manager.get_security_price_max_date(security.id)
         if latest_date_in_db is None:
             latest_date_in_db = df["date"].max()
@@ -206,7 +203,6 @@ def process_security(
 
 
 def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseManager) -> int:
-    clickhouse_client = ClickHouseClient.from_env()
     end_trading_date = get_last_completed_trading_date(args.market)
     securities = get_securities_to_update(db_manager, args, end_trading_date)
     if not securities:
@@ -217,7 +213,7 @@ def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseMan
     outputs, results_counter = run_concurrently(
         securities,
         lambda security: process_security(
-            security, source, db_manager, clickhouse_client, args.full_refresh, end_trading_date
+            security, source, db_manager, args.full_refresh, end_trading_date
         ),
         max_workers=args.workers,
         desc="更新 Massive 日线",

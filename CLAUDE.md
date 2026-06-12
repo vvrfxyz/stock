@@ -4,7 +4,7 @@ This file gives Claude Code a compact, current map of the repository.
 
 ## Project Overview
 
-This is a Greenfield US stock data pipeline. PostgreSQL is the current system of record for metadata, events, and daily raw facts. ClickHouse is prepared as the future matrix-read layer for backtests and large scans.
+This is a Greenfield US stock data pipeline. PostgreSQL is the system of record for metadata, events, and daily raw facts. (ClickHouse as a matrix-read layer was removed in 2026-06; it may return once minute-level data arrives — see `docs/archive/polyglot_persistence_architecture.md`.)
 
 Primary data source:
 
@@ -28,7 +28,6 @@ Core architecture rules:
 - `utils/massive_task.py`: Shared skeleton for `update_massive_*` scripts (standard parser, runtime setup/teardown, security selection, thread-pool runner).
 - `utils/massive_config.py`: Massive keys, supported types, history-window helpers.
 - `utils/key_rate_limiter.py`: Per-key, process-shared Massive rate limiter.
-- `sql/clickhouse/polyglot_persistence.sql`: ClickHouse DDL.
 - `alembic/versions/`: PostgreSQL migrations.
 
 ## Current Tables
@@ -68,11 +67,6 @@ Required configuration:
 - Massive API keys in `activation_value.txt`, one key per line.
 - `SEC_USER_AGENT` in `.env` for SEC EDGAR scripts (self-identifying UA required by SEC).
 
-Optional ClickHouse configuration:
-
-- `CLICKHOUSE_URL`
-- `CLICKHOUSE_DATABASE`
-
 ## Common Commands
 
 ```bash
@@ -92,9 +86,6 @@ python main.py update_adjustment_factors AAPL
 python main.py sync_sec_identifiers                 # SEC ticker->CIK 映射
 python main.py update_sec_filings aapl              # SEC filing 索引；--all 全市场约 18 分钟
 python main.py update_sec_fundamentals aapl         # XBRL 基本面；--all --since 增量 / --bulk-zip 全量回填
-
-python main.py init_clickhouse
-python main.py backfill_clickhouse_daily_bars --limit 10000
 
 python scripts/check_data_integrity.py --limit 5
 python scripts/audit_recent_data.py --sample-size 32   # vendor 对账抽样审计（耗 API 配额）
@@ -142,5 +133,4 @@ python -m pytest tests/ -q -m "not integration"  # 仅纯单元测试
 - Script logging goes through `utils/script_logging.setup_logging(name)`; the first caller in a process becomes the primary log, later names get swappable per-script file sinks — do not redefine sinks per script.
 - Script entrypoints are `main(argv: list[str] | None = None)` parsing via `parse_args(argv)` and returning an int exit code (0/1); `__main__` uses `raise SystemExit(main())`. `main.py` invokes scripts in-process by passing the argv list — never mutate `sys.argv`. `scheduled_update` isolates step failures and exits non-zero if any step failed.
 - `update_massive_*` scripts build on `utils/massive_task.py` (`run_massive_task` + `select_us_securities` + `run_concurrently`); keep per-script code to parser extras, selection filters, and `process_*` logic.
-- `ClickHouseClient` degrades (warn + stop writing) on write failure; only `backfill_clickhouse_daily_bars` uses `strict=True`. PostgreSQL is the system of record.
 - Multi-row `pg_insert().values()` requires homogeneous dict keys; group heterogeneous rows with `_group_rows_by_key_set` (see `upsert_securities_by_symbol`).

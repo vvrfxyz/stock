@@ -1,6 +1,6 @@
 # Massive-only 重建与每日运行
 
-本文档描述当前推荐的 Massive-only 运行方式。当前系统按 Greenfield raw truth 原则落地：只把 Massive 直接提供或可审计映射的事实写入 PostgreSQL/ClickHouse，不把复权价格、换手率、成交额或技术指标写成事实表。复权因子单独分层保存：供应商因子是 reference，内部计算因子是 cache。
+本文档描述当前推荐的 Massive-only 运行方式。当前系统按 Greenfield raw truth 原则落地：只把 Massive 直接提供或可审计映射的事实写入 PostgreSQL，不把复权价格、换手率、成交额或技术指标写成事实表。复权因子单独分层保存：供应商因子是 reference，内部计算因子是 cache。
 
 - 核验日期：2026-05-14
 - 适用前提：使用当前 `activation_value.txt` 中 Massive keys

@@ -34,8 +34,6 @@ from scripts.update_massive_news import main as update_massive_news_main
 from scripts.update_adjustment_factors import main as update_adjustment_factors_main
 from scripts.update_open_close_summary import main as update_open_close_summary_main
 from scripts.cleanup_us_universe import main as cleanup_us_universe_main
-from scripts.init_clickhouse import main as init_clickhouse_main
-from scripts.backfill_clickhouse_daily_bars import main as backfill_clickhouse_daily_bars_main
 from scripts.migrate_database import main as migrate_main
 from utils.script_logging import setup_logging as configure_script_logging
 from utils.trading_calendar import get_last_completed_trading_date, shift_trading_date
@@ -510,27 +508,6 @@ def run_migrate(args):
     execute_script(migrate_main, [])
 
 
-def run_init_clickhouse(args):
-    logger.info("执行: 初始化 ClickHouse schema")
-    execute_script(init_clickhouse_main, [])
-
-
-def run_backfill_clickhouse_daily_bars(args):
-    logger.info("执行: 回填 ClickHouse 日线")
-    cli_args = []
-    if args.start_date:
-        cli_args.extend(['--start-date', args.start_date])
-    if args.end_date:
-        cli_args.extend(['--end-date', args.end_date])
-    if args.source:
-        cli_args.extend(['--source', args.source])
-    if args.batch_size:
-        cli_args.extend(['--batch-size', str(args.batch_size)])
-    if args.limit > 0:
-        cli_args.extend(['--limit', str(args.limit)])
-    execute_script(backfill_clickhouse_daily_bars_main, cli_args)
-
-
 # ==============================================================================
 #  主函数：命令行解析器
 # ==============================================================================
@@ -643,17 +620,6 @@ def main():
     # --- 定义 'migrate' 命令 ---
     p_migrate = subparsers.add_parser('migrate', help="执行数据库迁移（一次性操作）")
     p_migrate.set_defaults(func=run_migrate)
-
-    p_init_clickhouse = subparsers.add_parser('init_clickhouse', help="初始化 ClickHouse 数据库与表")
-    p_init_clickhouse.set_defaults(func=run_init_clickhouse)
-
-    p_backfill_ch = subparsers.add_parser('backfill_clickhouse_daily_bars', help="从 PostgreSQL daily_prices 回填 ClickHouse 日线")
-    p_backfill_ch.add_argument('--start-date', type=str, help="开始日期 (YYYY-MM-DD)。")
-    p_backfill_ch.add_argument('--end-date', type=str, help="结束日期 (YYYY-MM-DD)。")
-    p_backfill_ch.add_argument('--source', type=str, default='POSTGRESQL', help="写入 ClickHouse 的 source 标签。")
-    p_backfill_ch.add_argument('--batch-size', type=int, default=10000, help="每批写入行数。")
-    p_backfill_ch.add_argument('--limit', type=int, default=0, help="最多回填多少行；0 表示不限制。")
-    p_backfill_ch.set_defaults(func=run_backfill_clickhouse_daily_bars)
 
     p_massive_prices = subparsers.add_parser('update_massive_prices', help="单独更新 Massive 的日线价格")
     p_massive_prices.add_argument('symbols', nargs='*', help="要更新的股票代码列表。")

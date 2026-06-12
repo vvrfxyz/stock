@@ -89,10 +89,8 @@ class TestPricesRun:
 
     def test_happy_path_writes_rows_and_metadata(self, monkeypatch):
         sec = _security()
-        ch = Mock()
         monkeypatch.setattr(prices, "get_last_completed_trading_date", lambda market: END_DATE)
         monkeypatch.setattr(prices, "get_securities_to_update", lambda db, args, end: [sec])
-        monkeypatch.setattr(prices.ClickHouseClient, "from_env", classmethod(lambda cls: ch))
         source, db = Mock(), Mock()
         source.get_historical_data.return_value = self._frame()
         db.get_security_price_max_date.return_value = date(2026, 6, 10)
@@ -102,14 +100,12 @@ class TestPricesRun:
         rows = db.upsert_daily_prices.call_args.args[0]
         assert rows[0]["security_id"] == 1
         assert rows[0]["volume"] == 100 and isinstance(rows[0]["volume"], int)
-        ch.write_daily_bars.assert_called_once()
         db.update_security_price_latest_date.assert_called_once_with(1, date(2026, 6, 10), is_full_run=True)
 
     def test_empty_frame_syncs_metadata_from_existing_rows(self, monkeypatch):
         sec = _security()
         monkeypatch.setattr(prices, "get_last_completed_trading_date", lambda market: END_DATE)
         monkeypatch.setattr(prices, "get_securities_to_update", lambda db, args, end: [sec])
-        monkeypatch.setattr(prices.ClickHouseClient, "from_env", classmethod(lambda cls: Mock()))
         source, db = Mock(), Mock()
         source.get_historical_data.return_value = pd.DataFrame()
         db.get_security_price_max_date.return_value = END_DATE  # 库里其实已是最新

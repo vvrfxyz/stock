@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Removed (2026-06-12)
+
+- Removed the ClickHouse layer entirely (client, `init_clickhouse` / `backfill_clickhouse_daily_bars` commands, DDL, docker-compose service, dual-writes in price scripts). PostgreSQL is the only store. The polyglot design doc is archived at `docs/archive/polyglot_persistence_architecture.md` for a future rebuild once minute-level data (Massive paid tier) arrives.
+
 ### Changed
 
 - Rebuilt the project around the Greenfield Massive-only path:

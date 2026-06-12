@@ -21,7 +21,6 @@ from data_models.models import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CLICKHOUSE_DDL = PROJECT_ROOT / "sql" / "clickhouse" / "polyglot_persistence.sql"
 ALEMBIC_REVISION = PROJECT_ROOT / "alembic" / "versions" / "9a1b2c3d4e5f_add_polyglot_control_tables.py"
 ADJUSTMENT_FACTOR_REVISION = PROJECT_ROOT / "alembic" / "versions" / "e1f2a3b4c5d6_add_adjustment_factor_reference_cache.py"
 EXCHANGE_SEC_REVISION = PROJECT_ROOT / "alembic" / "versions" / "f2a3b4c5d6e7_add_exchange_calendar_and_sec_foundation.py"
@@ -188,28 +187,6 @@ def test_sec_foundation_models_are_point_in_time_and_identifier_ready():
     assert "period" in holding_columns
     assert "shares_or_principal_amount" in holding_columns
     assert ("source", "accession_number", "source_row_hash") in _unique_constraints(InstitutionalHolding)
-
-
-def test_clickhouse_ddl_contains_heavy_compute_tables_and_dictionary():
-    ddl = CLICKHOUSE_DDL.read_text(encoding="utf-8")
-
-    assert "CREATE TABLE IF NOT EXISTS raw_daily_bars" in ddl
-    assert "ENGINE = ReplacingMergeTree(ingested_at)" in ddl
-    assert "PARTITION BY toYYYYMM(date)" in ddl
-    assert "ORDER BY (security_id, date, source)" in ddl
-    assert "is_suspect        UInt8 DEFAULT 0" in ddl
-    assert "turnover" not in ddl
-
-    assert "CREATE TABLE IF NOT EXISTS canonical_daily_bars" in ddl
-    assert "ENGINE = ReplacingMergeTree(built_at)" in ddl
-    assert "ORDER BY (security_id, date)" in ddl
-    assert "financial_snapshots_wide" not in ddl
-
-    assert "CREATE DICTIONARY IF NOT EXISTS pg_securities_dict" in ddl
-    assert "SOURCE(POSTGRESQL(" in ddl
-    assert "table 'securities'" in ddl
-    assert "LIFETIME(MIN 300 MAX 3600)" in ddl
-    assert "LAYOUT(HASHED())" in ddl
 
 
 def test_alembic_revision_materializes_polyglot_plan():

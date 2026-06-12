@@ -17,7 +17,6 @@ if project_root not in sys.path:
 from data_models.models import DailyPrice, Security
 from data_sources.massive_source import MassiveSource, normalize_volume_value
 from db_manager import DatabaseManager
-from utils.clickhouse_client import ClickHouseClient
 from utils.key_rate_limiter import KeyRateLimiter
 from utils.massive_config import (
     ALLOWED_US_SECURITY_TYPES,
@@ -59,9 +58,7 @@ def process_date(
     target_date: date,
     source: MassiveSource,
     db_manager: DatabaseManager,
-    clickhouse_client: ClickHouseClient,
     symbol_to_id_map: dict[str, int],
-    id_to_symbol_map: dict[int, str],
 ) -> tuple[str, str, int]:
     date_str = target_date.isoformat()
     try:
@@ -115,11 +112,6 @@ def process_date(
 
         update_rows = list(updates.values())
         db_manager.bulk_update_mappings(DailyPrice, update_rows)
-        ch_rows = [
-            dict(row, vendor_symbol=id_to_symbol_map.get(row["security_id"], ""))
-            for row in update_rows
-        ]
-        clickhouse_client.write_daily_bars(ch_rows, source="MASSIVE")
         db_manager.ensure_security_price_latest_date_at_least(list(updates.keys()), target_date)
         return date_str, "SUCCESS", len(updates)
     except Exception as e:
@@ -140,7 +132,6 @@ def main(argv: list[str] | None = None) -> int:
         rate_limiter = KeyRateLimiter(api_keys, MASSIVE_RATE_LIMIT, MASSIVE_RATE_SECONDS, scope="massive")
         source = MassiveSource(rate_limiter=rate_limiter)
         db_manager = DatabaseManager()
-        clickhouse_client = ClickHouseClient.from_env()
 
         with db_manager.get_session() as session:
             securities = (
@@ -150,7 +141,6 @@ def main(argv: list[str] | None = None) -> int:
                 .all()
             )
         symbol_to_id_map = {symbol.lower(): security_id for security_id, symbol in securities}
-        id_to_symbol_map = {security_id: symbol.lower() for security_id, symbol in securities}
 
         dates_to_process = get_dates_to_process(args.start_date, args.end_date)
         if not dates_to_process:
@@ -162,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             future_to_date = {
                 executor.submit(
-                    process_date, dt, source, db_manager, clickhouse_client, symbol_to_id_map, id_to_symbol_map
+                    process_date, dt, source, db_manager, symbol_to_id_map
                 ): dt
                 for dt in dates_to_process
             }

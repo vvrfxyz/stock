@@ -1,6 +1,6 @@
 # Architecture
 
-本项目按 Greenfield raw truth 原则设计：PostgreSQL 负责证券身份、元数据、事件事实和当前日线事实；ClickHouse 负责未来大规模矩阵读取和回测扫描。全系统以 `security_id` 作为 durable identity，`symbol` 只是当前代码或历史代码属性。
+本项目按 Greenfield raw truth 原则设计：PostgreSQL 负责证券身份、元数据、事件事实和当前日线事实。全系统以 `security_id` 作为 durable identity，`symbol` 只是当前代码或历史代码属性。（ClickHouse 矩阵读取层已于 2026-06 移除，待分钟级数据需求出现后再重建；设计存档见 `archive/polyglot_persistence_architecture.md`。）
 
 ## 数据源与职责边界
 
@@ -24,11 +24,10 @@
 
 关键原则：事实表只写数据源或交易事实直接提供的字段。派生值不进入事实表，包括复权价格、换手率、成交额和技术指标。复权因子可以保存，但必须单独分层：供应商因子是 reference，内部因子是可重建 cache，不是 source-of-truth。
 
-## PostgreSQL 与 ClickHouse 边界
+## 存储边界
 
-- PostgreSQL 是元数据、事件和日线 raw fact 的事务中心。
-- ClickHouse 当前只保留 `raw_daily_bars` / `canonical_daily_bars`，并通过 Dictionary 读取 PostgreSQL 维度。
-- PostgreSQL 字段要保持 ClickHouse 友好：`BIGINT -> Int64`、`DATE -> Date`、`TIMESTAMPTZ -> DateTime64`、`NUMERIC(P,S) -> Decimal(P,S)`。
+- PostgreSQL 是元数据、事件和日线 raw fact 的事务中心，也是当前唯一存储。
+- 字段类型保持列式存储友好（`BIGINT`、`DATE`、`TIMESTAMPTZ`、`NUMERIC(P,S)`），未来重建列式读取层时迁移成本低。
 - 分钟级数据尚未落地；未来新增分钟线时，沿用 `security_id + timestamp + OHLCV + VWAP + trade_count + source + ingested_at`。
 
 ## 核心表语义
@@ -87,7 +86,7 @@
 - `exchanges`
   - 保存交易所/MIC 参考数据。
   - `mic` 是 ISO 10383 市场代码，例如 `XNAS`、`XNYS`。
-  - Massive `primary_exchange`、SEC/交易所官方资料和未来 ClickHouse dictionary 都应对齐到这个字段。
+  - Massive `primary_exchange` 和 SEC/交易所官方资料都应对齐到这个字段。
 
 - `trading_calendars`
   - 主键为 `(exchange_mic, trade_date)`。

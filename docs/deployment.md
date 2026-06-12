@@ -10,7 +10,7 @@
 | 部署目录 | `/home/wenruifeng/projects/stock` |
 | 运行用户 | `wenruifeng`（systemd 服务以该用户执行） |
 | Python | `.venv/bin/python`（注意：venv 内未安装 pytest） |
-| 数据库 | docker compose: `stock-postgres` (PG 17.5)、`stock-clickhouse` (24.12) |
+| 数据库 | docker compose: `stock-postgres` (PG 17.5)（`stock-clickhouse` 容器已随 ClickHouse 层移除而退役，远端如仍在运行可 `docker compose up -d --remove-orphans` 收掉） |
 | 定时 | `stock-daily-run.timer` → 每天 10:00 Asia/Shanghai 跑 `scheduled_update` |
 | GitHub | `https://github.com/vvrfxyz/stock`（**远端机器无法访问 github.com**） |
 
@@ -81,7 +81,7 @@ ssh home-debian "tail -50 /home/wenruifeng/projects/stock/logs/cron_daily_run.lo
 
 - 远端 venv 没有 pytest；测试只在本地跑（67 个用例）。
 - 远端 git 首次以 root 操作需要 `safe.directory` 配置（`/home/wenruifeng/projects/stock` 和 `.../.git` 两条）。
-- docker-compose 端口默认绑定 `0.0.0.0`，`.env` 可用 `POSTGRES_BIND` / `CLICKHOUSE_BIND` 收紧为 `127.0.0.1`。
+- docker-compose 端口默认绑定 `0.0.0.0`，`.env` 可用 `POSTGRES_BIND` 收紧为 `127.0.0.1`。
 
 ## 同步记录
 

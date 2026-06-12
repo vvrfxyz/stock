@@ -5,7 +5,7 @@
 ## 当前有效文档
 
 - [Architecture](./architecture.md)
-  当前 PostgreSQL raw truth、Massive-only ingestion、复权 reference/cache、未来 ClickHouse 分工。
+  当前 PostgreSQL raw truth、Massive-only ingestion、复权 reference/cache。
 
 - [Massive-only 重建与每日运行](./massive_rebuild_and_daily_run.md)
   当前推荐命令、默认 `update` 链路、全量重建方式、单项维护入口。
@@ -16,9 +16,6 @@
 - [Massive 免费层日线能力](./massive_free_tier_daily_data.md)
   当前 API key 已验证可拿到的数据范围、字段用途和不纳入范围。
 
-- [双库混合持久化架构方案](./polyglot_persistence_architecture.md)
-  PostgreSQL + ClickHouse 的目标形态和 ClickHouse Dictionary 方案。
-
 - [API Rate Limiting](./rate_limiting.md)
   Massive 多 key 限流、429 处理和并发注意事项。
 
@@ -26,6 +23,9 @@
 
 - [Massive API Audit 2026-05-14](./archive/vendor_audits/massive_stock_api_audit_2026-05-14.md)
   Vendor endpoint 能力和 key 权限边界的归档证据，不是当前 ingestion contract。
+
+- [双库混合持久化架构方案（已归档）](./archive/polyglot_persistence_architecture.md)
+  PostgreSQL + ClickHouse 的设计存档；ClickHouse 层已于 2026-06 移除，待分钟级数据需求出现后再按此重建。
 
 ## 当前事实层边界
 

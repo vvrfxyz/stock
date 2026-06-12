@@ -105,7 +105,6 @@ python main.py update_massive_events META --force
 入库位置：
 
 - `daily_prices`
-- 可选回填到 ClickHouse `raw_daily_bars`
 
 当前口径：
 
@@ -123,7 +122,6 @@ python main.py update_massive_events META --force
 入库位置：
 
 - `daily_prices`
-- ClickHouse `raw_daily_bars`
 
 当前命令：
 

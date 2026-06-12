@@ -7,7 +7,6 @@
 
 已准备的基础服务：
 - PostgreSQL 17.5 via Docker Compose: `stock-postgres`
-- ClickHouse 24.12 via Docker Compose: `stock-clickhouse`
 
 ## 定时策略
 
@@ -59,7 +58,6 @@ sudo systemctl start stock-daily-run.service
 ```bash
 cd /home/wenruifeng/projects/stock
 docker compose ps
-.venv/bin/python main.py init_clickhouse
 systemctl status stock-daily-run.timer
 systemctl list-timers --all stock-daily-run.timer
 journalctl -u stock-daily-run.service -n 100 --no-pager

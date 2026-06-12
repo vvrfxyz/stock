@@ -1,6 +1,6 @@
 # Stock Data Pipeline
 
-一个 Greenfield 美股日线数据管道。当前主存储是 PostgreSQL，ClickHouse 作为未来矩阵计算与回测读取层；所有身份流转以 `security_id` 为锚点，`symbol` 只作为当前属性或历史属性。
+一个 Greenfield 美股日线数据管道。主存储是 PostgreSQL；所有身份流转以 `security_id` 为锚点，`symbol` 只作为当前属性或历史属性。（ClickHouse 矩阵读取层已于 2026-06 移除，待分钟级数据需求出现后再重建，设计存档见 `docs/archive/polyglot_persistence_architecture.md`。）
 
 核心原则：数据库的事实层只保存 raw truth。日线行情只存供应商/交易所给出的原始事实字段；复权价格、换手率、技术指标、成交额等派生值不进入事实表。复权因子允许单独分层保存：供应商因子是 reference snapshot，内部因子是带版本和事件哈希的 reproducible cache。
 
@@ -14,16 +14,12 @@
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-docker compose up -d clickhouse
 alembic upgrade head
-python main.py init_clickhouse
 python main.py update --market US
 ```
 
 `.env` 至少需要：
 - `DATABASE_URL`：PostgreSQL 连接串。
-- `CLICKHOUSE_URL`：ClickHouse HTTP 地址，Docker 默认是 `http://localhost:8123`。
-- `CLICKHOUSE_DATABASE`：ClickHouse 数据库名，默认 `stock`。
 
 Massive API key 从项目根目录的 `activation_value.txt` 读取：
 - 默认路径：`activation_value.txt`。
@@ -39,13 +35,6 @@ python main.py scheduled_update --market US
 # 轻量调试入口：只跑详情、公司行动、日线
 python main.py update --market US
 python main.py update AAPL
-
-# 初始化 ClickHouse schema
-docker compose up -d clickhouse
-python main.py init_clickhouse
-
-# 将 PostgreSQL daily_prices 既有历史回填到 ClickHouse
-python main.py backfill_clickhouse_daily_bars --limit 10000
 
 # Massive 免费层能力范围内的全量重建（最近 2 年窗口）
 python main.py rebuild_massive_dataset --market US
@@ -110,13 +99,11 @@ Debian 部署使用 systemd timer，每天 UTC+8 `10:00` 运行
 - `data_sources/`：外部数据源适配器，当前主要为 Massive。
 - `utils/`：小型复用工具。
 - `alembic/`：数据库迁移。
-- `sql/clickhouse/`：ClickHouse DDL。
 - `logs/`：运行日志。
 
 ## 数据一致性约定
 
-- 当前已实现数据都是日线级别，主存储统一使用 PostgreSQL；字段类型保持 ClickHouse 兼容，方便未来迁移到列式存储和分钟级数据。
-- 新增表或字段优先选择能直接映射到 ClickHouse 的口径，例如 `BIGINT/Int64`、`DATE/Date`、`TIMESTAMPTZ/DateTime64`、`NUMERIC(P,S)/Decimal(P,S)`。
+- 当前已实现数据都是日线级别，主存储统一使用 PostgreSQL；字段类型保持列式存储兼容（`BIGINT`、`DATE`、`TIMESTAMPTZ`、`NUMERIC(P,S)`），方便未来引入分钟级数据时迁移。
 - 未来上分钟线时，沿用 `security_id + timestamp + OHLCV + VWAP + trade_count + source + ingested_at` 的口径，避免重新解释日线字段。
 - `daily_prices` 只保存 raw bar：`open/high/low/close/volume/vwap/trade_count/pre_market/after_hours`。
 - `daily_prices` 不保存 `adj_factor`、`split_adj_factor`、`turnover_rate`、`turnover` 或技术指标。
@@ -132,7 +119,6 @@ Debian 部署使用 systemd timer，每天 UTC+8 `10:00` 运行
 
 - 文档目录：`docs/README.md`
 - 架构与约定：`docs/architecture.md`
-- 双库混合持久化目标架构：`docs/polyglot_persistence_architecture.md`
 - Massive 免费层日线能力：`docs/massive_free_tier_daily_data.md`
 - Massive-only 重建与每日运行：`docs/massive_rebuild_and_daily_run.md`
 - 变更记录：`CHANGELOG.md`

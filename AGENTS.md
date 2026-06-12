@@ -6,8 +6,7 @@
    - Do not keep compatibility shims, legacy tables, or old data-source paths merely because they already exist.
    - Prefer the target architecture over incremental patching when the two conflict.
    - Use `security_id` as the canonical identity across the system; `symbol` is an attribute/history item, not a durable key.
-   - Keep PostgreSQL as the metadata/event/ACID store and ClickHouse as the future matrix-compute store.
-   - Design PostgreSQL fields so they map cleanly to ClickHouse types and sort keys later.
+   - Keep PostgreSQL as the metadata/event/ACID store. The ClickHouse matrix-compute layer was removed in 2026-06 and may return when minute-level data arrives; keep field types columnar-friendly (BIGINT/DATE/TIMESTAMPTZ/NUMERIC) so that migration stays cheap.
    - Price bars should represent raw market facts. Do not store adjusted prices, adjustment factors, turnover, or technical indicators on `daily_prices`.
    - Adjustment factors may be stored only in explicitly separated layers: vendor-provided factors as reference snapshots, internally computed factors as reproducible caches with a methodology version and event hash. They are never source-of-truth facts.
    - New index-membership data should be generic, such as `index_constituents_history`, and anchored by `security_id`; avoid index-specific symbol-keyed tables.
