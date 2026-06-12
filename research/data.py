@@ -1,0 +1,181 @@
+"""研究用批量数据加载：daily_prices × computed_adjustment_factors -> pandas 面板。
+
+与 utils/adjusted_prices 同口径（raw_actions_v1）：
+- bar 日期 d 的因子 = 第一个 ex_date > d 的事件的 cumulative_factor，否则 1。
+- as_of 限定只使用 ex_date <= as_of 的事件（防未来函数）。
+
+区别在于这里一次 SQL 拉全市场、numpy 向量化套因子，供横截面研究使用；
+单标的精确读取仍走 utils.adjusted_prices.get_adjusted_daily_bars。
+"""
+from __future__ import annotations
+
+import os
+from datetime import date
+
+import numpy as np
+import pandas as pd
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+
+DEFAULT_METHODOLOGY_VERSION = "raw_actions_v1"
+
+
+def research_engine(database_url: str | None = None) -> Engine:
+    """优先 RESEARCH_DATABASE_URL（指向 253 生产库的只读连接），回退 DATABASE_URL。"""
+    url = database_url or os.environ.get("RESEARCH_DATABASE_URL") or os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError("需要 RESEARCH_DATABASE_URL 或 DATABASE_URL")
+    return create_engine(url)
+
+
+def load_price_long(
+    engine: Engine,
+    *,
+    start: date,
+    end: date,
+    types: tuple[str, ...] = ("CS",),
+    include_inactive: bool = True,
+    security_ids: list[int] | None = None,
+) -> pd.DataFrame:
+    """拉取 [start, end] 的原始日线（长表）。
+
+    默认包含 is_active=False 的证券：建库后退市的标的保留在库里，
+    纳入它们可以减轻（但不能消除）幸存者偏差。
+    """
+    active_clause = "" if include_inactive else "and s.is_active"
+    id_clause = "and p.security_id = any(:security_ids)" if security_ids else ""
+    sql = text(
+        f"""
+        select p.security_id, p.date,
+               p.open::float8 as open, p.close::float8 as close,
+               p.volume::float8 as volume, p.vwap::float8 as vwap
+        from daily_prices p
+        join securities s on s.id = p.security_id
+        where p.date between :start and :end
+          and s.type = any(:types) {active_clause} {id_clause}
+        order by p.security_id, p.date
+        """
+    )
+    params: dict = {"start": start, "end": end, "types": list(types)}
+    if security_ids:
+        params["security_ids"] = security_ids
+    chunks = pd.read_sql_query(
+        sql,
+        engine,
+        params=params,
+        chunksize=500_000,
+        parse_dates=["date"],
+    )
+    df = pd.concat(chunks, ignore_index=True)
+    df["security_id"] = df["security_id"].astype(np.int32)
+    return df
+
+
+def load_factor_events(
+    engine: Engine,
+    *,
+    as_of: date,
+    methodology_version: str = DEFAULT_METHODOLOGY_VERSION,
+) -> pd.DataFrame:
+    sql = text(
+        """
+        select security_id, date as ex_date, max(cumulative_factor)::float8 as cumulative_factor
+        from computed_adjustment_factors
+        where methodology_version = :mv
+          and factor_type = 'historical_adjustment'
+          and date <= :as_of
+        group by security_id, date
+        order by security_id, ex_date
+        """
+    )
+    return pd.read_sql_query(sql, engine, params={"mv": methodology_version, "as_of": as_of}, parse_dates=["ex_date"])
+
+
+def apply_adjustment(prices: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
+    """为长表 prices 增加 adj_close 列（同口径后复权）。"""
+    factor = np.ones(len(prices))
+    bar_dates = prices["date"].to_numpy()
+    sid_values = prices["security_id"].to_numpy()
+    grouped = {
+        sid: (g["ex_date"].to_numpy(), g["cumulative_factor"].to_numpy())
+        for sid, g in events.groupby("security_id")
+    }
+    # prices 按 (security_id, date) 排序，逐证券切片做 searchsorted
+    boundaries = np.flatnonzero(np.diff(sid_values)) + 1
+    starts = np.concatenate(([0], boundaries))
+    ends = np.concatenate((boundaries, [len(prices)]))
+    for lo, hi in zip(starts, ends):
+        ev = grouped.get(int(sid_values[lo]))
+        if ev is None:
+            continue
+        ex_dates, cumulative = ev
+        idx = np.searchsorted(ex_dates, bar_dates[lo:hi], side="right")
+        seg = np.ones(hi - lo)
+        in_range = idx < len(cumulative)
+        seg[in_range] = cumulative[idx[in_range]]
+        factor[lo:hi] = seg
+    out = prices.copy()
+    out["adj_close"] = out["close"] * factor
+    return out
+
+
+def to_wide(prices: pd.DataFrame, column: str) -> pd.DataFrame:
+    """长表 -> 宽表（index=date, columns=security_id）。"""
+    return prices.pivot_table(index="date", columns="security_id", values=column, aggfunc="last")
+
+
+def load_adjusted_panel(
+    engine: Engine,
+    *,
+    start: date,
+    end: date,
+    types: tuple[str, ...] = ("CS",),
+    as_of: date | None = None,
+    include_inactive: bool = True,
+) -> dict[str, pd.DataFrame]:
+    """返回宽表字典：adj_close / close / volume / dollar_volume。"""
+    prices = load_price_long(engine, start=start, end=end, types=types, include_inactive=include_inactive)
+    events = load_factor_events(engine, as_of=as_of or end)
+    prices = apply_adjustment(prices, events)
+    prices["dollar_volume"] = prices["close"] * prices["volume"]
+    return {
+        "adj_close": to_wide(prices, "adj_close"),
+        "close": to_wide(prices, "close"),
+        "volume": to_wide(prices, "volume"),
+        "dollar_volume": to_wide(prices, "dollar_volume"),
+    }
+
+
+def load_symbol_map(engine: Engine) -> pd.Series:
+    df = pd.read_sql_query(text("select id, symbol from securities"), engine)
+    return df.set_index("id")["symbol"]
+
+
+def securities_with_uncovered_events(
+    engine: Engine,
+    *,
+    start: date,
+    end: date,
+    methodology_version: str = DEFAULT_METHODOLOGY_VERSION,
+) -> list[int]:
+    """窗口内存在 corporate_actions 事件但无对应因子行的证券。
+
+    主要是因子构建只跑 is_active=True 导致的退市股缺口；缺因子的拆股会在
+    价格序列里留下假跳空，这些证券必须从横截面样本中剔除。
+    """
+    sql = text(
+        """
+        select distinct ca.security_id
+        from corporate_actions ca
+        where ca.ex_date between :start and :end
+          and ca.action_type = 'SPLIT'
+          and not exists (
+            select 1 from computed_adjustment_factors f
+            where f.security_id = ca.security_id
+              and f.date = ca.ex_date
+              and f.methodology_version = :mv)
+        """
+    )
+    with engine.connect() as conn:
+        rows = conn.execute(sql, {"start": start, "end": end, "mv": methodology_version}).fetchall()
+    return [r[0] for r in rows]
