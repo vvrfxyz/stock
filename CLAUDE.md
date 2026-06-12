@@ -50,6 +50,7 @@ Core architecture rules:
 - `sec_fundamental_facts`: Curated XBRL facts (`utils/sec_concepts.py` whitelist); `filed_date` is the point-in-time visibility boundary, all restatements kept.
 - `insider_transactions`: Form 3/4/5 ownership transaction rows (one row per entry × reporting owner; layer by `transaction_code` before building features).
 - `institutional_holdings`: 13-F holdings rows (filer-CIK anchored, discovered via EDGAR form index — not `sec_filings`; `security_id` stays NULL until a CUSIP mapping exists; `value` stored as reported — thousands of USD before 2023-01, USD after).
+- `fx_rates`: ECB daily EUR-based reference rates; USD cross rates are computed at read time via `utils/fx_rates.UsdFxConverter`.
 
 Financial ratios remain read-time computations — never store derived ratios back into fact tables. `sec_fundamental_facts` stores raw reported XBRL values only; do not revive `financial_reports` as a vague catch-all table.
 
@@ -88,6 +89,7 @@ python main.py update_sec_filings aapl              # SEC filing 索引；--all 
 python main.py update_sec_fundamentals aapl         # XBRL 基本面；--all --since 增量 / --bulk-zip 全量回填
 python main.py update_insider_transactions aapl     # Form 3/4/5 明细；--all 处理全部待解析 filing
 python main.py update_institutional_holdings --since 2026-06-01   # 13F 持仓；--quarter 2026Q1 季度回填
+python main.py update_fx_rates                      # ECB 参考汇率；非 USD 分红折算依赖
 
 python scripts/check_data_integrity.py --limit 5
 python scripts/audit_recent_data.py --sample-size 32   # vendor 对账抽样审计（耗 API 配额）
@@ -124,7 +126,7 @@ python -m pytest tests/ -q -m "not integration"  # 仅纯单元测试
 - Price scripts should update only through the most recent completed trading session.
 - `securities.price_data_latest_date` should match `daily_prices.max(date)`.
 - Company actions are keyed by Massive `source_event_id`; synthetic historical IDs should be cleaned up when a real vendor event ID becomes available.
-- `computed_adjustment_factors.methodology_version` currently uses `raw_actions_v1`.
+- `computed_adjustment_factors.methodology_version` currently uses `raw_actions_v1`. Non-USD dividends (CAD/NOK/ILS cross-listings) are converted to USD via ECB rates from `fx_rates` when available — run `update_fx_rates` first, then a factor rebuild picks them up; without FX data the events are skipped as before. Vendor reconciliation excludes these events from the chain (vendor never emits factor rows for them).
 - Turnover and adjusted prices are calculation outputs, not facts.
 - `historical_shares.filing_date` is the point-in-time boundary: never attach floats whose `effective_date` is after it.
 - Corporate-action incremental batches must fall back to the full Massive history floor when any security in the batch has no `actions_last_updated_at`.

@@ -534,3 +534,17 @@ class SecFundamentalFact(Base):
             name='_sec_fundamental_fact_uc',
         ),
     )
+
+
+class FxRate(Base):
+    """ECB 每日参考汇率（raw reference facts）。1 base_currency = rate quote_currency。
+
+    USD 交叉换算在读取层完成（utils/fx_rates.py），不存换算结果。"""
+    __tablename__ = 'fx_rates'
+    rate_date = Column(Date, primary_key=True)
+    base_currency = Column(String(10), primary_key=True)
+    quote_currency = Column(String(10), primary_key=True)
+    source = Column(String(30), primary_key=True)
+    rate = Column(Numeric(20, 10), nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)

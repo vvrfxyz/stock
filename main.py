@@ -29,6 +29,7 @@ from scripts.update_sec_filings import main as update_sec_filings_main
 from scripts.update_sec_fundamentals import main as update_sec_fundamentals_main
 from scripts.update_insider_transactions import main as update_insider_transactions_main
 from scripts.update_institutional_holdings import main as update_institutional_holdings_main
+from scripts.update_fx_rates import main as update_fx_rates_main
 from scripts.update_massive_shares import main as update_massive_shares_main
 from scripts.update_massive_events import main as update_massive_events_main
 from scripts.update_massive_short_data import main as update_massive_short_data_main
@@ -183,6 +184,13 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
             )
         )
     if run_date.weekday() == 6:
+        steps.append(
+            ScheduledStep(
+                "update_fx_rates",
+                update_fx_rates_main,
+                ["--since", (run_date - timedelta(days=30)).isoformat()],
+            )
+        )
         steps.append(
             ScheduledStep(
                 "update_massive_actions",
@@ -469,6 +477,14 @@ def run_update_institutional_holdings(args):
     execute_script(update_institutional_holdings_main, cli_args)
 
 
+def run_update_fx_rates(args):
+    logger.info("执行: 同步 ECB 参考汇率")
+    cli_args = []
+    if args.since:
+        cli_args.extend(['--since', args.since])
+    execute_script(update_fx_rates_main, cli_args)
+
+
 def run_cleanup_us_universe(args):
     logger.info("执行: 清理 US Universe 中非保留类型证券")
     cli_args = []
@@ -651,6 +667,10 @@ def main():
     p_13f.add_argument('--limit', type=int, default=0, help="限制处理 filing 数量。")
     p_13f.add_argument('--reparse', action='store_true', help="重新解析已入库 filing。")
     p_13f.set_defaults(func=run_update_institutional_holdings)
+
+    p_fx = subparsers.add_parser('update_fx_rates', help="同步 ECB 每日参考汇率（非 USD 分红折算用）")
+    p_fx.add_argument('--since', type=str, default=None, help="只写入该日期之后的汇率；不传则全历史回填。")
+    p_fx.set_defaults(func=run_update_fx_rates)
 
     p_massive_details = subparsers.add_parser('update_massive_details', help="单独更新股票的详细信息 (来自 Massive)")
     p_massive_details.add_argument('symbols', nargs='*', help="要更新的股票代码列表。")

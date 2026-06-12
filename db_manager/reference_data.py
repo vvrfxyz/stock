@@ -3,6 +3,7 @@ from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from data_models.models import (
+    FxRate,
     InsiderTransaction,
     InstitutionalHolding,
     NewsArticle,
@@ -249,6 +250,31 @@ class ReferenceDataMixin:
                     )
                     result = conn.execute(stmt)
                     written += result.rowcount
+            conn.commit()
+        return written
+
+    def upsert_fx_rates(self, rows_data: list[dict]) -> int:
+        """写 ECB 参考汇率。复合主键无序列；冲突时刷新 rate（来源重发布修正）。"""
+        rows = [_clean_for_model(FxRate, row) for row in rows_data]
+        rows = [
+            row for row in rows
+            if row.get("rate_date") and row.get("base_currency")
+            and row.get("quote_currency") and row.get("source") and row.get("rate") is not None
+        ]
+        if not rows:
+            return 0
+
+        written = 0
+        with self.engine.connect() as conn:
+            for start in range(0, len(rows), 5000):
+                chunk = rows[start:start + 5000]
+                stmt = pg_insert(FxRate).values(chunk)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["rate_date", "base_currency", "quote_currency", "source"],
+                    set_={"rate": stmt.excluded.rate, "updated_at": func.now()},
+                )
+                result = conn.execute(stmt)
+                written += result.rowcount
             conn.commit()
         return written
 

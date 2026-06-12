@@ -30,6 +30,7 @@ from utils.massive_config import (
     get_massive_history_floor,
 )
 from utils.trading_calendar import get_last_completed_trading_date
+from utils.fx_rates import UsdFxConverter
 from utils.script_logging import setup_logging as configure_script_logging
 
 
@@ -176,8 +177,15 @@ def _find_previous_close(price_dates: list[date], close_by_date: dict[date, Deci
     return close_by_date.get(price_dates[index])
 
 
-def _event_payload(action, previous_close: Decimal | None, single_event_factor: Decimal | None) -> dict:
-    return {
+def _event_payload(
+    action,
+    previous_close: Decimal | None,
+    single_event_factor: Decimal | None,
+    *,
+    cash_amount_usd: Decimal | None = None,
+    fx_rate_to_usd: Decimal | None = None,
+) -> dict:
+    payload = {
         "action_type": getattr(action, "action_type", None),
         "cash_amount": _format_decimal(getattr(action, "cash_amount", None)),
         "ex_date": getattr(action, "ex_date", None).isoformat() if getattr(action, "ex_date", None) else None,
@@ -188,6 +196,12 @@ def _event_payload(action, previous_close: Decimal | None, single_event_factor: 
         "split_from": _format_decimal(getattr(action, "split_from", None)),
         "split_to": _format_decimal(getattr(action, "split_to", None)),
     }
+    # 仅 FX 折算事件追加键，保持 USD 事件的 event_hash 与历史一致。
+    if fx_rate_to_usd is not None:
+        payload["currency"] = getattr(action, "currency", None)
+        payload["cash_amount_usd"] = _format_decimal(cash_amount_usd)
+        payload["fx_rate_to_usd"] = _format_decimal(fx_rate_to_usd)
+    return payload
 
 
 def _event_hash(event_payloads: list[dict]) -> str:
@@ -195,12 +209,16 @@ def _event_hash(event_payloads: list[dict]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _single_event_factor(action, previous_close: Decimal | None) -> Decimal | None:
+def _single_event_factor(
+    action,
+    previous_close: Decimal | None,
+    cash_amount_override: Decimal | None = None,
+) -> Decimal | None:
     action_type = (getattr(action, "action_type", "") or "").upper()
     with localcontext() as ctx:
         ctx.prec = 34
         if action_type == "DIVIDEND":
-            cash_amount = _to_decimal(getattr(action, "cash_amount", None))
+            cash_amount = cash_amount_override if cash_amount_override is not None else _to_decimal(getattr(action, "cash_amount", None))
             if cash_amount is None or previous_close is None or previous_close <= 0:
                 return None
             if cash_amount < 0 or cash_amount >= previous_close:
@@ -225,6 +243,7 @@ def compute_adjustment_factor_rows(
     *,
     methodology_version: str,
     as_of_date: date,
+    fx_converter=None,
 ) -> tuple[list[dict], Counter]:
     event_items = []
     stats = Counter()
@@ -237,15 +256,26 @@ def compute_adjustment_factor_rows(
             stats["SKIP_NO_DATE"] += 1
             continue
         previous_close = None
+        cash_amount_usd = None
+        fx_rate = None
         if (getattr(action, "action_type", "") or "").upper() == "DIVIDEND":
-            # 非 USD 分红（CAD/NOK/ILS 等跨上市公司）无法用 USD 收盘价折算因子——
-            # 混币种会产出 0.6x 量级的幻影跌幅。vendor 对这些事件同样不出因子行。
+            # 非 USD 分红（CAD/NOK/ILS 等跨上市公司）按 ECB 参考汇率折算成 USD 再
+            # 折因子；无可用汇率时跳过（直接混币种会产出 0.6x 量级的幻影跌幅）。
+            # vendor 对这些事件不出因子行，对账侧按 vendor 口径剔除（见
+            # evaluate_vendor_comparison 的 non_usd_dividends 处理）。
             currency = (getattr(action, "currency", None) or "USD").upper()
             if currency != "USD":
-                stats["SKIP_NON_USD_DIVIDEND"] += 1
-                continue
+                fx_rate = fx_converter.rate_to_usd(currency, ex_date) if fx_converter else None
+                cash_amount = _to_decimal(getattr(action, "cash_amount", None))
+                if fx_rate is None or cash_amount is None:
+                    stats["SKIP_NON_USD_DIVIDEND"] += 1
+                    continue
+                with localcontext() as ctx:
+                    ctx.prec = 34
+                    cash_amount_usd = cash_amount * fx_rate
+                stats["FX_CONVERTED_DIVIDEND"] += 1
             previous_close = _find_previous_close(price_dates, close_by_date, ex_date)
-        single_factor = _single_event_factor(action, previous_close)
+        single_factor = _single_event_factor(action, previous_close, cash_amount_override=cash_amount_usd)
         if single_factor is None:
             stats[f"SKIP_{(getattr(action, 'action_type', '') or 'UNKNOWN').upper()}"] += 1
             continue
@@ -256,13 +286,21 @@ def compute_adjustment_factor_rows(
                 "factor_key": build_factor_key(action),
                 "previous_close": previous_close,
                 "single_event_factor": single_factor,
+                "cash_amount_usd": cash_amount_usd,
+                "fx_rate_to_usd": fx_rate,
             }
         )
 
     event_items.sort(key=lambda item: (item["date"], item["factor_key"]))
     event_hash = _event_hash(
         [
-            _event_payload(item["action"], item["previous_close"], item["single_event_factor"])
+            _event_payload(
+                item["action"],
+                item["previous_close"],
+                item["single_event_factor"],
+                cash_amount_usd=item["cash_amount_usd"],
+                fx_rate_to_usd=item["fx_rate_to_usd"],
+            )
             for item in event_items
         ]
     )
@@ -343,13 +381,23 @@ def evaluate_vendor_comparison(
     之后所有同类型事件单因子的连乘——分红链不含拆股、拆股链不含分红，且不含
     ex_date 在 as_of 之后的未来事件。computed 的 cumulative_factor 则是跨类型总链
     （读取层复权口径），不能直接比；这里按 vendor 口径用 single_event_factor 重算。
+
+    非 USD 分红（FX 折算事件）vendor 不出因子行、也不计入其链；对账链须同样
+    剔除（单独计 non_usd_dividends），否则其后的全部历史分红对账必然失败。
     """
     from itertools import groupby
 
     future_events = 0
+    non_usd_dividends = 0
     eligible = []
     for row in rows:
         if not row["date"]:
+            continue
+        if (
+            (row.get("action_type") or "").upper() == "DIVIDEND"
+            and (row.get("currency") or "USD").upper() != "USD"
+        ):
+            non_usd_dividends += 1
             continue
         # vendor 是否包含某事件以 vendor 是否返回了该事件的参考行为准：ex_date 已到
         # 的事件（含当日）vendor 会给行并计入链；尚未生效的未来事件无行、不计入。
@@ -412,6 +460,7 @@ def evaluate_vendor_comparison(
             "future_events": future_events,
             "stale_vendor": stale_vendor,
             "vendor_unadjusted": vendor_unadjusted,
+            "non_usd_dividends": non_usd_dividends,
         }
 
     compared.sort(key=lambda r: r["abs_diff"], reverse=True)
@@ -429,6 +478,7 @@ def evaluate_vendor_comparison(
         "future_events": future_events,
         "stale_vendor": stale_vendor,
         "vendor_unadjusted": vendor_unadjusted,
+        "non_usd_dividends": non_usd_dividends,
     }
 
 
@@ -450,9 +500,15 @@ def compare_with_vendor(
             c.action_type,
             c.cumulative_factor,
             c.single_event_factor,
+            a.currency,
             v.adjustment_factor,
             v.as_of_date AS vendor_as_of
         FROM computed_adjustment_factors c
+        LEFT JOIN corporate_actions a
+          ON a.security_id = c.security_id
+         AND a.source_event_id = c.source_event_id
+         AND a.action_type = c.action_type
+         AND upper(a.source) = upper(:source)
         LEFT JOIN vendor_adjustment_factors v
           ON v.security_id = c.security_id
          AND v.factor_type = c.factor_type
@@ -521,6 +577,7 @@ def process_security(
     args: argparse.Namespace,
     as_of_date: date,
     tolerance: Decimal,
+    fx_converter=None,
 ) -> tuple[str, str, int, dict, Counter]:
     actions, price_dates, close_by_date = _load_actions_and_prices(db_manager, security.id, args.source)
     if not actions:
@@ -534,6 +591,7 @@ def process_security(
         close_by_date,
         methodology_version=args.methodology_version,
         as_of_date=as_of_date,
+        fx_converter=fx_converter,
     )
     inserted = db_manager.replace_computed_adjustment_factors(security.id, args.methodology_version, rows)
     comparison = compare_with_vendor(
@@ -565,6 +623,10 @@ def main(argv: list[str] | None = None) -> int:
             logger.success("没有需要重建调整因子的证券。")
             return 0
 
+        # fx_rates 为空（未跑 update_fx_rates）时 converter 查不到行，
+        # 行为自动退化为原 SKIP_NON_USD_DIVIDEND。
+        fx_converter = UsdFxConverter(db_manager)
+
         if args.refresh_vendor_daily_bars:
             api_keys = get_massive_api_keys()
             rate_limiter = KeyRateLimiter(api_keys, MASSIVE_RATE_LIMIT, MASSIVE_RATE_SECONDS, scope="massive-adjustment")
@@ -589,6 +651,7 @@ def main(argv: list[str] | None = None) -> int:
                 args,
                 as_of_date,
                 tolerance,
+                fx_converter=fx_converter,
             )
             status_counter[status] += 1
             total_rows += row_count

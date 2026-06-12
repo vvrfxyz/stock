@@ -40,6 +40,7 @@ def test_scheduled_update_staggers_weekly_tasks():
     assert "update_sec_filings_recent" in sunday_names
     assert "update_insider_transactions_recent" in sunday_names
     assert "update_institutional_holdings_recent" in sunday_names
+    assert "update_fx_rates" in sunday_names
     assert "sync_sec_identifiers" not in saturday_names
     assert "update_insider_transactions_recent" not in saturday_names
     sec_step = next(

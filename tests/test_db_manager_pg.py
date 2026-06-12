@@ -509,3 +509,45 @@ class TestInstitutionalHoldings:
         row = self._row()
         row.pop("filer_cik")
         assert pg_db.upsert_institutional_holdings([row]) == 0
+
+
+class TestFxRates:
+    def _rows(self):
+        return [
+            {"rate_date": date(2026, 6, 5), "base_currency": "EUR", "quote_currency": "USD",
+             "source": "ECB", "rate": Decimal("1.14")},
+            {"rate_date": date(2026, 6, 5), "base_currency": "EUR", "quote_currency": "CAD",
+             "source": "ECB", "rate": Decimal("1.60")},
+            {"rate_date": date(2026, 6, 11), "base_currency": "EUR", "quote_currency": "USD",
+             "source": "ECB", "rate": Decimal("1.1537")},
+            {"rate_date": date(2026, 6, 11), "base_currency": "EUR", "quote_currency": "CAD",
+             "source": "ECB", "rate": Decimal("1.6127")},
+        ]
+
+    def test_upsert_idempotent_and_rate_refresh(self, pg_db):
+        assert pg_db.upsert_fx_rates(self._rows()) == 4
+        pg_db.upsert_fx_rates([{**self._rows()[0], "rate": Decimal("1.15")}])
+        assert _scalar(pg_db, "SELECT count(*) FROM fx_rates") == 4
+        assert _scalar(
+            pg_db,
+            "SELECT rate FROM fx_rates WHERE quote_currency='USD' AND rate_date='2026-06-05'",
+        ) == Decimal("1.1500000000")
+
+    def test_usd_converter_cross_rate_and_asof_fallback(self, pg_db):
+        from utils.fx_rates import UsdFxConverter
+
+        pg_db.upsert_fx_rates(self._rows())
+        fx = UsdFxConverter(pg_db)
+        # 当日有行情：CAD->USD = 1.1537/1.6127
+        rate = fx.rate_to_usd("CAD", date(2026, 6, 11))
+        assert rate is not None
+        assert abs(rate - Decimal("1.1537") / Decimal("1.6127")) < Decimal("1e-15")
+        # 周末回退到 6/5（间隔 2 天 < 7 天阈值）
+        assert fx.rate_to_usd("CAD", date(2026, 6, 7)) == Decimal("1.14") / Decimal("1.60")
+        # 超过 staleness 阈值
+        assert fx.rate_to_usd("CAD", date(2026, 7, 1)) is None
+        # EUR 与 USD 特例
+        assert fx.rate_to_usd("EUR", date(2026, 6, 11)) == Decimal("1.1537")
+        assert fx.rate_to_usd("USD", date(2026, 6, 11)) == Decimal("1")
+        # 无该币种数据
+        assert fx.rate_to_usd("XXX", date(2026, 6, 11)) is None
