@@ -4,7 +4,7 @@
 CUSIP|SYMBOL 对照抽出来，作为 CUSIP -> security_id 身份映射的免费官方来源
 （13F holdings 回填 security_id 依赖它）。
 
-数据源（免费、建议带自报 UA）：
+数据源（免费、硬性要求自报含邮箱的 User-Agent，否则 403）：
 - https://www.sec.gov/files/data/fails-deliver-data/cnsfails{YYYYMM}{a|b}.zip
   每月两个半月文件，约 T+1 月发布；单文件 ~5 万行、~12k 唯一 CUSIP/symbol 对。
 """
@@ -15,6 +15,8 @@ import zipfile
 from datetime import date
 
 import requests
+
+from utils.sec_config import get_sec_user_agent
 
 _FTD_URL = "https://www.sec.gov/files/data/fails-deliver-data/cnsfails{yyyymm}{half}.zip"
 _DEFAULT_TIMEOUT = 60
@@ -39,16 +41,18 @@ def fetch_ftd_cusip_symbol_pairs(
     yyyymm: str,
     half: str,
     session: requests.Session | None = None,
-    user_agent: str = "stock-pipeline ftd sync",
+    user_agent: str | None = None,
 ) -> set[tuple[str, str]] | None:
-    """下载单个 FTD 半月文件，返回 {(cusip, symbol_lower), ...}；未发布(403/404)返回 None。"""
+    """下载单个 FTD 半月文件，返回 {(cusip, symbol_lower), ...}；未发布(404)返回 None。
+
+    403 不吞——正确的自报 UA 下未发布只会 404，403 意味着 UA 配置问题，必须暴露。"""
     http = session or requests
     response = http.get(
         _FTD_URL.format(yyyymm=yyyymm, half=half),
         timeout=_DEFAULT_TIMEOUT,
-        headers={"User-Agent": user_agent},
+        headers={"User-Agent": user_agent or get_sec_user_agent()},
     )
-    if response.status_code in (403, 404):
+    if response.status_code == 404:
         return None
     response.raise_for_status()
     with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
