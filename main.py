@@ -28,6 +28,7 @@ from scripts.sync_sec_identifiers import main as sync_sec_identifiers_main
 from scripts.update_sec_filings import main as update_sec_filings_main
 from scripts.update_sec_fundamentals import main as update_sec_fundamentals_main
 from scripts.update_insider_transactions import main as update_insider_transactions_main
+from scripts.update_institutional_holdings import main as update_institutional_holdings_main
 from scripts.update_massive_shares import main as update_massive_shares_main
 from scripts.update_massive_events import main as update_massive_events_main
 from scripts.update_massive_short_data import main as update_massive_short_data_main
@@ -226,6 +227,16 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
                     "--market", market,
                     "--all",
                     "--since", (run_date - timedelta(days=21)).isoformat(),
+                ],
+            )
+        )
+        steps.append(
+            ScheduledStep(
+                "update_institutional_holdings_recent",
+                update_institutional_holdings_main,
+                [
+                    "--market", market,
+                    "--since", (run_date - timedelta(days=14)).isoformat(),
                 ],
             )
         )
@@ -442,6 +453,22 @@ def run_update_insider_transactions(args):
     execute_script(update_insider_transactions_main, cli_args)
 
 
+def run_update_institutional_holdings(args):
+    logger.info("执行: 同步 SEC 13F 机构持仓")
+    cli_args = []
+    if args.since:
+        cli_args.extend(['--since', args.since])
+    if getattr(args, 'quarter', None):
+        cli_args.extend(['--quarter', args.quarter])
+    if getattr(args, 'filer_cik', None):
+        cli_args.extend(['--filer-cik', args.filer_cik])
+    if args.limit > 0:
+        cli_args.extend(['--limit', str(args.limit)])
+    if getattr(args, 'reparse', False):
+        cli_args.append('--reparse')
+    execute_script(update_institutional_holdings_main, cli_args)
+
+
 def run_cleanup_us_universe(args):
     logger.info("执行: 清理 US Universe 中非保留类型证券")
     cli_args = []
@@ -616,6 +643,14 @@ def main():
     p_insiders.add_argument('--since', type=str, default=None, help="只处理该日期之后的 filing。")
     p_insiders.add_argument('--reparse', action='store_true', help="重解析已有明细的 filing。")
     p_insiders.set_defaults(func=run_update_insider_transactions)
+
+    p_13f = subparsers.add_parser('update_institutional_holdings', help="同步 SEC 13F-HR 机构持仓明细")
+    p_13f.add_argument('--since', type=str, default=None, help="按日扫 daily index 的起始日期。")
+    p_13f.add_argument('--quarter', type=str, default=None, help="季度全量回填，如 2026Q1。")
+    p_13f.add_argument('--filer-cik', type=str, default=None, help="只处理该 filer CIK。")
+    p_13f.add_argument('--limit', type=int, default=0, help="限制处理 filing 数量。")
+    p_13f.add_argument('--reparse', action='store_true', help="重新解析已入库 filing。")
+    p_13f.set_defaults(func=run_update_institutional_holdings)
 
     p_massive_details = subparsers.add_parser('update_massive_details', help="单独更新股票的详细信息 (来自 Massive)")
     p_massive_details.add_argument('symbols', nargs='*', help="要更新的股票代码列表。")

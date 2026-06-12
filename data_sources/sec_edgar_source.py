@@ -28,6 +28,9 @@ _TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
 _SUBMISSIONS_URL = "https://data.sec.gov/submissions/{filename}"
 _COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik10}.json"
 _ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar/data"
+_DAILY_FORM_INDEX_URL = "https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{quarter}/form.{ymd}.idx"
+_QUARTERLY_FORM_INDEX_URL = "https://www.sec.gov/Archives/edgar/full-index/{year}/QTR{quarter}/form.idx"
+_ARCHIVES_ROOT = "https://www.sec.gov/Archives"
 
 _DEFAULT_TIMEOUT = 30
 _MIN_REQUEST_INTERVAL = 1.0 / 8  # 8 req/s，低于 SEC 10 req/s 上限
@@ -256,6 +259,28 @@ class SecEdgarSource:
                 return None
             raise
 
+    # ------------------------------------------------------------------
+    # T4: 13F-HR（EDGAR form index 发现 + 全文提交抓取）
+    # ------------------------------------------------------------------
+
+    def fetch_daily_form_index(self, day: date) -> str | None:
+        """抓取某交易日的 daily form index 文本；非工作日/未发布返回 None。"""
+        quarter = (day.month - 1) // 3 + 1
+        url = _DAILY_FORM_INDEX_URL.format(year=day.year, quarter=quarter, ymd=day.strftime("%Y%m%d"))
+        try:
+            return self._get_text(url)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code in (403, 404):
+                return None
+            raise
+
+    def fetch_quarterly_form_index(self, year: int, quarter: int) -> str:
+        return self._get_text(_QUARTERLY_FORM_INDEX_URL.format(year=year, quarter=quarter))
+
+    def fetch_full_submission(self, file_path: str) -> str:
+        """按 form index 给出的相对路径（edgar/data/.../accession.txt）抓全文提交。"""
+        return self._get_text(f"{_ARCHIVES_ROOT}/{file_path.lstrip('/')}")
+
 
 def parse_company_facts(
     payload: dict,
@@ -477,4 +502,172 @@ def parse_ownership_document(xml_text: str, accession_number: str) -> list[dict]
                 ]
             )
             rows.append(row)
+    return rows
+
+
+# ----------------------------------------------------------------------
+# 13F-HR 解析（form index 行 + 全文提交）
+# ----------------------------------------------------------------------
+
+def parse_form_index(index_text: str, forms: set[str]) -> list[dict]:
+    """解析 EDGAR form.idx（daily 或 quarterly），返回指定 form 的行。
+
+    固定列宽格式不可靠（不同年份宽度不同），按右侧字段回退解析：
+    最后一段是文件路径，倒数第二段是日期，倒数第三段是 CIK，
+    行首到 CIK 之间为 form type + company name（form type 不含两个连续空格）。
+    """
+    rows = []
+    for line in index_text.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        file_path = parts[-1]
+        if not file_path.startswith("edgar/data/"):
+            continue
+        date_str = parts[-2]
+        cik_str = parts[-3]
+        if not (len(date_str) == 8 and date_str.isdigit() and cik_str.isdigit()):
+            continue
+        form_type = line.split("  ", 1)[0].strip()
+        if form_type not in forms:
+            continue
+        accession = file_path.rsplit("/", 1)[-1].removesuffix(".txt")
+        rows.append(
+            {
+                "form_type": form_type,
+                "filer_cik": cik_to_10digit(cik_str),
+                "filing_date": date(int(date_str[:4]), int(date_str[4:6]), int(date_str[6:8])),
+                "file_path": file_path,
+                "accession_number": accession,
+            }
+        )
+    return rows
+
+
+def _strip_ns(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _find_ns(node: ET.Element | None, name: str) -> ET.Element | None:
+    """忽略命名空间按本地名找第一个子孙节点。"""
+    if node is None:
+        return None
+    for child in node.iter():
+        if _strip_ns(child.tag) == name:
+            return child
+    return None
+
+
+def _text_ns(node: ET.Element | None, name: str) -> str | None:
+    found = _find_ns(node, name)
+    if found is None or found.text is None:
+        return None
+    return found.text.strip() or None
+
+
+def _parse_us_date(value: str | None) -> date | None:
+    """13F primary_doc 用 MM-DD-YYYY。"""
+    if not value:
+        return None
+    try:
+        month, day, year = value.strip().split("-")
+        return date(int(year), int(month), int(day))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _extract_xml_documents(submission_text: str) -> list[tuple[str, str]]:
+    """从全文提交 .txt 中提取 (filename, xml_text) 列表。"""
+    documents = []
+    pos = 0
+    while True:
+        doc_start = submission_text.find("<DOCUMENT>", pos)
+        if doc_start < 0:
+            break
+        doc_end = submission_text.find("</DOCUMENT>", doc_start)
+        if doc_end < 0:
+            break
+        block = submission_text[doc_start:doc_end]
+        pos = doc_end + len("</DOCUMENT>")
+        filename = ""
+        fn_start = block.find("<FILENAME>")
+        if fn_start >= 0:
+            filename = block[fn_start + len("<FILENAME>"):].split("\n", 1)[0].strip()
+        xml_start = block.find("<XML>")
+        xml_end = block.find("</XML>")
+        if xml_start < 0 or xml_end < 0:
+            continue
+        xml_text = block[xml_start + len("<XML>"):xml_end].strip()
+        documents.append((filename, xml_text))
+    return documents
+
+
+def parse_thirteenf_submission(submission_text: str, accession_number: str) -> list[dict]:
+    """13F-HR 全文提交 -> institutional_holdings 行。
+
+    primary_doc（edgarSubmission）给 filer/period 元数据，informationTable 给逐持仓行。
+    行哈希用 accession + 表内序号（同一 filing 中可能存在完全相同的持仓行，
+    内容哈希会误去重）。
+    """
+    primary_root = None
+    info_root = None
+    for _filename, xml_text in _extract_xml_documents(submission_text):
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError:
+            continue
+        tag = _strip_ns(root.tag)
+        if tag == "edgarSubmission" and primary_root is None:
+            primary_root = root
+        elif tag == "informationTable" and info_root is None:
+            info_root = root
+    if info_root is None:
+        return []
+
+    filer_cik = None
+    period = None
+    filer_name = None
+    form_type = None
+    file_number = None
+    if primary_root is not None:
+        filer_cik = cik_to_10digit(_text_ns(primary_root, "cik"))
+        period = _parse_us_date(_text_ns(primary_root, "periodOfReport"))
+        form_type = _text_ns(primary_root, "submissionType")
+        file_number = _text_ns(primary_root, "form13FFileNumber")
+        manager = _find_ns(primary_root, "filingManager")
+        filer_name = _text_ns(manager, "name")
+
+    rows = []
+    entry_index = 0
+    for node in info_root.iter():
+        if _strip_ns(node.tag) != "infoTable":
+            continue
+        shrs = _find_ns(node, "shrsOrPrnAmt")
+        voting = _find_ns(node, "votingAuthority")
+        other_managers_text = _text_ns(node, "otherManager")
+        rows.append(
+            {
+                "source": "SEC_EDGAR",
+                "accession_number": accession_number,
+                "source_row_hash": _row_hash([accession_number, entry_index]),
+                "filer_cik": filer_cik,
+                "form_type": form_type,
+                "period": period,
+                "issuer_name": _text_ns(node, "nameOfIssuer"),
+                "title_of_class": _text_ns(node, "titleOfClass"),
+                "cusip": _text_ns(node, "cusip"),
+                "market_value": _parse_decimal(_text_ns(node, "value")),
+                "shares_or_principal_amount": _parse_decimal(_text_ns(shrs, "sshPrnamt")),
+                "shares_or_principal_type": _text_ns(shrs, "sshPrnamtType"),
+                "put_call": _text_ns(node, "putCall"),
+                "investment_discretion": _text_ns(node, "investmentDiscretion"),
+                "other_managers": [other_managers_text] if other_managers_text else None,
+                "voting_authority_sole": _parse_decimal(_text_ns(voting, "Sole")),
+                "voting_authority_shared": _parse_decimal(_text_ns(voting, "Shared")),
+                "voting_authority_none": _parse_decimal(_text_ns(voting, "None")),
+                "file_number": file_number,
+                "filer_name": filer_name,
+            }
+        )
+        entry_index += 1
     return rows

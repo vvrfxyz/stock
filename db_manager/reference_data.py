@@ -4,6 +4,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from data_models.models import (
     InsiderTransaction,
+    InstitutionalHolding,
     NewsArticle,
     NewsArticleInsight,
     SecFiling,
@@ -199,6 +200,55 @@ class ReferenceDataMixin:
                 )
                 result = conn.execute(stmt)
                 written += result.rowcount
+            conn.commit()
+        return written
+
+    def upsert_institutional_holdings(self, rows_data: list[dict]) -> int:
+        """写 13-F 持仓明细行。security_id 允许为空（CUSIP 映射后补）；
+        冲突更新时 security_id 用 COALESCE 保护，不让未映射批次清掉已映射值。"""
+        rows = [_clean_for_model(InstitutionalHolding, row) for row in rows_data]
+        rows = [
+            row for row in rows
+            if row.get("source") and row.get("accession_number")
+            and row.get("source_row_hash") and row.get("filer_cik")
+        ]
+        if not rows:
+            return 0
+
+        deduped: dict[tuple, dict] = {}
+        for row in rows:
+            deduped.setdefault((row["source"], row["accession_number"], row["source_row_hash"]), row)
+        rows = list(deduped.values())
+
+        written = 0
+        with self.engine.connect() as conn:
+            self._lock_model_sequence_sync(conn, InstitutionalHolding)
+            self._sync_model_id_sequence(conn, InstitutionalHolding)
+            for group in _group_rows_by_key_set(rows):
+                for start in range(0, len(group), 2000):
+                    chunk = group[start:start + 2000]
+                    stmt = pg_insert(InstitutionalHolding).values(chunk)
+                    update_keys = set(chunk[0].keys())
+                    update_columns = {
+                        key: getattr(stmt.excluded, key)
+                        for key in update_keys
+                        if key not in {
+                            "id", "source", "accession_number", "source_row_hash",
+                            "created_at", "security_id",
+                        }
+                    }
+                    if "security_id" in update_keys:
+                        update_columns["security_id"] = func.coalesce(
+                            stmt.excluded.security_id,
+                            InstitutionalHolding.security_id,
+                        )
+                    update_columns["updated_at"] = func.now()
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=["source", "accession_number", "source_row_hash"],
+                        set_=update_columns,
+                    )
+                    result = conn.execute(stmt)
+                    written += result.rowcount
             conn.commit()
         return written
 

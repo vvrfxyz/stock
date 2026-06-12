@@ -133,7 +133,7 @@ python main.py scheduled_update --market US
 `scheduled_update` 顺序执行：
 1. 每天：日线、short data、最近 14 天 corporate actions、最近已完成交易日的盘前/盘后。
 2. 每周六：shares / float、最近 5 个交易日 grouped daily 重刷。
-3. 每周日：分红 / 拆股全量、SEC identifiers、SEC filings 增量、SEC fundamentals 增量、Form 3/4/5 insider 解析增量。
+3. 每周日：分红 / 拆股全量、SEC identifiers、SEC filings 增量、SEC fundamentals 增量、Form 3/4/5 insider 解析增量、13F 持仓增量。
 4. 每月第一个周二：ticker events / symbol history。
 5. 每月第一个周三：证券详情。
 

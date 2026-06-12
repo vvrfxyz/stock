@@ -5,6 +5,7 @@
 ### Added (2026-06-12)
 
 - T3 insider ingestion: `update_insider_transactions` parses Form 3/4/5 ownership XML from the `sec_filings` index into `insider_transactions` (one row per entry × reporting owner, `source+accession+row_hash` idempotency, footnote resolution); weekly incremental added to Sunday `scheduled_update`.
+- T4 13-F ingestion: `update_institutional_holdings` discovers 13F-HR filings via EDGAR daily/quarterly form indexes (filer-CIK anchored, independent of issuer-side `sec_filings`), parses full-submission information tables into `institutional_holdings`, and backfills `security_id` from `security_identifiers` CUSIP mappings when available (COALESCE-protected on re-upsert). Migration `c3d4e5f6a7b8` adds `filer_name`. Weekly incremental added to Sunday `scheduled_update`.
 
 ### Removed (2026-06-12)
 

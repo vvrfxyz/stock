@@ -477,3 +477,35 @@ class TestInsiderTransactions:
     def test_distinct_hashes_create_separate_rows(self, pg_db):
         pg_db.upsert_insider_transactions([self._row(), self._row(source_row_hash="b" * 64)])
         assert _scalar(pg_db, "SELECT count(*) FROM insider_transactions") == 2
+
+
+class TestInstitutionalHoldings:
+    def _row(self, **extra):
+        return {
+            "source": "SEC_EDGAR",
+            "accession_number": "0001-26-000099",
+            "source_row_hash": "c" * 64,
+            "filer_cik": "0001779506",
+            "cusip": "037833100",
+            "market_value": Decimal("1864"),
+            "shares_or_principal_amount": Decimal("10"),
+            **extra,
+        }
+
+    def test_insert_then_idempotent_reupsert(self, pg_db):
+        assert pg_db.upsert_institutional_holdings([self._row()]) == 1
+        pg_db.upsert_institutional_holdings([self._row()])
+        assert _scalar(pg_db, "SELECT count(*) FROM institutional_holdings") == 1
+
+    def test_security_id_not_cleared_by_unmapped_reupsert(self, pg_db):
+        _insert_security(pg_db)
+        pg_db.upsert_institutional_holdings([self._row(security_id=1)])
+        # CUSIP 映射缺失的重灌批次 security_id=None，不得清掉已映射值
+        pg_db.upsert_institutional_holdings([self._row(security_id=None, market_value=Decimal("2000"))])
+        assert _scalar(pg_db, "SELECT security_id FROM institutional_holdings") == 1
+        assert _scalar(pg_db, "SELECT market_value FROM institutional_holdings") == Decimal("2000.0000")
+
+    def test_missing_filer_cik_skipped(self, pg_db):
+        row = self._row()
+        row.pop("filer_cik")
+        assert pg_db.upsert_institutional_holdings([row]) == 0

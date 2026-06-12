@@ -340,6 +340,7 @@ class InstitutionalHolding(Base):
     accession_number = Column(String(32), nullable=False, index=True)
     source_row_hash = Column(String(64), nullable=False)
     filer_cik = Column(String(20), nullable=False, index=True)
+    filer_name = Column(String(255), nullable=True, index=True)
     form_type = Column(String(20), nullable=True, index=True)
     filing_date = Column(Date, nullable=True, index=True)
     period = Column(Date, nullable=True, index=True)
