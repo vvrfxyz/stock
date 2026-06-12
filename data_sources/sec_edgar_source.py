@@ -515,6 +515,7 @@ def parse_form_index(index_text: str, forms: set[str]) -> list[dict]:
     固定列宽格式不可靠（不同年份宽度不同），按右侧字段回退解析：
     最后一段是文件路径，倒数第二段是日期，倒数第三段是 CIK，
     行首到 CIK 之间为 form type + company name（form type 不含两个连续空格）。
+    日期两种格式：daily 索引用 YYYYMMDD，quarterly 索引用 YYYY-MM-DD。
     """
     rows = []
     for line in index_text.splitlines():
@@ -524,9 +525,9 @@ def parse_form_index(index_text: str, forms: set[str]) -> list[dict]:
         file_path = parts[-1]
         if not file_path.startswith("edgar/data/"):
             continue
-        date_str = parts[-2]
+        filing_date = _parse_index_date(parts[-2])
         cik_str = parts[-3]
-        if not (len(date_str) == 8 and date_str.isdigit() and cik_str.isdigit()):
+        if filing_date is None or not cik_str.isdigit():
             continue
         form_type = line.split("  ", 1)[0].strip()
         if form_type not in forms:
@@ -536,12 +537,23 @@ def parse_form_index(index_text: str, forms: set[str]) -> list[dict]:
             {
                 "form_type": form_type,
                 "filer_cik": cik_to_10digit(cik_str),
-                "filing_date": date(int(date_str[:4]), int(date_str[4:6]), int(date_str[6:8])),
+                "filing_date": filing_date,
                 "file_path": file_path,
                 "accession_number": accession,
             }
         )
     return rows
+
+
+def _parse_index_date(value: str) -> date | None:
+    if len(value) == 8 and value.isdigit():
+        return date(int(value[:4]), int(value[4:6]), int(value[6:8]))
+    if len(value) == 10:
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _strip_ns(tag: str) -> str:

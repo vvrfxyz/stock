@@ -124,6 +124,17 @@ class TestParseFormIndex:
         rows = parse_form_index(FORM_INDEX_TEXT, {"10-K"})
         assert rows == []
 
+    def test_quarterly_index_iso_dates_parsed(self):
+        # quarterly full-index 的日期是 YYYY-MM-DD，daily 是 YYYYMMDD，两种都要认
+        text = (
+            "13F-HR           1 NORTH WEALTH SERVICES LLC                                   "
+            "1641761     2026-02-13  edgar/data/1641761/0001641761-26-000001.txt\n"
+        )
+        rows = parse_form_index(text, {"13F-HR"})
+        assert len(rows) == 1
+        assert rows[0]["filing_date"] == date(2026, 2, 13)
+        assert rows[0]["accession_number"] == "0001641761-26-000001"
+
 
 class TestParseThirteenfSubmission:
     def test_holdings_rows_with_filer_metadata(self):
