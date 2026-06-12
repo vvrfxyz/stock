@@ -62,11 +62,11 @@ def test_scheduled_update_staggers_monthly_tasks():
 def test_scheduled_update_continues_after_step_failure_and_exits_nonzero(monkeypatch):
     executed = []
 
-    def failing_step():
+    def failing_step(argv=None):
         executed.append("fail")
         raise SystemExit(1)
 
-    def ok_step():
+    def ok_step(argv=None):
         executed.append("ok")
 
     steps = [
@@ -86,8 +86,8 @@ def test_scheduled_update_exits_zero_when_all_steps_succeed(monkeypatch):
     executed = []
 
     steps = [
-        ScheduledStep("step_a", lambda: executed.append("a"), []),
-        ScheduledStep("step_b", lambda: executed.append("b"), []),
+        ScheduledStep("step_a", lambda argv=None: executed.append("a"), []),
+        ScheduledStep("step_b", lambda argv=None: executed.append("b"), []),
     ]
     monkeypatch.setattr(main_module, "build_scheduled_update_steps", lambda run_date, market: steps)
 

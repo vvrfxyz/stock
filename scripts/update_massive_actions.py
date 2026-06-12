@@ -1,15 +1,11 @@
 import argparse
 import os
 import sys
-import time
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 
 from loguru import logger
-from sqlalchemy import func, or_
-from tqdm import tqdm
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
@@ -18,18 +14,14 @@ if project_root not in sys.path:
 from data_models.models import Security
 from data_sources.massive_source import MassiveSource
 from db_manager import DatabaseManager
-from utils.key_rate_limiter import KeyRateLimiter
-from utils.massive_config import (
-    ALLOWED_US_SECURITY_TYPES,
-    MASSIVE_RATE_LIMIT,
-    MASSIVE_RATE_SECONDS,
-    enforce_us_market,
-    get_massive_api_keys,
-    get_massive_history_floor,
-    iter_chunks,
+from utils.massive_config import get_massive_history_floor, iter_chunks
+from utils.massive_task import (
+    build_standard_parser,
+    run_concurrently,
+    run_massive_task,
+    select_us_securities,
 )
 from utils.trading_calendar import get_last_completed_trading_date
-from utils.script_logging import setup_logging as configure_script_logging
 
 ACTIONS_UPDATE_INTERVAL_DAYS = 90
 MAX_CONCURRENT_WORKERS = 8
@@ -43,18 +35,11 @@ def _infer_currency(security: Security) -> str | None:
     return "USD"
 
 
-def setup_logging():
-    configure_script_logging("update_massive_actions")
-
-
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="使用 Massive API 批量更新公司行动（分红、拆股）。",
-        formatter_class=argparse.RawTextHelpFormatter,
+    parser = build_standard_parser(
+        "使用 Massive API 批量更新公司行动（分红、拆股）。",
+        default_workers=MAX_CONCURRENT_WORKERS,
     )
-    parser.add_argument("symbols", nargs="*", help="要更新的股票代码列表。")
-    parser.add_argument("--all", action="store_true", help="处理全部活跃保留类型证券。")
-    parser.add_argument("--market", type=str, default="US", help="当前仅支持 US。")
     parser.add_argument("--force", action="store_true", help="强制刷新 Massive 可覆盖的最近 2 年窗口。")
     parser.add_argument(
         "--recent-days",
@@ -63,35 +48,17 @@ def create_parser() -> argparse.ArgumentParser:
         help="只拉取最近 N 天的新事件（忽略 90 天间隔，选取全部活跃证券）。"
              "用于每日轻量补新，弥补周日全量被跳过时的事件缺口。",
     )
-    parser.add_argument("--limit", type=int, default=0, help="限制处理数量。")
-    parser.add_argument("--workers", type=int, default=MAX_CONCURRENT_WORKERS, help="批次并发数。")
     return parser
 
 
 def get_securities_to_update(db_manager: DatabaseManager, args: argparse.Namespace) -> list[Security]:
-    with db_manager.get_session() as session:
-        query = session.query(Security).filter(
-            func.upper(Security.market) == enforce_us_market(args.market),
-            func.upper(Security.type).in_(ALLOWED_US_SECURITY_TYPES),
-            Security.is_active == True,
-        )
-
-        if args.symbols:
-            query = query.filter(Security.symbol.in_([item.lower() for item in args.symbols]))
-
-        if not args.force and not args.recent_days:
-            update_before = datetime.now(timezone.utc) - timedelta(days=ACTIONS_UPDATE_INTERVAL_DAYS)
-            query = query.filter(
-                or_(
-                    Security.actions_last_updated_at.is_(None),
-                    Security.actions_last_updated_at < update_before,
-                )
-            )
-
-        query = query.order_by(Security.actions_last_updated_at.asc().nulls_first(), Security.symbol.asc())
-        if args.limit > 0:
-            query = query.limit(args.limit)
-        return query.all()
+    return select_us_securities(
+        db_manager,
+        args,
+        staleness_column="actions_last_updated_at",
+        staleness_days=ACTIONS_UPDATE_INTERVAL_DAYS,
+        skip_staleness=bool(args.force or args.recent_days),
+    )
 
 
 def _get_batch_start_date(
@@ -263,63 +230,35 @@ def process_batch(
     return results_counter, changed
 
 
-def main() -> int:
-    start_time = time.monotonic()
-    setup_logging()
-    parser = create_parser()
-    args = parser.parse_args()
-
-    if not any([args.symbols, args.all, args.market]):
-        parser.print_help()
+def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseManager) -> int:
+    end_date = get_last_completed_trading_date(args.market)
+    history_floor = get_massive_history_floor(end_date)
+    securities = get_securities_to_update(db_manager, args)
+    if not securities:
+        logger.success("没有需要更新 Massive 公司行动的证券。")
         return 0
 
-    db_manager = None
-    try:
-        enforce_us_market(args.market)
-        api_keys = get_massive_api_keys()
-        rate_limiter = KeyRateLimiter(api_keys, MASSIVE_RATE_LIMIT, MASSIVE_RATE_SECONDS, scope="massive")
-        source = MassiveSource(rate_limiter=rate_limiter)
-        db_manager = DatabaseManager()
+    batches = iter_chunks(securities, API_BATCH_SIZE)
+    outputs, results_counter = run_concurrently(
+        batches,
+        lambda batch: process_batch(batch, source, db_manager, history_floor, args.force, args.recent_days),
+        max_workers=args.workers,
+        desc="更新 Massive 公司行动",
+    )
+    for batch_counter, _changed in outputs:
+        results_counter.update(batch_counter)
 
-        end_date = get_last_completed_trading_date(args.market)
-        history_floor = get_massive_history_floor(end_date)
-        securities = get_securities_to_update(db_manager, args)
-        if not securities:
-            logger.success("没有需要更新 Massive 公司行动的证券。")
-            return 0
+    logger.info("--- 公司行动统计 ---")
+    logger.info("  成功(有新增): {}", results_counter["SUCCESS"])
+    logger.info("  成功(仅重复): {}", results_counter["SUCCESS_DUPLICATE_ONLY"])
+    logger.info("  成功(无 actions): {}", results_counter["SUCCESS_NO_ACTIONS"])
+    logger.info("  错误: {}", results_counter["ERROR"] + results_counter["FATAL_ERROR"])
+    logger.info("--------------------")
+    return 0
 
-        results_counter = Counter()
-        batches = iter_chunks(securities, API_BATCH_SIZE)
 
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            future_to_batch = {
-                executor.submit(process_batch, batch, source, db_manager, history_floor, args.force, args.recent_days): batch
-                for batch in batches
-            }
-            for future in tqdm(as_completed(future_to_batch), total=len(future_to_batch), desc="更新 Massive 公司行动"):
-                try:
-                    batch_counter, batch_changed = future.result()
-                    results_counter.update(batch_counter)
-                except Exception as exc:
-                    batch = future_to_batch[future]
-                    logger.opt(exception=exc).error("批次 {}-{} 发生未捕获异常: {}", batch[0].symbol, batch[-1].symbol, exc)
-                    results_counter["FATAL_ERROR"] += len(batch)
-
-        logger.info("--- 公司行动统计 ---")
-        logger.info("  成功(有新增): {}", results_counter["SUCCESS"])
-        logger.info("  成功(仅重复): {}", results_counter["SUCCESS_DUPLICATE_ONLY"])
-        logger.info("  成功(无 actions): {}", results_counter["SUCCESS_NO_ACTIONS"])
-        logger.info("  错误: {}", results_counter["ERROR"] + results_counter["FATAL_ERROR"])
-        logger.info("--------------------")
-
-        return 0
-    except Exception as e:
-        logger.opt(exception=e).critical("update_actions 执行失败: {}", e)
-        return 1
-    finally:
-        if db_manager:
-            db_manager.close()
-        logger.info("耗时: {}", timedelta(seconds=time.monotonic() - start_time))
+def main(argv: list[str] | None = None) -> int:
+    return run_massive_task("update_massive_actions", argv, create_parser, run)
 
 
 if __name__ == "__main__":

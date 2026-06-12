@@ -16,13 +16,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROGRESS_PATH = PROJECT_ROOT / "logs" / "massive_shares_chunks_2026-05-15.jsonl"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Massive shares full-refresh in resumable symbol chunks.")
     parser.add_argument("--market", default="US", help="Market to process. Currently only US is supported.")
     parser.add_argument("--chunk-size", type=int, default=100, help="Number of symbols per child run.")
     parser.add_argument("--progress", type=Path, default=DEFAULT_PROGRESS_PATH, help="JSONL progress file.")
     parser.add_argument("--limit-chunks", type=int, default=0, help="Optional limit for smoke tests.")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def utc_now() -> str:
@@ -77,8 +77,8 @@ def iter_chunks(items: list[str], chunk_size: int):
         yield index // chunk_size + 1, items[index : index + chunk_size]
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     if args.market.upper() != "US":
         raise ValueError(f"Only US market is supported, got: {args.market}")
     if args.chunk_size <= 0:

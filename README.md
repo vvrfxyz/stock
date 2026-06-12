@@ -54,8 +54,8 @@ python main.py rebuild_massive_dataset --market US
 python main.py sync_massive_universe --market US
 
 # 单项调试入口（一般不需要日常手动跑）
-python main.py update_details AAPL NVDA --workers 4
-python main.py update_actions --market US --workers 4
+python main.py update_massive_details AAPL NVDA --workers 4
+python main.py update_massive_actions --market US --workers 4
 
 # 单项调试 raw 日线事实
 python main.py update_massive_prices AAPL --full-refresh
@@ -83,8 +83,8 @@ python scripts/migrate_database.py
 ```
 
 `update` 默认顺序：
-1. `update_details`：自动检测是否需要更新股票基本信息（默认 30 天间隔）。
-2. `update_actions`：自动判断是否需要拉取最新分红/拆股（默认 90 天间隔或缺失）。
+1. `update_massive_details`：自动检测是否需要更新股票基本信息（默认 30 天间隔）。
+2. `update_massive_actions`：自动判断是否需要拉取最新分红/拆股（默认 90 天间隔或缺失）。
 3. `update_massive_prices`：自动补齐当前缺失的日线 raw bar。
 
 `scheduled_update` 是推荐的 cron 入口，顺序执行并复用同一进程内的 Massive key 限流状态：
@@ -101,14 +101,12 @@ Debian 部署使用 systemd timer，每天 UTC+8 `10:00` 运行
 需要一次性重拉 Massive 可覆盖窗口时，仍然使用各单项命令的 `--force` 或
 `--full-refresh` 参数；默认日更路径不会走全量刷新。
 
-`daily_run` 仅作为兼容别名保留，等同于 `update`。
-
 ## 目录结构
 
 - `main.py`：CLI 中央控制器。
 - `scripts/`：各类更新/维护脚本。
 - `data_models/models.py`：SQLAlchemy ORM schema。
-- `db_manager.py`：`DatabaseManager` session/upsert/批量写入。
+- `db_manager/`：`DatabaseManager` session/upsert/批量写入（按领域拆分为多个 mixin 模块）。
 - `data_sources/`：外部数据源适配器，当前主要为 Massive。
 - `utils/`：小型复用工具。
 - `alembic/`：数据库迁移。

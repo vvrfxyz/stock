@@ -1,0 +1,3 @@
+# 开发/测试依赖（生产运行不需要）
+pytest
+pytest-cov

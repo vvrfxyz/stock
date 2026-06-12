@@ -29,10 +29,10 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     start_time = time.monotonic()
     configure_script_logging("sync_sec_identifiers")
-    create_parser().parse_args()
+    create_parser().parse_args(argv)
 
     db_manager = None
     try:

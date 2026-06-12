@@ -1,14 +1,11 @@
 import argparse
 import os
 import sys
-import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, timedelta
+from datetime import date
 
 from loguru import logger
 from sqlalchemy import func
-from tqdm import tqdm
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
@@ -17,39 +14,27 @@ if project_root not in sys.path:
 from data_models.models import HistoricalShare, Security
 from data_sources.massive_source import MassiveSource
 from db_manager import DatabaseManager
-from utils.key_rate_limiter import KeyRateLimiter
 from utils.massive_config import (
     ALLOWED_US_SECURITY_TYPES,
-    MASSIVE_RATE_LIMIT,
-    MASSIVE_RATE_SECONDS,
     enforce_us_market,
-    get_massive_api_keys,
     get_massive_history_floor,
     get_quarter_snapshot_dates,
 )
+from utils.massive_task import build_standard_parser, run_concurrently, run_massive_task
 from utils.trading_calendar import get_last_completed_trading_date
-from utils.script_logging import setup_logging as configure_script_logging
 
 MAX_CONCURRENT_WORKERS = 8
 UPSERT_BATCH_SIZE = 1000
 
 
-def setup_logging():
-    configure_script_logging("update_massive_shares")
-
-
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="使用 Massive Ticker Overview / Float 更新 historical_shares。",
-        formatter_class=argparse.RawTextHelpFormatter,
+    parser = build_standard_parser(
+        "使用 Massive Ticker Overview / Float 更新 historical_shares。",
+        default_workers=MAX_CONCURRENT_WORKERS,
+        all_help="处理全部保留类型证券。",
     )
-    parser.add_argument("symbols", nargs="*", help="要处理的股票代码列表。")
-    parser.add_argument("--all", action="store_true", help="处理全部保留类型证券。")
-    parser.add_argument("--market", type=str, default="US", help="当前仅支持 US。")
     parser.add_argument("--full-refresh", action="store_true", help="回填 Massive 可覆盖的最近 2 年季度快照。")
     parser.add_argument("--start-date", type=str, help="起始日期 YYYY-MM-DD。仅在 full-refresh 时生效。")
-    parser.add_argument("--limit", type=int, default=0, help="限制处理数量。")
-    parser.add_argument("--workers", type=int, default=MAX_CONCURRENT_WORKERS, help="并发线程数。")
     return parser
 
 
@@ -180,110 +165,88 @@ def _get_exit_code(results_counter: Counter) -> int:
     return 0
 
 
-def main() -> int:
-    start_time = time.monotonic()
-    setup_logging()
-    parser = create_parser()
-    args = parser.parse_args()
+def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseManager) -> int:
+    end_date = get_last_completed_trading_date(args.market)
+    history_floor = get_massive_history_floor(end_date)
+    requested_start_date = date.fromisoformat(args.start_date) if args.start_date else history_floor
+    start_date = max(requested_start_date, history_floor)
+    snapshot_dates = get_quarter_snapshot_dates(start_date, end_date) if args.full_refresh else [end_date]
 
-    db_manager = None
-    try:
-        enforce_us_market(args.market)
-        api_keys = get_massive_api_keys()
-        rate_limiter = KeyRateLimiter(api_keys, MASSIVE_RATE_LIMIT, MASSIVE_RATE_SECONDS, scope="massive")
-        source = MassiveSource(rate_limiter=rate_limiter)
-        db_manager = DatabaseManager()
+    securities = get_securities_to_process(db_manager, args, end_date)
+    if not securities:
+        logger.success("没有需要更新 shares 的证券。")
+        return 0
 
-        end_date = get_last_completed_trading_date(args.market)
-        history_floor = get_massive_history_floor(end_date)
-        requested_start_date = date.fromisoformat(args.start_date) if args.start_date else history_floor
-        start_date = max(requested_start_date, history_floor)
-        snapshot_dates = get_quarter_snapshot_dates(start_date, end_date) if args.full_refresh else [end_date]
+    outputs, results_counter = run_concurrently(
+        securities,
+        lambda security: process_security(security, source, snapshot_dates),
+        max_workers=args.workers,
+        desc="更新 Massive shares",
+    )
+    all_rows: list[dict] = []
+    for _symbol, status, rows in outputs:
+        results_counter[status] += 1
+        if rows:
+            all_rows.extend(rows)
 
-        securities = get_securities_to_process(db_manager, args, end_date)
-        if not securities:
-            logger.success("没有需要更新 shares 的证券。")
-            return 0
+    float_rows = source.get_float_batch([security.symbol for security in securities])
+    floats_by_symbol: dict[str, list[dict]] = {}
+    for row in float_rows:
+        ticker = row.get("ticker")
+        effective_date = row.get("effective_date")
+        if not ticker or not effective_date:
+            continue
+        floats_by_symbol.setdefault(ticker, []).append(row)
+    for rows in floats_by_symbol.values():
+        rows.sort(key=lambda item: item["effective_date"])
 
-        results_counter = Counter()
-        all_rows: list[dict] = []
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            future_to_security = {
-                executor.submit(process_security, security, source, snapshot_dates): security
-                for security in securities
+    symbol_to_security = {security.symbol: security for security in securities}
+    security_id_to_symbol = {security.id: security.symbol for security in securities}
+    historical_float_rows: list[dict] = []
+    for row in float_rows:
+        security = symbol_to_security.get(row.get("ticker"))
+        if not security:
+            continue
+        historical_float_rows.append(
+            {
+                "security_id": security.id,
+                "effective_date": row.get("effective_date"),
+                "free_float": row.get("free_float"),
+                "free_float_percent": row.get("free_float_percent"),
+                "source": "MASSIVE",
             }
-            for future in tqdm(as_completed(future_to_security), total=len(securities), desc="更新 Massive shares"):
-                try:
-                    symbol, status, rows = future.result()
-                    results_counter[status] += 1
-                    if rows:
-                        all_rows.extend(rows)
-                except Exception as exc:
-                    security = future_to_security[future]
-                    logger.opt(exception=exc).error("任务 {} 发生未捕获异常: {}", security.symbol, exc)
-                    results_counter["FATAL_ERROR"] += 1
+        )
 
-        float_rows = source.get_float_batch([security.symbol for security in securities])
-        floats_by_symbol: dict[str, list[dict]] = {}
-        for row in float_rows:
-            ticker = row.get("ticker")
-            effective_date = row.get("effective_date")
-            if not ticker or not effective_date:
-                continue
-            floats_by_symbol.setdefault(ticker, []).append(row)
-        for rows in floats_by_symbol.values():
-            rows.sort(key=lambda item: item["effective_date"])
+    for row in all_rows:
+        row.setdefault("float_shares", None)
+        row.setdefault("free_float_percent", None)
+    float_match_count = _attach_float_fields(all_rows, floats_by_symbol, security_id_to_symbol)
 
-        symbol_to_security = {security.symbol: security for security in securities}
-        security_id_to_symbol = {security.id: security.symbol for security in securities}
-        historical_float_rows: list[dict] = []
-        for row in float_rows:
-            security = symbol_to_security.get(row.get("ticker"))
-            if not security:
-                continue
-            historical_float_rows.append(
-                {
-                    "security_id": security.id,
-                    "effective_date": row.get("effective_date"),
-                    "free_float": row.get("free_float"),
-                    "free_float_percent": row.get("free_float_percent"),
-                    "source": "MASSIVE",
-                }
-            )
+    if all_rows:
+        for batch in _iter_batches(all_rows, UPSERT_BATCH_SIZE):
+            db_manager.upsert_historical_shares(batch)
+    if historical_float_rows:
+        for batch in _iter_batches(historical_float_rows, UPSERT_BATCH_SIZE):
+            db_manager.upsert_historical_floats(batch)
 
-        for row in all_rows:
-            row.setdefault("float_shares", None)
-            row.setdefault("free_float_percent", None)
-        float_match_count = _attach_float_fields(all_rows, floats_by_symbol, security_id_to_symbol)
+    db_manager.update_security_timestamps([security.id for security in securities], "shares_last_updated_at")
 
-        if all_rows:
-            for batch in _iter_batches(all_rows, UPSERT_BATCH_SIZE):
-                db_manager.upsert_historical_shares(batch)
-        if historical_float_rows:
-            for batch in _iter_batches(historical_float_rows, UPSERT_BATCH_SIZE):
-                db_manager.upsert_historical_floats(batch)
+    logger.info("--- shares 更新统计 ---")
+    logger.info("  成功: {}", results_counter["SUCCESS"])
+    logger.info("  无数据: {}", results_counter["SUCCESS_NO_DATA"])
+    logger.info("  错误: {}", results_counter["ERROR"] + results_counter["FATAL_ERROR"])
+    logger.info("  total_shares 行数: {}", len(all_rows))
+    logger.info("  historical_floats 行数: {}", len(historical_float_rows))
+    logger.info("  float_shares 匹配行数: {}", float_match_count)
+    logger.info("----------------------")
+    exit_code = _get_exit_code(results_counter)
+    if exit_code != 0:
+        logger.error("shares 更新存在失败 symbol，本轮退出码设为 {}，以便外层重跑该 chunk。", exit_code)
+    return exit_code
 
-        db_manager.update_security_timestamps([security.id for security in securities], "shares_last_updated_at")
 
-        logger.info("--- shares 更新统计 ---")
-        logger.info("  成功: {}", results_counter["SUCCESS"])
-        logger.info("  无数据: {}", results_counter["SUCCESS_NO_DATA"])
-        logger.info("  错误: {}", results_counter["ERROR"] + results_counter["FATAL_ERROR"])
-        logger.info("  total_shares 行数: {}", len(all_rows))
-        logger.info("  historical_floats 行数: {}", len(historical_float_rows))
-        logger.info("  float_shares 匹配行数: {}", float_match_count)
-        logger.info("----------------------")
-        exit_code = _get_exit_code(results_counter)
-        if exit_code != 0:
-            logger.error("shares 更新存在失败 symbol，本轮退出码设为 {}，以便外层重跑该 chunk。", exit_code)
-        return exit_code
-    except Exception as e:
-        logger.opt(exception=e).critical("update_massive_shares 执行失败: {}", e)
-        return 1
-    finally:
-        if db_manager:
-            db_manager.close()
-        logger.info("耗时: {}", timedelta(seconds=time.monotonic() - start_time))
+def main(argv: list[str] | None = None) -> int:
+    return run_massive_task("update_massive_shares", argv, create_parser, run)
 
 
 if __name__ == "__main__":

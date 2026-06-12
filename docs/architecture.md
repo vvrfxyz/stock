@@ -147,8 +147,6 @@ python main.py update --market US
 python main.py update AAPL
 ```
 
-`daily_run` 仅作为旧入口兼容别名保留，等同于 `update`。
-
 常用单项维护命令：
 
 ```bash

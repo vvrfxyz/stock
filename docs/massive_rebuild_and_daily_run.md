@@ -105,8 +105,8 @@ python main.py rebuild_massive_dataset --market US
 该命令会顺序执行：
 
 1. `sync_massive_universe`
-2. `update_details --all --force`
-3. `update_actions --all --force`
+2. `update_massive_details --all --force`
+3. `update_massive_actions --all --force`
 4. `update_massive_prices --full-refresh`
 5. `update_grouped_daily`（最近 5 个交易日）
 6. `update_massive_shares --all --full-refresh`
@@ -158,8 +158,6 @@ python main.py update --market US
 ```
 
 `update` 只跑详情、公司行动、日线三步，主要用于手动调试或快速补缺。
-
-`daily_run` 仅作为兼容别名保留，等同于 `update`。
 
 可选强制刷新最近 2 年价格窗口：
 

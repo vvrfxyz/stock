@@ -117,12 +117,12 @@ def calibrate_latest_price_dates(db_manager: DatabaseManager, dry_run: bool = Fa
         logger.opt(exception=e).error(f"校准过程中发生错误: {e}")
 
 
-def main():
+def main(argv: list[str] | None = None):
     """脚本主入口"""
     start_time = time.monotonic()
     setup_logging()
     parser = create_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     db_manager = None
     try:

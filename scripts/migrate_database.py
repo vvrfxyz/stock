@@ -118,7 +118,7 @@ class DataMigrator:
         self.target_db.close()
 
 
-def main():
+def main(argv: list[str] | None = None):
     old_url = os.getenv("OLD_DATABASE_URL")
     new_url = os.getenv("NEW_DATABASE_URL")
 

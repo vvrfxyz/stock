@@ -175,7 +175,7 @@ PostgreSQL 不适合作为分钟级主扫描表；它只保留必要元数据、
 ## 工程落地点
 
 - ORM schema：`data_models/models.py`
-- DB upsert：`db_manager.py`
+- DB upsert：`db_manager/`
 - Massive adapter：`data_sources/massive_source.py`
 - Main CLI：`main.py`
 - ClickHouse DDL：`sql/clickhouse/polyglot_persistence.sql`

@@ -48,43 +48,28 @@ class ScheduledStep:
     args: list[str]
 
 
-_CONTROLLER_LOGGING_ACTIVE = False
-
-
 def setup_logging():
     """配置全局 Loguru 日志记录器"""
-    global _CONTROLLER_LOGGING_ACTIVE
     configure_script_logging("main_controller")
-    _CONTROLLER_LOGGING_ACTIVE = True
     logger.info("主控制器日志记录器设置完成。")
 
 
 def execute_script(main_func, args_list):
     """
-    一个辅助函数，用于安全地调用其他脚本的 main 函数。
-    它通过临时修改 sys.argv 来模拟命令行调用，确保原始脚本无需任何改动即可被集成。
+    调用子脚本的 main(argv)，并把非零 int 返回码统一转换为 SystemExit，
+    使调度层可以按退出码感知失败。
     """
-    original_argv = sys.argv
     script_name = main_func.__module__ + ".py"
     try:
-        # 模拟命令行参数，第一个元素通常是脚本名
-        sys.argv = [script_name] + args_list
         logger.debug(f"正在执行: {script_name} with args: {args_list}")
-        result = main_func()
+        result = main_func(args_list)
         if type(result) is int and result != 0:
             raise SystemExit(result)
     except SystemExit as e:
-        # argparse 的 --help 会触发 SystemExit，这是正常行为
+        # argparse 的 --help 会触发 SystemExit(0)，这是正常行为
         if e.code != 0:
             logger.error(f"脚本 {script_name} 异常退出，退出码: {e.code}")
             raise
-    finally:
-        # 恢复原始的 sys.argv，避免影响后续操作
-        sys.argv = original_argv
-        # 子脚本的 setup_logging 会 logger.remove() 摘掉控制器的 sink；
-        # 执行完后恢复控制器日志，保证步骤之间的调度日志不丢。
-        if _CONTROLLER_LOGGING_ACTIVE:
-            configure_script_logging("main_controller")
 
 
 # ==============================================================================
@@ -137,19 +122,6 @@ def run_update(args):
         "✅ ======== 自动更新完成，总耗时: {} ======== ✅",
         timedelta(seconds=time.monotonic() - start_time),
     )
-
-
-def run_daily_update(args):
-    """
-    daily_run 作为 update 的兼容别名保留。
-    """
-    args.symbols = []
-    args.limit = 0
-    args.workers = getattr(args, "workers", None)
-    args.force_details = False
-    args.force_actions = False
-    args.full_refresh_prices = False
-    run_update(args)
 
 
 def _is_first_weekday_of_month(run_date: date, weekday: int) -> bool:
@@ -587,16 +559,6 @@ def main():
     p_update.add_argument('--full-refresh-prices', action='store_true', help="强制刷新价格最近 2 年窗口，而不是只补缺口。")
     p_update.set_defaults(func=run_update)
 
-    # --- 定义 'daily_run' 命令 ---
-    p_daily = subparsers.add_parser(
-        'daily_run',
-        help="兼容别名：等同于 update",
-        description="兼容旧入口；新用法请直接使用 update。",
-    )
-    p_daily.add_argument('--market', type=str, default='US', help="指定市场，当前仅支持 US。")
-    p_daily.add_argument('--workers', type=int, help="并发线程数。")
-    p_daily.set_defaults(func=run_daily_update)
-
     p_scheduled = subparsers.add_parser(
         'scheduled_update',
         help="统一每日调度入口：日更任务每天跑，周/月任务按日期错峰跑",
@@ -641,16 +603,6 @@ def main():
     p_sec_fund.add_argument('--bulk-zip', type=str, default=None, help="本地 companyfacts.zip 路径（初次回填）。")
     p_sec_fund.set_defaults(func=run_update_sec_fundamentals)
 
-    # --- 定义 'update_details' 命令 ---
-    p_details = subparsers.add_parser('update_details', help="单独更新股票的详细信息 (来自Massive)")
-    p_details.add_argument('symbols', nargs='*', help="要更新的股票代码列表。")
-    p_details.add_argument('--all', action='store_true', help="处理所有活跃股票。")
-    p_details.add_argument('--market', type=str, help="仅处理指定市场的股票。")
-    p_details.add_argument('--force', action='store_true', help="强制更新，忽略时间检查。")
-    p_details.add_argument('--limit', type=int, default=0, help="限制处理的股票数量。")
-    p_details.add_argument('--workers', type=int, help="并发线程数。")
-    p_details.set_defaults(func=run_update_details)
-
     p_massive_details = subparsers.add_parser('update_massive_details', help="单独更新股票的详细信息 (来自 Massive)")
     p_massive_details.add_argument('symbols', nargs='*', help="要更新的股票代码列表。")
     p_massive_details.add_argument('--all', action='store_true', help="处理所有活跃股票。")
@@ -659,17 +611,6 @@ def main():
     p_massive_details.add_argument('--limit', type=int, default=0, help="限制处理的股票数量。")
     p_massive_details.add_argument('--workers', type=int, help="并发线程数。")
     p_massive_details.set_defaults(func=run_update_details)
-
-    # --- 定义 'update_actions' 命令 ---
-    p_actions = subparsers.add_parser('update_actions', help="单独更新股票的公司行动 (分红、拆股)")
-    p_actions.add_argument('symbols', nargs='*', help="要更新的股票代码列表。")
-    p_actions.add_argument('--all', action='store_true', help="处理所有活跃股票。")
-    p_actions.add_argument('--market', type=str, help="仅处理指定市场的股票。")
-    p_actions.add_argument('--force', action='store_true', help="强制更新，忽略时间检查。")
-    p_actions.add_argument('--recent-days', type=int, default=0, help="只拉取最近 N 天的新事件。")
-    p_actions.add_argument('--limit', type=int, default=0, help="限制处理的股票数量。")
-    p_actions.add_argument('--workers', type=int, help="并发线程数。")
-    p_actions.set_defaults(func=run_update_actions)
 
     p_massive_actions = subparsers.add_parser('update_massive_actions', help="单独更新股票的公司行动 (来自 Massive)")
     p_massive_actions.add_argument('symbols', nargs='*', help="要更新的股票代码列表。")
@@ -721,16 +662,6 @@ def main():
     p_massive_prices.add_argument('--limit', type=int, default=0, help="限制处理的股票数量。")
     p_massive_prices.add_argument('--workers', type=int, help="并发线程数。")
     p_massive_prices.set_defaults(func=run_update_massive_prices)
-
-    p_shares = subparsers.add_parser('update_historical_shares', help="使用 Massive 更新 historical_shares（兼容旧命令名）")
-    p_shares.add_argument('symbols', nargs='*', help="要处理的股票代码列表。")
-    p_shares.add_argument('--all', action='store_true', help="处理所有活跃股票。")
-    p_shares.add_argument('--market', type=str, default='US', help="仅处理指定市场的股票。")
-    p_shares.add_argument('--full-refresh', action='store_true', help="回填最近 2 年季度快照。")
-    p_shares.add_argument('--start-date', type=str, default='2010-01-01', help="起始日期 (YYYY-MM-DD)。")
-    p_shares.add_argument('--limit', type=int, default=0, help="限制处理的股票数量。")
-    p_shares.add_argument('--workers', type=int, help="并发线程数。")
-    p_shares.set_defaults(func=run_update_historical_shares)
 
     p_massive_shares = subparsers.add_parser('update_massive_shares', help="使用 Massive 更新 historical_shares")
     p_massive_shares.add_argument('symbols', nargs='*', help="要处理的股票代码列表。")

@@ -548,10 +548,10 @@ def process_security(
     return security.symbol, status, inserted, comparison, stats
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     start_time = time.monotonic()
     setup_logging()
-    args = create_parser().parse_args()
+    args = create_parser().parse_args(argv)
 
     db_manager = None
     source = None

@@ -127,11 +127,11 @@ def _fetch_batch(
     ]
 
 
-def main():
+def main(argv: list[str] | None = None):
     start_time = time.monotonic()
     setup_logging()
     parser = create_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.batch_size <= 0:
         raise ValueError("--batch-size 必须大于 0。")

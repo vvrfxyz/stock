@@ -319,10 +319,10 @@ def check_unexplained_jumps(session, limit: int, window_start: date, threshold: 
     return 0  # 预警不计入失败退出码
 
 
-def main():
+def main(argv: list[str] | None = None):
     start_time = time.monotonic()
     setup_logging()
-    args = create_parser().parse_args()
+    args = create_parser().parse_args(argv)
 
     db_manager = None
     try:

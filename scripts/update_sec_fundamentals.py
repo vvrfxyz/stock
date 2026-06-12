@@ -137,10 +137,10 @@ def run_api(db_manager: DatabaseManager, cik_map: dict, filed_since: date | None
     return len(cik_map), total_rows, failed
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     start_time = time.monotonic()
     configure_script_logging("update_sec_fundamentals")
-    args = create_parser().parse_args()
+    args = create_parser().parse_args(argv)
     if not args.symbols and not args.all and not args.bulk_zip:
         logger.error("请提供 symbols，或使用 --all / --bulk-zip。")
         return 1

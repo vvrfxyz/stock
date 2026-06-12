@@ -1,14 +1,10 @@
 import argparse
 import os
 import sys
-import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
 from loguru import logger
-from sqlalchemy import func
-from tqdm import tqdm
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
@@ -17,55 +13,36 @@ if project_root not in sys.path:
 from data_models.models import Security
 from data_sources.massive_source import MassiveSource
 from db_manager import DatabaseManager
-from utils.key_rate_limiter import KeyRateLimiter
-from utils.massive_config import (
-    ALLOWED_US_SECURITY_TYPES,
-    MASSIVE_RATE_LIMIT,
-    MASSIVE_RATE_SECONDS,
-    enforce_us_market,
-    get_massive_api_keys,
-    get_massive_history_floor,
-    iter_chunks,
+from utils.massive_config import get_massive_history_floor, iter_chunks
+from utils.massive_task import (
+    build_standard_parser,
+    run_concurrently,
+    run_massive_task,
+    select_us_securities,
 )
 from utils.trading_calendar import get_last_completed_trading_date
-from utils.script_logging import setup_logging as configure_script_logging
 
 MAX_CONCURRENT_WORKERS = 2
 API_BATCH_SIZE = 100
 
 
-def setup_logging():
-    configure_script_logging("update_massive_short_data")
-
-
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="使用 Massive 更新 short interest / short volume。",
-        formatter_class=argparse.RawTextHelpFormatter,
+    parser = build_standard_parser(
+        "使用 Massive 更新 short interest / short volume。",
+        default_workers=MAX_CONCURRENT_WORKERS,
+        all_help="处理全部活跃 CS/ETF。",
     )
-    parser.add_argument("symbols", nargs="*", help="要更新的股票代码列表。")
-    parser.add_argument("--all", action="store_true", help="处理全部活跃 CS/ETF。")
-    parser.add_argument("--market", type=str, default="US", help="当前仅支持 US。")
     parser.add_argument("--force", action="store_true", help="强制刷新 Massive 可覆盖窗口。")
-    parser.add_argument("--limit", type=int, default=0, help="限制处理数量。")
-    parser.add_argument("--workers", type=int, default=MAX_CONCURRENT_WORKERS, help="批次并发数。")
     return parser
 
 
 def get_securities_to_update(db_manager: DatabaseManager, args: argparse.Namespace, end_date: date) -> list[Security]:
-    with db_manager.get_session() as session:
-        query = session.query(Security).filter(
-            func.upper(Security.market) == enforce_us_market(args.market),
-            func.upper(Security.type).in_(ALLOWED_US_SECURITY_TYPES),
-        )
-        if args.symbols:
-            query = query.filter(Security.symbol.in_([symbol.lower() for symbol in args.symbols]))
-        else:
-            query = query.filter(Security.is_active == True)
-        query = query.order_by(Security.short_data_last_updated_at.asc().nulls_first(), Security.symbol.asc())
-        if args.limit > 0:
-            query = query.limit(args.limit)
-        securities = query.all()
+    securities = select_us_securities(
+        db_manager,
+        args,
+        active_scope="unless_symbols",
+        order_column="short_data_last_updated_at",
+    )
 
     if args.force:
         return securities
@@ -171,67 +148,41 @@ def process_batch(
     return counter, interest_count, volume_count
 
 
-def main() -> int:
-    start_time = time.monotonic()
-    setup_logging()
-    parser = create_parser()
-    args = parser.parse_args()
+def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseManager) -> int:
+    end_date = get_last_completed_trading_date(args.market)
+    history_floor = get_massive_history_floor(end_date)
 
-    db_manager = None
-    source = None
-    try:
-        end_date = get_last_completed_trading_date(args.market)
-        history_floor = get_massive_history_floor(end_date)
-        api_keys = get_massive_api_keys()
-        rate_limiter = KeyRateLimiter(api_keys, MASSIVE_RATE_LIMIT, MASSIVE_RATE_SECONDS, scope="massive")
-        source = MassiveSource(rate_limiter=rate_limiter)
-        db_manager = DatabaseManager()
+    securities = get_securities_to_update(db_manager, args, end_date)
+    if not securities:
+        logger.success("没有需要更新 short data 的证券。")
+        return 0
 
-        securities = get_securities_to_update(db_manager, args, end_date)
-        if not securities:
-            logger.success("没有需要更新 short data 的证券。")
-            return 0
+    batches = iter_chunks(securities, API_BATCH_SIZE)
+    outputs, results_counter = run_concurrently(
+        batches,
+        lambda batch: process_batch(batch, source, db_manager, history_floor, args.force),
+        max_workers=args.workers,
+        desc="更新 Massive short data",
+    )
+    total_interests = 0
+    total_volumes = 0
+    for batch_counter, interest_count, volume_count in outputs:
+        results_counter.update(batch_counter)
+        total_interests += interest_count
+        total_volumes += volume_count
 
-        batches = iter_chunks(securities, API_BATCH_SIZE)
-        results_counter = Counter()
-        total_interests = 0
-        total_volumes = 0
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            future_to_batch = {
-                executor.submit(process_batch, batch, source, db_manager, history_floor, args.force): batch
-                for batch in batches
-            }
-            for future in tqdm(as_completed(future_to_batch), total=len(future_to_batch), desc="更新 Massive short data"):
-                try:
-                    batch_counter, interest_count, volume_count = future.result()
-                except Exception as exc:
-                    batch = future_to_batch[future]
-                    logger.opt(exception=exc).error(
-                        "批次 {}-{} 发生未捕获异常: {}", batch[0].symbol, batch[-1].symbol, exc
-                    )
-                    results_counter["FATAL_ERROR"] += len(batch)
-                    continue
-                results_counter.update(batch_counter)
-                total_interests += interest_count
-                total_volumes += volume_count
+    logger.info("--- short data 更新统计 ---")
+    logger.info("  成功: {}", results_counter["SUCCESS"])
+    logger.info("  无数据: {}", results_counter["SUCCESS_NO_DATA"])
+    logger.info("  批次失败证券数: {}", results_counter["FATAL_ERROR"])
+    logger.info("  short_interest 写入行数: {}", total_interests)
+    logger.info("  short_volume 写入行数: {}", total_volumes)
+    logger.info("---------------------------")
+    return 1 if results_counter["FATAL_ERROR"] else 0
 
-        logger.info("--- short data 更新统计 ---")
-        logger.info("  成功: {}", results_counter["SUCCESS"])
-        logger.info("  无数据: {}", results_counter["SUCCESS_NO_DATA"])
-        logger.info("  批次失败证券数: {}", results_counter["FATAL_ERROR"])
-        logger.info("  short_interest 写入行数: {}", total_interests)
-        logger.info("  short_volume 写入行数: {}", total_volumes)
-        logger.info("---------------------------")
-        return 1 if results_counter["FATAL_ERROR"] else 0
-    except Exception as e:
-        logger.opt(exception=e).critical("update_massive_short_data 执行失败: {}", e)
-        return 1
-    finally:
-        if source:
-            source.close()
-        if db_manager:
-            db_manager.close()
-        logger.info("耗时: {}", timedelta(seconds=time.monotonic() - start_time))
+
+def main(argv: list[str] | None = None) -> int:
+    return run_massive_task("update_massive_short_data", argv, create_parser, run)
 
 
 if __name__ == "__main__":

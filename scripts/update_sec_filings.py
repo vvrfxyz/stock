@@ -94,10 +94,10 @@ def get_target_securities(db_manager: DatabaseManager, args: argparse.Namespace)
     return resolved
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     start_time = time.monotonic()
     configure_script_logging("update_sec_filings")
-    args = create_parser().parse_args()
+    args = create_parser().parse_args(argv)
     if not args.symbols and not args.all:
         logger.error("请提供 symbols 或使用 --all。")
         return 1

@@ -10,7 +10,7 @@ if project_root not in sys.path:
 from utils.clickhouse_client import ClickHouseClient
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     client = ClickHouseClient.from_env()
     client.ensure_schema()
     logger.success("ClickHouse 连接检查: {}", "OK" if client.ping() else "FAILED")

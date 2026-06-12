@@ -245,10 +245,10 @@ def write_report(results: list[dict], output_path: str, window_start: date, end_
     logger.success("报告已写入 {}", output_path)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     start_time = time.monotonic()
     setup_logging()
-    args = create_parser().parse_args()
+    args = create_parser().parse_args(argv)
 
     db_manager = None
     source = None

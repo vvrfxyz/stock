@@ -114,11 +114,11 @@ def run_apply(db_manager: DatabaseManager, security_ids: list[int]) -> Counter:
     return deleted
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     start_time = time.monotonic()
     setup_logging()
     parser = create_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     db_manager = None
     try:
