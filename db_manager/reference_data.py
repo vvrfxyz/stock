@@ -253,6 +253,33 @@ class ReferenceDataMixin:
             conn.commit()
         return written
 
+    def map_unlinked_holdings_to_securities(self) -> int:
+        """用 security_identifiers 的 CUSIP 映射回填 institutional_holdings.security_id。
+
+        只回填 NULL 行；一个 CUSIP 对应多个 security 时视为歧义跳过（HAVING 保护），
+        不覆盖任何已有关联。返回回填行数。"""
+        from sqlalchemy import text
+
+        sql = text(
+            """
+            UPDATE institutional_holdings h
+            SET security_id = m.security_id, updated_at = now()
+            FROM (
+                SELECT id_value, min(security_id) AS security_id
+                FROM security_identifiers
+                WHERE id_type = 'CUSIP'
+                GROUP BY id_value
+                HAVING count(DISTINCT security_id) = 1
+            ) m
+            WHERE h.security_id IS NULL
+              AND upper(h.cusip) = m.id_value
+            """
+        )
+        with self.engine.connect() as conn:
+            result = conn.execute(sql)
+            conn.commit()
+            return result.rowcount
+
     def upsert_fx_rates(self, rows_data: list[dict]) -> int:
         """写 ECB 参考汇率。复合主键无序列；冲突时刷新 rate（来源重发布修正）。"""
         rows = [_clean_for_model(FxRate, row) for row in rows_data]

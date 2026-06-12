@@ -551,3 +551,39 @@ class TestFxRates:
         assert fx.rate_to_usd("USD", date(2026, 6, 11)) == Decimal("1")
         # 无该币种数据
         assert fx.rate_to_usd("XXX", date(2026, 6, 11)) is None
+
+
+class TestMapUnlinkedHoldings:
+    def _holding(self, hash_ch, cusip, security_id=None):
+        return {
+            "source": "SEC_EDGAR", "accession_number": "0001-26-000077",
+            "source_row_hash": hash_ch * 64, "filer_cik": "0001779506",
+            "cusip": cusip, "security_id": security_id,
+        }
+
+    def test_backfills_null_only_and_skips_ambiguous(self, pg_db):
+        _insert_security(pg_db, 1, "aapl")
+        _insert_security(pg_db, 2, "msft")
+        _insert_security(pg_db, 3, "goog")
+        pg_db.insert_missing_security_identifiers([
+            {"security_id": 1, "id_type": "CUSIP", "id_value": "037833100", "source": "SEC_FTD"},
+            # 歧义 CUSIP：两个 security 共用
+            {"security_id": 2, "id_type": "CUSIP", "id_value": "594918104", "source": "SEC_FTD"},
+            {"security_id": 3, "id_type": "CUSIP", "id_value": "594918104", "source": "SEC_FTD"},
+        ])
+        pg_db.upsert_institutional_holdings([
+            self._holding("a", "037833100"),              # 应回填 -> 1
+            self._holding("b", "594918104"),              # 歧义，保持 NULL
+            self._holding("c", "037833100", security_id=2),  # 已关联，不得覆盖
+            self._holding("d", "000000000"),              # 无映射，保持 NULL
+        ])
+
+        assert pg_db.map_unlinked_holdings_to_securities() == 1
+        assert _scalar(pg_db, "SELECT security_id FROM institutional_holdings WHERE source_row_hash = :h",
+                       h="a" * 64) == 1
+        assert _scalar(pg_db, "SELECT security_id FROM institutional_holdings WHERE source_row_hash = :h",
+                       h="b" * 64) is None
+        assert _scalar(pg_db, "SELECT security_id FROM institutional_holdings WHERE source_row_hash = :h",
+                       h="c" * 64) == 2
+        # 幂等：再跑无行可回填
+        assert pg_db.map_unlinked_holdings_to_securities() == 0

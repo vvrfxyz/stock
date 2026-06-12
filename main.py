@@ -30,6 +30,7 @@ from scripts.update_sec_fundamentals import main as update_sec_fundamentals_main
 from scripts.update_insider_transactions import main as update_insider_transactions_main
 from scripts.update_institutional_holdings import main as update_institutional_holdings_main
 from scripts.update_fx_rates import main as update_fx_rates_main
+from scripts.sync_cusip_identifiers import main as sync_cusip_identifiers_main
 from scripts.update_massive_shares import main as update_massive_shares_main
 from scripts.update_massive_events import main as update_massive_events_main
 from scripts.update_massive_short_data import main as update_massive_short_data_main
@@ -236,6 +237,13 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
                     "--all",
                     "--since", (run_date - timedelta(days=21)).isoformat(),
                 ],
+            )
+        )
+        steps.append(
+            ScheduledStep(
+                "sync_cusip_identifiers",
+                sync_cusip_identifiers_main,
+                ["--market", market, "--months", "2"],
             )
         )
         steps.append(
@@ -485,6 +493,12 @@ def run_update_fx_rates(args):
     execute_script(update_fx_rates_main, cli_args)
 
 
+def run_sync_cusip_identifiers(args):
+    logger.info("执行: 同步 FTD CUSIP 身份映射")
+    cli_args = ['--market', args.market, '--months', str(args.months)]
+    execute_script(sync_cusip_identifiers_main, cli_args)
+
+
 def run_cleanup_us_universe(args):
     logger.info("执行: 清理 US Universe 中非保留类型证券")
     cli_args = []
@@ -671,6 +685,11 @@ def main():
     p_fx = subparsers.add_parser('update_fx_rates', help="同步 ECB 每日参考汇率（非 USD 分红折算用）")
     p_fx.add_argument('--since', type=str, default=None, help="只写入该日期之后的汇率；不传则全历史回填。")
     p_fx.set_defaults(func=run_update_fx_rates)
+
+    p_cusip = subparsers.add_parser('sync_cusip_identifiers', help="用 SEC FTD 数据同步 CUSIP 身份映射并回填 13F security_id")
+    p_cusip.add_argument('--market', type=str, default='US', help="当前仅支持 US。")
+    p_cusip.add_argument('--months', type=int, default=3, help="回看的 FTD 月数；初次回填建议 12。")
+    p_cusip.set_defaults(func=run_sync_cusip_identifiers)
 
     p_massive_details = subparsers.add_parser('update_massive_details', help="单独更新股票的详细信息 (来自 Massive)")
     p_massive_details.add_argument('symbols', nargs='*', help="要更新的股票代码列表。")

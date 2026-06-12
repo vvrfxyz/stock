@@ -49,7 +49,7 @@ Core architecture rules:
 - `sec_filings`: SEC EDGAR filing index metadata.
 - `sec_fundamental_facts`: Curated XBRL facts (`utils/sec_concepts.py` whitelist); `filed_date` is the point-in-time visibility boundary, all restatements kept.
 - `insider_transactions`: Form 3/4/5 ownership transaction rows (one row per entry × reporting owner; layer by `transaction_code` before building features).
-- `institutional_holdings`: 13-F holdings rows (filer-CIK anchored, discovered via EDGAR form index — not `sec_filings`; `security_id` stays NULL until a CUSIP mapping exists; `value` stored as reported — thousands of USD before 2023-01, USD after).
+- `institutional_holdings`: 13-F holdings rows (filer-CIK anchored, discovered via EDGAR form index — not `sec_filings`; `security_id` mapped via SEC fails-to-deliver CUSIP identifiers (`sync_cusip_identifiers`), NULL where unmapped; `value` stored as reported — thousands of USD before 2023-01, USD after).
 - `fx_rates`: ECB daily EUR-based reference rates; USD cross rates are computed at read time via `utils/fx_rates.UsdFxConverter`.
 
 Financial ratios remain read-time computations — never store derived ratios back into fact tables. `sec_fundamental_facts` stores raw reported XBRL values only; do not revive `financial_reports` as a vague catch-all table.
@@ -85,6 +85,7 @@ python main.py update_massive_news TSLA --force --lookback-days 7
 python main.py update_adjustment_factors AAPL
 
 python main.py sync_sec_identifiers                 # SEC ticker->CIK 映射
+python main.py sync_cusip_identifiers --months 12   # FTD CUSIP 映射 + 回填 13F security_id
 python main.py update_sec_filings aapl              # SEC filing 索引；--all 全市场约 18 分钟
 python main.py update_sec_fundamentals aapl         # XBRL 基本面；--all --since 增量 / --bulk-zip 全量回填
 python main.py update_insider_transactions aapl     # Form 3/4/5 明细；--all 处理全部待解析 filing
