@@ -56,8 +56,11 @@ def fetch_ftd_cusip_symbol_pairs(
         return None
     response.raise_for_status()
     with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-        name = next(n for n in archive.namelist() if n.lower().endswith(".txt"))
-        text = archive.read(name).decode("latin-1")
+        # 新文件 zip 内是 .txt，旧文件（约 2026-04 之前）无后缀；取第一个文件成员。
+        names = [n for n in archive.namelist() if not n.endswith("/")]
+        if not names:
+            return None
+        text = archive.read(names[0]).decode("latin-1")
     return parse_ftd_pairs(text)
 
 
