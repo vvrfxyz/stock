@@ -79,7 +79,7 @@ python scripts/migrate_database.py
 `scheduled_update` 是推荐的 cron 入口，顺序执行并复用同一进程内的 Massive key 限流状态：
 - 每天：`update_massive_prices`、`update_massive_short_data` 增量、最近已完成交易日的 `update_open_close_summary --all`。
 - 每周六：`update_massive_shares --all`。
-- 每周日：`update_massive_actions --all --force`。
+- 每周日：`update_massive_actions --all --force`、SEC identifiers/filings/fundamentals/insider 增量。
 - 每月第一个周二：`update_massive_events --all --force`。
 - 每月第一个周三：`update_massive_details --all --force`。
 

@@ -3,6 +3,7 @@ from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from data_models.models import (
+    InsiderTransaction,
     NewsArticle,
     NewsArticleInsight,
     SecFiling,
@@ -160,6 +161,44 @@ class ReferenceDataMixin:
                     )
                     result = conn.execute(stmt)
                     written += result.rowcount
+            conn.commit()
+        return written
+
+    def upsert_insider_transactions(self, rows_data: list[dict]) -> int:
+        """写 Form 3/4/5 明细行。同一 accession 重新解析时整批 hash 一致，
+        冲突更新除身份键外的全部提供字段（XML 不可变，但解析器口径可能升级）。"""
+        rows = [_clean_for_model(InsiderTransaction, row) for row in rows_data]
+        rows = [
+            row for row in rows
+            if row.get("source") and row.get("accession_number") and row.get("source_row_hash")
+        ]
+        if not rows:
+            return 0
+
+        deduped: dict[tuple, dict] = {}
+        for row in rows:
+            deduped.setdefault((row["source"], row["accession_number"], row["source_row_hash"]), row)
+        rows = list(deduped.values())
+
+        written = 0
+        with self.engine.connect() as conn:
+            self._lock_model_sequence_sync(conn, InsiderTransaction)
+            self._sync_model_id_sequence(conn, InsiderTransaction)
+            for group in _group_rows_by_key_set(rows):
+                stmt = pg_insert(InsiderTransaction).values(group)
+                update_keys = set(group[0].keys())
+                update_columns = {
+                    key: getattr(stmt.excluded, key)
+                    for key in update_keys
+                    if key not in {"id", "source", "accession_number", "source_row_hash", "created_at"}
+                }
+                update_columns["updated_at"] = func.now()
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["source", "accession_number", "source_row_hash"],
+                    set_=update_columns,
+                )
+                result = conn.execute(stmt)
+                written += result.rowcount
             conn.commit()
         return written
 

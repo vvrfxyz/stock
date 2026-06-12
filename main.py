@@ -27,6 +27,7 @@ from scripts.sync_massive_universe import main as sync_massive_universe_main
 from scripts.sync_sec_identifiers import main as sync_sec_identifiers_main
 from scripts.update_sec_filings import main as update_sec_filings_main
 from scripts.update_sec_fundamentals import main as update_sec_fundamentals_main
+from scripts.update_insider_transactions import main as update_insider_transactions_main
 from scripts.update_massive_shares import main as update_massive_shares_main
 from scripts.update_massive_events import main as update_massive_events_main
 from scripts.update_massive_short_data import main as update_massive_short_data_main
@@ -214,6 +215,17 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
                     "--market", market,
                     "--all",
                     "--since", (run_date - timedelta(days=14)).isoformat(),
+                ],
+            )
+        )
+        steps.append(
+            ScheduledStep(
+                "update_insider_transactions_recent",
+                update_insider_transactions_main,
+                [
+                    "--market", market,
+                    "--all",
+                    "--since", (run_date - timedelta(days=21)).isoformat(),
                 ],
             )
         )
@@ -414,6 +426,22 @@ def run_update_sec_fundamentals(args):
     execute_script(update_sec_fundamentals_main, cli_args)
 
 
+def run_update_insider_transactions(args):
+    logger.info("执行: 解析 SEC Form 3/4/5 内部人交易")
+    cli_args = list(args.symbols)
+    if args.all:
+        cli_args.append('--all')
+    if args.market:
+        cli_args.extend(['--market', args.market])
+    if args.limit > 0:
+        cli_args.extend(['--limit', str(args.limit)])
+    if args.since:
+        cli_args.extend(['--since', args.since])
+    if getattr(args, 'reparse', False):
+        cli_args.append('--reparse')
+    execute_script(update_insider_transactions_main, cli_args)
+
+
 def run_cleanup_us_universe(args):
     logger.info("执行: 清理 US Universe 中非保留类型证券")
     cli_args = []
@@ -579,6 +607,15 @@ def main():
     p_sec_fund.add_argument('--since', type=str, default=None, help="增量：只处理该日后有财报 filing 的 CIK。")
     p_sec_fund.add_argument('--bulk-zip', type=str, default=None, help="本地 companyfacts.zip 路径（初次回填）。")
     p_sec_fund.set_defaults(func=run_update_sec_fundamentals)
+
+    p_insiders = subparsers.add_parser('update_insider_transactions', help="解析 SEC Form 3/4/5 内部人交易明细")
+    p_insiders.add_argument('symbols', nargs='*', help="要处理的股票代码列表。")
+    p_insiders.add_argument('--all', action='store_true', help="处理全部待解析的 Form 3/4/5。")
+    p_insiders.add_argument('--market', type=str, default='US', help="当前仅支持 US。")
+    p_insiders.add_argument('--limit', type=int, default=0, help="限制处理 filing 数量。")
+    p_insiders.add_argument('--since', type=str, default=None, help="只处理该日期之后的 filing。")
+    p_insiders.add_argument('--reparse', action='store_true', help="重解析已有明细的 filing。")
+    p_insiders.set_defaults(func=run_update_insider_transactions)
 
     p_massive_details = subparsers.add_parser('update_massive_details', help="单独更新股票的详细信息 (来自 Massive)")
     p_massive_details.add_argument('symbols', nargs='*', help="要更新的股票代码列表。")

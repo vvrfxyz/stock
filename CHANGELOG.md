@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added (2026-06-12)
+
+- T3 insider ingestion: `update_insider_transactions` parses Form 3/4/5 ownership XML from the `sec_filings` index into `insider_transactions` (one row per entry × reporting owner, `source+accession+row_hash` idempotency, footnote resolution); weekly incremental added to Sunday `scheduled_update`.
+
 ### Removed (2026-06-12)
 
 - Removed the ClickHouse layer entirely (client, `init_clickhouse` / `backfill_clickhouse_daily_bars` commands, DDL, docker-compose service, dual-writes in price scripts). PostgreSQL is the only store. The polyglot design doc is archived at `docs/archive/polyglot_persistence_architecture.md` for a future rebuild once minute-level data (Massive paid tier) arrives.

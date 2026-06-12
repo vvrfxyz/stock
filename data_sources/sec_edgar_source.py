@@ -9,9 +9,12 @@
 """
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
+import xml.etree.ElementTree as ET
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
 import requests
@@ -94,14 +97,23 @@ class SecEdgarSource:
         return session
 
     def _get_json(self, url: str) -> dict:
+        self._throttle()
+        response = self._session.get(url, timeout=_DEFAULT_TIMEOUT)
+        response.raise_for_status()
+        return response.json()
+
+    def _get_text(self, url: str) -> str:
+        self._throttle()
+        response = self._session.get(url, timeout=_DEFAULT_TIMEOUT)
+        response.raise_for_status()
+        return response.text
+
+    def _throttle(self) -> None:
         with self._throttle_lock:
             wait = self._last_request_at + _MIN_REQUEST_INTERVAL - time.monotonic()
             if wait > 0:
                 time.sleep(wait)
             self._last_request_at = time.monotonic()
-        response = self._session.get(url, timeout=_DEFAULT_TIMEOUT)
-        response.raise_for_status()
-        return response.json()
 
     # ------------------------------------------------------------------
     # T0: ticker -> CIK 映射
@@ -224,6 +236,26 @@ class SecEdgarSource:
             raise
         return parse_company_facts(payload, cik10, concepts=concepts, filed_since=filed_since)
 
+    # ------------------------------------------------------------------
+    # T3: Form 3/4/5 ownership 文档
+    # ------------------------------------------------------------------
+
+    def fetch_ownership_document(self, primary_document_url: str) -> str | None:
+        """抓取 Form 3/4/5 的原始 ownershipDocument XML。
+
+        sec_filings 里的 primaryDocument 带 xsl 渲染前缀（如 xslF345X06/form4.xml），
+        去掉该路径段即原始 XML。无 XML（早期纸质 filing）或 404 时返回 None。
+        """
+        xml_url = raw_ownership_xml_url(primary_document_url)
+        if xml_url is None:
+            return None
+        try:
+            return self._get_text(xml_url)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
+
 
 def parse_company_facts(
     payload: dict,
@@ -276,4 +308,173 @@ def parse_company_facts(
                             "frame": fact.get("frame"),
                         }
                     )
+    return rows
+
+
+# ----------------------------------------------------------------------
+# Form 3/4/5 ownershipDocument XML 解析
+# ----------------------------------------------------------------------
+
+def raw_ownership_xml_url(primary_document_url: str | None) -> str | None:
+    """xslF345X06/form4.xml 渲染路径 -> 原始 XML URL；非 .xml 文档返回 None。"""
+    if not primary_document_url or not primary_document_url.lower().endswith(".xml"):
+        return None
+    base, _, doc = primary_document_url.rpartition("/")
+    if base.rsplit("/", 1)[-1].lower().startswith("xsl"):
+        base = base.rsplit("/", 1)[0]
+    return f"{base}/{doc}"
+
+
+def _text(node: ET.Element | None, path: str | None = None) -> str | None:
+    """取 path 下的文本；Form 345 值多嵌一层 <value>。"""
+    if node is None:
+        return None
+    target = node.find(path) if path else node
+    if target is None:
+        return None
+    value_node = target.find("value")
+    raw = (value_node.text if value_node is not None else target.text) or ""
+    raw = raw.strip()
+    return raw or None
+
+
+def _parse_bool(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    return value.strip().lower() in ("1", "true", "yes")
+
+
+def _parse_decimal(value: str | None) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(value)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _footnote_text(node: ET.Element | None, footnotes: dict[str, str]) -> list[str]:
+    """收集子树里所有 footnoteId 引用的脚注文本。"""
+    if node is None:
+        return []
+    ids = [fn.get("id") for fn in node.iter("footnoteId") if fn.get("id")]
+    return [footnotes[i] for i in ids if i in footnotes]
+
+
+def _row_hash(parts: Iterable[Any]) -> str:
+    joined = "|".join("" if p is None else str(p) for p in parts)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+def parse_ownership_document(xml_text: str, accession_number: str) -> list[dict]:
+    """ownershipDocument XML -> insider_transactions 行。
+
+    每个 nonDerivative/derivative 的 transaction/holding × reporting owner 出一行；
+    record_type 区分 TRANSACTION/HOLDING，security_type 区分 NON_DERIVATIVE/DERIVATIVE。
+    多 owner filing（合并申报）按 owner 复制行，行哈希含 owner_cik 防互撞。
+    """
+    root = ET.fromstring(xml_text)
+    form_type = (root.findtext("documentType") or "").strip() or None
+    period_of_report = _parse_date(root.findtext("periodOfReport"))
+    aff_10b5_one = _parse_bool(root.findtext("aff10b5One"))
+    remarks = (root.findtext("remarks") or "").strip() or None
+
+    issuer = root.find("issuer")
+    issuer_cik = cik_to_10digit(_text(issuer, "issuerCik"))
+    issuer_name = _text(issuer, "issuerName")
+    issuer_symbol = (_text(issuer, "issuerTradingSymbol") or "").lower() or None
+
+    footnotes = {
+        fn.get("id"): (fn.text or "").strip()
+        for fn in root.findall("footnotes/footnote")
+        if fn.get("id")
+    }
+
+    owners = []
+    for owner_node in root.findall("reportingOwner"):
+        rel = owner_node.find("reportingOwnerRelationship")
+        owners.append(
+            {
+                "owner_cik": cik_to_10digit(_text(owner_node, "reportingOwnerId/rptOwnerCik")),
+                "owner_name": _text(owner_node, "reportingOwnerId/rptOwnerName"),
+                "is_director": _parse_bool(_text(rel, "isDirector")),
+                "is_officer": _parse_bool(_text(rel, "isOfficer")),
+                "is_ten_percent_owner": _parse_bool(_text(rel, "isTenPercentOwner")),
+                "is_other": _parse_bool(_text(rel, "isOther")),
+                "officer_title": _text(rel, "officerTitle"),
+            }
+        )
+    if not owners:
+        owners = [{"owner_cik": None, "owner_name": None}]
+
+    common = {
+        "source": "SEC_EDGAR",
+        "accession_number": accession_number,
+        "form_type": form_type,
+        "period_of_report": period_of_report,
+        "issuer_cik": issuer_cik,
+        "issuer_name": issuer_name,
+        "issuer_trading_symbol": issuer_symbol,
+        "aff_10b5_one": aff_10b5_one,
+        "remarks": remarks,
+    }
+
+    entries = []  # (security_type, record_type, node)
+    for table, security_type in (("nonDerivativeTable", "NON_DERIVATIVE"), ("derivativeTable", "DERIVATIVE")):
+        table_node = root.find(table)
+        if table_node is None:
+            continue
+        for child in table_node:
+            record_type = "TRANSACTION" if child.tag.endswith("Transaction") else "HOLDING"
+            entries.append((security_type, record_type, child))
+
+    rows = []
+    for entry_index, (security_type, record_type, node) in enumerate(entries):
+        coding = node.find("transactionCoding")
+        amounts = node.find("transactionAmounts")
+        post = node.find("postTransactionAmounts")
+        nature = node.find("ownershipNature")
+        underlying = node.find("underlyingSecurity")
+
+        shares = _parse_decimal(_text(amounts, "transactionShares"))
+        price = _parse_decimal(_text(amounts, "transactionPricePerShare"))
+        entry_fields = {
+            "security_title": _text(node, "securityTitle"),
+            "transaction_date": _parse_date(_text(node, "transactionDate")),
+            "deemed_execution_date": _parse_date(_text(node, "deemedExecutionDate")),
+            "transaction_code": _text(coding, "transactionCode"),
+            "equity_swap_involved": _parse_bool(_text(coding, "equitySwapInvolved")),
+            "transaction_timeliness": _text(node, "transactionTimeliness"),
+            "transaction_shares": shares,
+            "transaction_price_per_share": price,
+            "transaction_acquired_disposed": _text(amounts, "transactionAcquiredDisposedCode"),
+            "shares_owned_following_transaction": _parse_decimal(
+                _text(post, "sharesOwnedFollowingTransaction")
+            ),
+            "transaction_value": (shares * price) if shares is not None and price is not None else None,
+            "exercise_date": _parse_date(_text(node, "exerciseDate")),
+            "expiration_date": _parse_date(_text(node, "expirationDate")),
+            "underlying_security_title": _text(underlying, "underlyingSecurityTitle"),
+            "underlying_security_shares": _parse_decimal(_text(underlying, "underlyingSecurityShares")),
+            "direct_or_indirect": _text(nature, "directOrIndirectOwnership"),
+            "security_type": security_type,
+            "record_type": record_type,
+        }
+        notes = _footnote_text(node, footnotes)
+        entry_fields["footnotes"] = "\n".join(notes) if notes else None
+
+        for owner in owners:
+            row = dict(common)
+            row.update(owner)
+            row.update(entry_fields)
+            row["source_row_hash"] = _row_hash(
+                [
+                    accession_number,
+                    owner.get("owner_cik"),
+                    security_type,
+                    record_type,
+                    entry_index,
+                ]
+            )
+            rows.append(row)
     return rows

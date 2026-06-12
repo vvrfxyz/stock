@@ -38,13 +38,20 @@ def test_scheduled_update_staggers_weekly_tasks():
     assert "update_massive_shares" not in sunday_names
     assert "sync_sec_identifiers" in sunday_names
     assert "update_sec_filings_recent" in sunday_names
+    assert "update_insider_transactions_recent" in sunday_names
     assert "sync_sec_identifiers" not in saturday_names
+    assert "update_insider_transactions_recent" not in saturday_names
     sec_step = next(
         step for step in build_scheduled_update_steps(date(2026, 5, 17), market="US")
         if step.name == "update_sec_filings_recent"
     )
     assert "--since" in sec_step.args
     assert "--all" in sec_step.args
+    # insiders 解析依赖 filings 索引先落库，必须排在其后
+    sunday_steps = _step_names(date(2026, 5, 17))
+    assert sunday_steps.index("update_sec_filings_recent") < sunday_steps.index(
+        "update_insider_transactions_recent"
+    )
 
 
 def test_scheduled_update_staggers_monthly_tasks():

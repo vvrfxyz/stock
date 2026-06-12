@@ -20,7 +20,7 @@
 | --- | --- | --- |
 | 每天 | 每次 timer 触发 | `update_massive_prices` 增量、`update_massive_short_data` 增量、最近已完成交易日的 `update_open_close_summary --all` |
 | 每周 | 周六 | `update_massive_shares --all` |
-| 每周 | 周日 | `update_massive_actions --all --force` |
+| 每周 | 周日 | `update_massive_actions --all --force`、SEC identifiers/filings/fundamentals/insider 增量 |
 | 每月 | 第一个周二 | `update_massive_events --all --force` |
 | 每月 | 第一个周三 | `update_massive_details --all --force` |
 | 按需 | 手动执行 | `update_massive_news`、`update_adjustment_factors`、各类 `--force` / `--full-refresh` 全量重建 |

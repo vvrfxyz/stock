@@ -442,3 +442,38 @@ class TestNewsArticles:
     def test_article_without_required_fields_skipped(self, pg_db):
         articles, insights = pg_db.upsert_news_articles([{"title": "no id"}])
         assert (articles, insights) == (0, 0)
+
+
+class TestInsiderTransactions:
+    def _row(self, **extra):
+        return {
+            "source": "SEC_EDGAR",
+            "accession_number": "0001-26-000042",
+            "source_row_hash": "a" * 64,
+            "form_type": "4",
+            "transaction_code": "S",
+            "transaction_shares": Decimal("100"),
+            "transaction_price_per_share": Decimal("10.5"),
+            **extra,
+        }
+
+    def test_insert_then_idempotent_reupsert(self, pg_db):
+        assert pg_db.upsert_insider_transactions([self._row()]) == 1
+        pg_db.upsert_insider_transactions([self._row()])
+        assert _scalar(pg_db, "SELECT count(*) FROM insider_transactions") == 1
+
+    def test_conflict_updates_provided_fields(self, pg_db):
+        _insert_security(pg_db)
+        pg_db.upsert_insider_transactions([self._row()])
+        pg_db.upsert_insider_transactions([self._row(security_id=1, transaction_shares=Decimal("200"))])
+        assert _scalar(pg_db, "SELECT count(*) FROM insider_transactions") == 1
+        assert _scalar(pg_db, "SELECT security_id FROM insider_transactions") == 1
+        assert _scalar(pg_db, "SELECT transaction_shares FROM insider_transactions") == Decimal("200.000000")
+
+    def test_batch_dedup_and_missing_keys_skipped(self, pg_db):
+        rows = [self._row(), self._row(), {"source": "SEC_EDGAR", "accession_number": "x"}]
+        assert pg_db.upsert_insider_transactions(rows) == 1
+
+    def test_distinct_hashes_create_separate_rows(self, pg_db):
+        pg_db.upsert_insider_transactions([self._row(), self._row(source_row_hash="b" * 64)])
+        assert _scalar(pg_db, "SELECT count(*) FROM insider_transactions") == 2
