@@ -78,7 +78,12 @@ _NO_SIC_VALUES = {"", "N/A", "NA", "NONE", "NULL"}
 
 
 def _is_missing_sic(sic_code: int | str | None) -> bool:
-    return sic_code is None or (
+    # 不仅识别 None / 空串,也要识别 pandas object 列里 NULL 物化出来的 NaN 浮点。
+    if sic_code is None:
+        return True
+    if isinstance(sic_code, float) and pd.isna(sic_code):
+        return True
+    return (
         isinstance(sic_code, str) and sic_code.strip().upper() in _NO_SIC_VALUES
     )
 
@@ -134,11 +139,12 @@ def load_industry_panel(
     params = {"security_ids": security_ids} if security_ids is not None else None
     panel = pd.read_sql_query(sql, engine, params=params)
     panel["ff12"] = [sic_to_ff12(value) for value in panel["sic_code"]]
+    # ff12 列里 None 在 object dtype 下会被 pandas 序列化成 NaN;判断时用 pd.notna 兜底。
     panel["ff12_coverage_reason"] = [
         "no_sic"
         if _is_missing_sic(sic_code)
         else "mapped"
-        if ff12 is not None
+        if pd.notna(ff12) and ff12 is not None
         else "unmapped_sic"
         for sic_code, ff12 in zip(panel["sic_code"], panel["ff12"], strict=True)
     ]

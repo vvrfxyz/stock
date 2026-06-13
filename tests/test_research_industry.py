@@ -116,6 +116,19 @@ def test_coverage_report_empty_panel():
     assert all(count == 0 for count in report["by_ff12"].values())
 
 
+def test_is_missing_sic_recognizes_pandas_nan():
+    # pandas object 列里 NULL 物化成 numpy.nan(float),不是 None。
+    # _is_missing_sic 必须把它识别成 missing,否则 load_industry_panel 在生产库
+    # 上会把每条 sic_code IS NULL 的 security 错归成 "mapped"。
+    import math
+    from research.industry import _is_missing_sic
+    assert _is_missing_sic(float("nan")) is True
+    assert _is_missing_sic(math.nan) is True
+    assert _is_missing_sic(None) is True
+    assert _is_missing_sic("") is True
+    assert _is_missing_sic(2010) is False
+
+
 @pytest.mark.integration
 def test_load_industry_panel_against_real_schema(pg_db):
     _insert_security(pg_db, 1, "aapl", "2010")
