@@ -25,35 +25,69 @@ tests/test_research_industry.py  # 单元测试 (合成数据)
 
 ## 契约
 
-### `research.industry.SIC_TO_FF12: dict[int, str]`
+### `research.industry.SIC_TO_FF12` / `_FF12_RANGES`
 
-**静态字典**,SIC code → FF12 行业代码(12 个 + `Other`,共 13 个 bucket)。
+**静态范围表**,FF12 行业代码(12 个 bucket: `NoDur Durbl Manuf Enrgy Chems BusEq Telcm Utils Shops Hlth Money Other`)。
 
-FF12 的标准定义参见 Ken French 库:
+#### 权威范围 — 必须照搬,不凭记忆
 
-| code | name | SIC ranges (示例,完整范围在原始定义里) |
-|---|---|---|
-| `NoDur` | Consumer NonDurables | 0100-0999, 2000-2399, 2700-2749, 2770-2799, 3100-3199, 3940-3989 |
-| `Durbl` | Consumer Durables | 2500-2519, 2590-2599, 3630-3659, 3710-3711, 3714-3714, 3716-3716, 3750-3751, 3792-3792, 3900-3939, 3990-3999 |
-| `Manuf` | Manufacturing | 2520-2589, 2600-2699, 2750-2769, 2800-2829, 2840-2899, 3000-3099, 3200-3569, 3580-3621, 3623-3629, 3700-3709, 3712-3713, 3715-3715, 3717-3749, 3752-3791, 3793-3799, 3860-3899 |
-| `Enrgy` | Oil, Gas, and Coal | 1200-1399, 2900-2999 |
-| `Chems` | Chemicals | 2830-2839, 2860-2899 |
-| `BusEq` | Business Equipment | 3570-3579, 3622-3622, 3660-3692, 3694-3699, 3810-3839, 7370-7372, 7373-7373, 7374-7374, 7375-7375, 7376-7376, 7377-7377, 7378-7378, 7379-7379, 7391-7391, 8730-8734 |
-| `Telcm` | Telecom | 4800-4899 |
-| `Utils` | Utilities | 4900-4949 |
-| `Shops` | Wholesale, Retail | 5000-5999, 7200-7299, 7600-7699 |
-| `Hlth` | Healthcare | 2830-2839 (部分), 3693-3693, 3840-3859, 8000-8099 |
-| `Money` | Finance | 6000-6999 |
-| `Other` | Everything Else | 其余所有 SIC |
+**Codex 必须**:用脚本去 Ken French 官网拉 `Siccodes12.zip`(URL: `https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Siccodes12.zip`),解压后的纯文本就是权威定义。把它**抄进模块**(硬编码,不留运行时下载依赖)。
 
-**注意**: `Chems` 和 `Hlth` 在 2830-2839 上有交集(化学制药),Ken French 的标准做法是 `Hlth` 优先(2830-2839 算 Healthcare)。Codex 实现时必须把这种顺序硬编码并加测试锁定。
+完整范围如下(直接来自 `Siccodes12.zip`,2026-06-13 拉取核对):
 
-权威范围列表去 [Ken French 网站](https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/Data_Library/det_12_ind_port.html) 拿完整 SIC range,不要凭记忆补。**任务可接受的实现方式**:
+```
+1 NoDur  Consumer Nondurables
+   0100-0999, 2000-2399, 2700-2749, 2770-2799, 3100-3199, 3940-3989
 
-1. 把完整 SIC range 表硬编码进模块(推荐,无运行时依赖)
-2. 模块加载时从一个 `research/data/ff12_sic_ranges.csv` 文件读(可接受,数据来源必须文档化)
+2 Durbl  Consumer Durables
+   2500-2519, 2590-2599, 3630-3659, 3710-3711, 3714-3714, 3716-3716,
+   3750-3751, 3792-3792, 3900-3939, 3990-3999
 
-不接受运行时下载或网络依赖。
+3 Manuf  Manufacturing
+   2520-2589, 2600-2699, 2750-2769, 3000-3099, 3200-3569, 3580-3629,
+   3700-3709, 3712-3713, 3715-3715, 3717-3749, 3752-3791, 3793-3799,
+   3830-3839, 3860-3899
+
+4 Enrgy  Oil, Gas, and Coal
+   1200-1399, 2900-2999
+
+5 Chems  Chemicals and Allied Products
+   2800-2829, 2840-2899
+
+6 BusEq  Business Equipment
+   3570-3579, 3660-3692, 3694-3699, 3810-3829, 7370-7379
+
+7 Telcm  Telephone and Television Transmission
+   4800-4899
+
+8 Utils  Utilities
+   4900-4949
+
+9 Shops  Wholesale, Retail
+   5000-5999, 7200-7299, 7600-7699
+
+10 Hlth  Healthcare, Medical Equipment, and Drugs
+   2830-2839, 3693-3693, 3840-3859, 8000-8099
+
+11 Money Finance
+   6000-6999
+
+12 Other  Other (everything not above; catch-all)
+```
+
+#### 关键约束(必须有测试锁)
+
+1. **不要凭记忆补**。`Chems` 真实范围是 `2800-2829, 2840-2899` —— **故意排除了 2830-2839**,因为那段属于 `Hlth`(医药)。这两个 bucket 在 12-industry 体系里**没有真重叠**——Ken French 是通过把 Chems 拆成 `2800-2829` + `2840-2899` 两段来回避重叠。
+2. **实现时如果把 ranges 简单按列表枚举,顺序仍可能制造伪重叠**——比如错写成单段 `(2800, 2899) -> Chems` 就会吞掉 `(2830, 2839) -> Hlth`。**禁止**这种简化,必须保留官方的 `Chems` 两段切片。
+3. **`Other` 是 catch-all**:任何不在上述 11 个 bucket 范围里的 SIC 都归 `Other`。
+
+#### 实现要求
+
+- 把上面 11 个 bucket 的范围**完整**硬编码进模块(看 Codex 之前下载的 `/tmp/Siccodes12.zip` 或重新下载核对)
+- `_FF12_RANGES: tuple[tuple[int, int, str], ...]` 按 zip 文件里的顺序枚举
+- `sic_to_ff12` 实现用 `bisect` 或线性扫,落不到任何 11 bucket 的归 `Other`
+- **不**用网络运行时依赖
+- **不**做 SIC range CSV 文件外读(范围十年改一次,硬编码最简单)
 
 ### `research.industry.sic_to_ff12(sic_code: int | str | None) -> str | None`
 
@@ -91,11 +125,14 @@ FF12 的标准定义参见 Ken French 库:
 
 ### 单元 (纯合成,无 DB)
 
-1. `test_sic_to_ff12_known_codes` — 13 个 bucket 每个至少 1 个代表性 SIC 测试:
+1. `test_sic_to_ff12_known_codes` — 12 个 bucket 每个至少 1 个代表性 SIC 测试:
    - `2010 -> NoDur`(食品)
    - `3711 -> Durbl`(机动车)
-   - `2860 -> Hlth`(化学制药,验证 Hlth 优先于 Chems)
-   - `2840 -> Chems`(2830-2839 之外的化学)
+   - `2860 -> Chems`(2840-2899 段内的化学)
+   - `2825 -> Chems`(2800-2829 段内的化学)
+   - `2830 -> Hlth`(2830-2839 段,药品)
+   - `2835 -> Hlth`(2830-2839 段)
+   - `2839 -> Hlth`(2830-2839 段末)
    - `3674 -> BusEq`(半导体)
    - `4812 -> Telcm`(电信)
    - `4911 -> Utils`(电力)
@@ -105,13 +142,14 @@ FF12 的标准定义参见 Ken French 库:
    - `1311 -> Enrgy`(石油开采)
    - `5712 -> Shops`(家具零售)
    - `2300 -> NoDur`(服装)
-   - `7011 -> Other`(酒店,不在 12 个明确 bucket 里)
+   - `7011 -> Other`(酒店,不在 11 个明确 bucket 里 → catch-all)
 2. `test_sic_to_ff12_handles_dirty_input`:
    - `None` / `""` / `"N/A"` / 负数 / 超界(99999)→ `None`
    - 字符串带前导零 `"0100"` 等于 `100`(int 化后映射成 `NoDur`)
    - 浮点 / 非数字字符串 → `None`
-3. `test_chemicals_healthcare_overlap`:
-   - 输入 2830, 2835, 2839(三个落在 Chems/Hlth 交集) → 必须返回 `Hlth`
+3. `test_chems_does_not_swallow_hlth_subrange`:
+   - 2830 / 2835 / 2839 必须返回 `Hlth` —— 验证实现没把 `Chems` 误写成单段 `(2800, 2899)`(那会吞掉 Hlth 子段)
+   - 2829 / 2840 必须返回 `Chems` —— 验证 Chems 边界正确
 4. `test_coverage_report_shape` — 合成 panel,断言所有字段、加总等于 total
 
 ### 集成 (`pytest.mark.integration`, 用 `pg_db` fixture)
