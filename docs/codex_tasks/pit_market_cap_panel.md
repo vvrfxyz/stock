@@ -44,11 +44,12 @@ tests/test_research_market_cap.py     # 单元 + 集成测试
 ```sql
 SELECT security_id, filing_date AS visible_date, period_end_date, total_shares
 FROM historical_shares
-WHERE source = 'MASSIVE'
-  AND total_shares IS NOT NULL
+WHERE total_shares IS NOT NULL
   AND (:security_ids IS NULL OR security_id = ANY(:security_ids))
 ORDER BY security_id, filing_date, period_end_date
 ```
+
+注意:**不**过滤 `source`。生产库里 `historical_shares.source` 同时存在 `MASSIVE` 和 `POLYGON` 两种来源(2026-06-13 实查:41k MASSIVE + 10k POLYGON,共覆盖 ~10.5k securities),按 source 过滤会漏掉 20% 的数据。两个 source 在 schema 上等价,消费时不区分。
 
 **重述/重复处理**: 同一 `(security_id, filing_date)` 可能有多个 `period_end_date`(罕见,vendor 双填),保留全部行;消费者(asof_panel)做 last-wins。
 
@@ -129,6 +130,7 @@ python -m pytest tests/ -q
 4. **不要**在面板里同时返回原始 close 和市值 — 只返回市值。需要 close 的话调用者直接读 `research.data`
 5. **不要**用 `daily_prices.adjusted_close` 之类的列 — 不存在,事实表只有 raw,**注意 review 已经把"研究层只读 raw + read-time 复权"这条铁律强化过**
 6. **不要**做做空利息 / shares borrowed 等其他股本系信号 — 那是另一组任务
+7. **不要**在 SQL 里按 `historical_shares.source` 过滤 — 库内同时有 `MASSIVE` 和 `POLYGON` 两种来源,过滤会丢 20% 数据
 
 ## 实现建议
 

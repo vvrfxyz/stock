@@ -41,6 +41,16 @@
 - emoji 除非明示请求,**不要用**
 - 错误处理:不要捕异常然后忽略;不要在内部代码做无用 validation。trust 内部调用,只在系统边界(用户输入、外部 API)校验
 
+### pandas + DB 的 NaN 陷阱(硬规则)
+
+任何**从 PostgreSQL 读到 pandas 的 object 列里的 NULL 值**,在 pandas 里物化成 `float('nan')`,而**不是** `None`。所以:
+
+- `is None` 永远不会匹配从 DB 来的 NULL ← 错
+- `pd.isna(value)` 或 `isinstance(value, float) and pd.isna(value)` 才安全
+- 列表推导式里直接拿 `value` 当 truthy/falsy 比较也不行,因为 NaN 是 truthy 且不等于自己
+
+这是 2026-06-13 的 production smoke test 抓到的 bug(`research/industry.py` 的 `_is_missing_sic`)。所有读 `pd.read_sql_query` 的 object 列后做 `is None` / `is not None` 的代码必须**额外检测 NaN**。验收测试**必须**有一个用例,把 `numpy.nan` 显式喂进缺失值检查函数,断言被识别成 missing。
+
 ### 规格矛盾处理(硬规则)
 
 如果你在实施过程中发现**任务规格内部矛盾**(例如范围表说 X,测试用例说 not-X)、**规格与权威来源矛盾**(例如规格里的范围和 Ken French zip 不一致)、或者**规格与现有代码契约矛盾**(例如要求改一个被其他模块依赖的签名):
