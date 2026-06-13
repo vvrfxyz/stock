@@ -1,7 +1,7 @@
 import random as py_random
 from sqlalchemy import (
     Column, Integer, String, Date, Boolean, Numeric,
-    ForeignKey, UniqueConstraint, BigInteger, Text, TIMESTAMP
+    ForeignKey, UniqueConstraint, BigInteger, Text, TIMESTAMP, Index
 )
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import declarative_base, relationship
@@ -129,8 +129,19 @@ class Security(Base):
                                    comment="自动全量刷新的随机周期(天)")
     # --- 数据库约束 ---
     __table_args__ = (
-        UniqueConstraint('symbol', name='_symbol_market_type_uc'),
-        UniqueConstraint('current_symbol', 'exchange', name='_current_symbol_exchange_uc'),
+        Index(
+            '_active_symbol_uc',
+            'symbol',
+            unique=True,
+            postgresql_where=(is_active.is_(True)),
+        ),
+        Index(
+            '_active_current_symbol_exchange_uc',
+            'current_symbol',
+            'exchange',
+            unique=True,
+            postgresql_where=(is_active.is_(True)),
+        ),
     )
 
 

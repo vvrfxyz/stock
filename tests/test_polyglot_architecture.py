@@ -1,7 +1,7 @@
 import inspect
 from pathlib import Path
 
-from sqlalchemy import BigInteger, Numeric, String, UniqueConstraint
+from sqlalchemy import BigInteger, Index, Numeric, String, UniqueConstraint
 
 from data_models.models import (
     ComputedAdjustmentFactor,
@@ -34,6 +34,13 @@ def _unique_constraints(model):
     }
 
 
+def _unique_indexes(model):
+    return {
+        tuple(index.columns.keys())
+        for index in model.__table__.indexes
+        if isinstance(index, Index) and index.unique
+    }
+
 def test_security_model_exposes_postgres_control_center_columns():
     columns = Security.__table__.columns
 
@@ -48,7 +55,8 @@ def test_security_model_exposes_postgres_control_center_columns():
     assert columns["composite_figi"].type.length == 30
     assert not columns["created_at"].nullable
     assert not columns["updated_at"].nullable
-    assert ("current_symbol", "exchange") in _unique_constraints(Security)
+    assert ("symbol",) in _unique_indexes(Security)
+    assert ("current_symbol", "exchange") in _unique_indexes(Security)
 
 
 def test_existing_security_references_are_int64_compatible():
