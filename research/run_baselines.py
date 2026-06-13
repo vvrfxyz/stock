@@ -60,6 +60,7 @@ def trim(result: BacktestResult, eval_start: date) -> BacktestResult:
         equity=(1 + r).cumprod(),
         turnover=result.turnover.loc[result.turnover.index >= ts],
         avg_positions=result.avg_positions,
+        terminal_missing_position_days=int(result.terminal_missing_position_days),
     )
 
 
@@ -110,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
     bench_ids = _lookup_ids(engine, [args.benchmark])
     if bench_ids:
         bench = load_price_long(engine, start=args.start, end=args.end, types=("ETF",), security_ids=bench_ids)
-        bench = apply_adjustment(bench, load_factor_events(engine, as_of=args.end))
+        bench = apply_adjustment(bench, load_factor_events(engine, as_of=args.end), as_of=args.end)
         bench_ret = to_wide(bench, "adj_close").iloc[:, 0].pct_change(fill_method=None).reindex(adj_close.index)
         bench_result = trim(
             BacktestResult(

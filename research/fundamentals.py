@@ -409,18 +409,21 @@ def asof_panel(
     *,
     dates: pd.DatetimeIndex,
     max_staleness_days: int = 270,
+    visible_delay_days: int = 1,
 ) -> dict[str, pd.DataFrame]:
     """事件表 -> {metric: 宽表 (index=dates, columns=security_id)} 的 as-of 取数。
 
-    每个 (date, security) 取 visible_date <= date 的最近事件（重述事件自然
-    覆盖旧值）；period_end 落后 date 超过 max_staleness_days 的值视为停止
-    披露，置 NaN。
+    每个 (date, security) 取 visible_date + visible_delay_days <= date 的最近事件（重述事件自然
+    覆盖旧值）；默认后移一天，避免 filed_date 当日盘后 EDGAR 申报被 t 日收盘建仓提前看到。
+    period_end 落后 date 超过 max_staleness_days 的值视为停止披露，置 NaN。
     """
     dates = pd.DatetimeIndex(sorted(pd.to_datetime(dates))).astype("datetime64[ns]")
     panels: dict[str, pd.DataFrame] = {}
     staleness = pd.Timedelta(days=max_staleness_days)
+    visible_delay = pd.Timedelta(days=visible_delay_days)
     for metric, ev in events.groupby("metric"):
         ev = _to_ns(ev.copy(), ("period_end", "visible_date"))
+        ev["effective_visible_date"] = ev["visible_date"] + visible_delay
         secs = ev["security_id"].unique()
         grid = pd.DataFrame(
             {
@@ -430,9 +433,9 @@ def asof_panel(
         )
         joined = pd.merge_asof(
             grid.sort_values("date"),
-            ev.sort_values("visible_date"),
+            ev.sort_values("effective_visible_date"),
             left_on="date",
-            right_on="visible_date",
+            right_on="effective_visible_date",
             by="security_id",
             direction="backward",
         )
@@ -452,6 +455,7 @@ def load_fundamental_panel(
     types: tuple[str, ...] = ("CS",),
     security_ids: list[int] | None = None,
     max_staleness_days: int = 270,
+    visible_delay_days: int = 1,
 ) -> dict[str, pd.DataFrame]:
     """一站式：拉事实 -> 构造事件 -> as-of 面板。
 
@@ -466,4 +470,5 @@ def load_fundamental_panel(
         events,
         dates=pd.DatetimeIndex(pd.to_datetime(list(dates))),
         max_staleness_days=max_staleness_days,
+        visible_delay_days=visible_delay_days,
     )

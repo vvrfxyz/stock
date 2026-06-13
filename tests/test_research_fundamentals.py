@@ -124,20 +124,21 @@ def test_53_week_fiscal_year_prior_ytd_within_tolerance():
     assert ttm.iloc[0]["value"] == 110.0
 
 
-def test_asof_panel_visibility_inclusive_and_staleness():
+def test_asof_panel_visibility_delayed_one_day_and_staleness():
     facts = _facts(
         _f(1, "NetIncomeLoss", "2024-01-01", "2024-09-30", "2024-11-01", 80.0),
         _f(1, "NetIncomeLoss", "2023-01-01", "2023-12-31", "2024-02-20", 100.0),
         _f(1, "NetIncomeLoss", "2023-01-01", "2023-09-30", "2023-11-05", 70.0),
     )
     events = build_metric_events(facts)
-    dates = pd.to_datetime(["2024-02-19", "2024-03-01", "2024-11-01", "2025-09-30"])
-    panel = asof_panel(events, dates=pd.DatetimeIndex(dates), max_staleness_days=270)
+    dates = pd.to_datetime(["2024-02-20", "2024-03-01", "2024-11-01", "2024-11-02", "2025-11-05"])
+    panel = asof_panel(events, dates=pd.DatetimeIndex(dates), max_staleness_days=400)
     col = panel["net_income_ttm"][1]
-    assert np.isnan(col.loc["2024-02-19"])  # filed 前一日不可见
-    assert col.loc["2024-03-01"] == 100.0  # FY 直报已可见
-    assert col.loc["2024-11-01"] == 110.0  # filed 当日记为可见
-    assert np.isnan(col.loc["2025-09-30"])  # period_end 落后 365 天 > 270，置 NaN
+    assert np.isnan(col.loc["2024-02-20"])  # filed 当日默认不可见，避免盘后一日前视
+    assert col.loc["2024-03-01"] == 100.0  # FY 直报次日后可见
+    assert col.loc["2024-11-01"] == 100.0  # Q3 filed 当日仍只能看到旧 FY
+    assert col.loc["2024-11-02"] == 110.0  # Q3 filed 次日可见
+    assert np.isnan(col.loc["2025-11-05"])  # period_end 落后 400 天以上，置 NaN
 
 
 def test_instant_metric_asof_latest_visible():
@@ -146,11 +147,12 @@ def test_instant_metric_asof_latest_visible():
         _f(1, "Assets", "2024-06-30", "2024-06-30", "2024-08-01", 12.0),
     )
     events = build_metric_events(facts)
-    dates = pd.DatetimeIndex(pd.to_datetime(["2024-06-01", "2024-08-01"]))
+    dates = pd.DatetimeIndex(pd.to_datetime(["2024-06-01", "2024-08-01", "2024-08-02"]))
     panel = asof_panel(events, dates=dates)
     col = panel["assets"][1]
     assert col.loc["2024-06-01"] == 10.0
-    assert col.loc["2024-08-01"] == 12.0
+    assert col.loc["2024-08-01"] == 10.0  # filed 当日默认不可见
+    assert col.loc["2024-08-02"] == 12.0
 
 
 def test_late_filed_older_period_dropped_for_monotonic_asof():

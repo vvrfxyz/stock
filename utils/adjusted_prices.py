@@ -4,11 +4,10 @@ daily_prices 永远只存 raw facts；复权价是读取时由
 daily_prices × computed_adjustment_factors 现算的派生值，绝不回写事实表。
 
 口径（与 raw_actions_v1 / Massive historical_adjustment_factor 对齐）：
-- computed_adjustment_factors.cumulative_factor 表示"该事件及其之后所有事件"的累计因子。
-- 后复权习惯下，bar 日期 d 应用的因子 = ex_date > d 的最近一个事件的 cumulative_factor；
-  d 之后没有事件时因子为 1（最新价格即原始价格）。
-- as_of 是防未来函数边界：只使用 ex_date <= as_of 的事件，
-  回测在 as_of 时点"看不到"之后才发生的拆股/分红。
+- computed_adjustment_factors.cumulative_factor 表示“该事件及其之后所有事件”的累计因子。
+- 后复权习惯下，bar 日期 d 应用的因子 = C(第一个 ex_date > d) / C(第一个 ex_date > as_of)；
+  C 不存在时为 1。这个归一化会消除 as_of 之后已入库未来事件对历史链的污染。
+- as_of 是防未来函数边界：回测在 as_of 时点“看不到”之后才发生的拆股/分红。
 """
 from __future__ import annotations
 
@@ -59,14 +58,18 @@ def load_factor_events(
     as_of: date,
     methodology_version: str = DEFAULT_METHODOLOGY_VERSION,
 ) -> list[tuple[date, Decimal]]:
-    """返回按 ex_date 升序的 (ex_date, cumulative_factor)，仅含 ex_date <= as_of 的事件。"""
+    """返回按 ex_date 升序的 (ex_date, cumulative_factor)。
+
+    cumulative_factor 是全链后缀积，历史行可能已包含 as_of 之后的未来事件；
+    因此这里必须加载完整事件链，读取时再用 factor_for_date 的 as_of 归一化。
+    as_of 参数保留在签名中，表示调用方的可见性边界。
+    """
     rows = (
         session.query(ComputedAdjustmentFactor.date, ComputedAdjustmentFactor.cumulative_factor)
         .filter(
             ComputedAdjustmentFactor.security_id == security_id,
             ComputedAdjustmentFactor.methodology_version == methodology_version,
             ComputedAdjustmentFactor.factor_type == "historical_adjustment",
-            ComputedAdjustmentFactor.date <= as_of,
         )
         .order_by(ComputedAdjustmentFactor.date.asc())
         .all()
@@ -78,19 +81,28 @@ def load_factor_events(
     return sorted(by_date.items())
 
 
-def factor_for_date(events: list[tuple[date, Decimal]], bar_date: date) -> Decimal:
-    """bar 日期应用的因子 = 第一个 ex_date > bar_date 的事件的 cumulative_factor，否则 1。
-
-    events 必须按 ex_date 升序。cumulative_factor 本身是"该事件及之后"的累计，
-    所以直接取右侧第一个事件即可，无需再连乘。
-    """
-    if not events:
-        return Decimal("1")
+def _chain_after(events: list[tuple[date, Decimal]], boundary: date) -> Decimal:
     dates = [item[0] for item in events]
-    index = bisect_right(dates, bar_date)
+    index = bisect_right(dates, boundary)
     if index >= len(events):
         return Decimal("1")
     return events[index][1]
+
+
+def factor_for_date(events: list[tuple[date, Decimal]], bar_date: date, *, as_of: date | None = None) -> Decimal:
+    """bar 日期应用的 as-of 归一化后复权因子。
+
+    events 必须按 ex_date 升序。cumulative_factor 本身是“该事件及之后”的全链累计，
+    所以 as_of 时点可见的因子是 C(第一个 ex_date > bar_date) / C(第一个 ex_date > as_of)。
+    未传 as_of 时保持旧的“以最新价为基准”语义（as_of 取最后事件日）。
+    """
+    if not events:
+        return Decimal("1")
+    effective_as_of = as_of or events[-1][0]
+    denominator = _chain_after(events, effective_as_of)
+    if denominator == 0:
+        return Decimal("1")
+    return _chain_after(events, bar_date) / denominator
 
 
 def get_adjusted_daily_bars(
@@ -132,7 +144,7 @@ def get_adjusted_daily_bars(
 
     adjusted: list[AdjustedBar] = []
     for bar in bars:
-        factor = factor_for_date(events, bar.date)
+        factor = factor_for_date(events, bar.date, as_of=effective_as_of)
         values: dict[str, Decimal | None] = {}
         for field in _PRICE_FIELDS:
             raw_value = getattr(bar, field)

@@ -53,6 +53,18 @@ def test_factor_for_date_applies_to_bars_strictly_before_ex_date():
     assert factor_for_date([], date(2020, 8, 28)) == Decimal("1")
 
 
+def test_factor_for_date_normalizes_future_event_polluted_chain():
+    # computed cumulative_factor 是全链后缀积：2026-01 旧 15:1 缩股行已被
+    # 2026-06 未来 20:1 缩股污染为 300。as_of=2026-06-10 时必须除掉未来 20。
+    events = [
+        (date(2026, 1, 26), Decimal("300")),
+        (date(2026, 6, 12), Decimal("20")),
+    ]
+
+    assert factor_for_date(events, date(2026, 1, 25), as_of=date(2026, 6, 10)) == Decimal("15")
+    assert factor_for_date(events, date(2026, 1, 26), as_of=date(2026, 6, 10)) == Decimal("1")
+
+
 def test_adjusted_series_is_smooth_across_split():
     session = _make_session()
     _seed_split_scenario(session)

@@ -44,6 +44,27 @@ def test_apply_adjustment_matches_reference_semantics():
     assert np.allclose(got[4:], 1.0)
 
 
+def test_apply_adjustment_normalizes_future_event_polluted_chain():
+    prices = pd.DataFrame(
+        {
+            "security_id": np.array([22, 22, 22], dtype=np.int32),
+            "date": pd.to_datetime(["2026-01-23", "2026-01-26", "2026-06-10"]),
+            "close": [100.0, 10.0, 12.0],
+        }
+    )
+    events = pd.DataFrame(
+        {
+            "security_id": [22, 22],
+            "ex_date": pd.to_datetime(["2026-01-26", "2026-06-12"]),
+            "cumulative_factor": [300.0, 20.0],
+        }
+    )
+
+    got = apply_adjustment(prices, events, as_of=date(2026, 6, 10))
+
+    assert np.allclose((got["adj_close"] / got["close"]).to_numpy(), [15.0, 1.0, 1.0])
+
+
 def test_apply_adjustment_event_on_bar_date_uses_next_event():
     # ex_date 当天 bar 不再应用该事件（factor 取 ex_date > bar_date 的第一个事件）
     prices = pd.DataFrame(

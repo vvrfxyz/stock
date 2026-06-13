@@ -1,8 +1,8 @@
 """研究用批量数据加载：daily_prices × computed_adjustment_factors -> pandas 面板。
 
 与 utils/adjusted_prices 同口径（raw_actions_v1）：
-- bar 日期 d 的因子 = 第一个 ex_date > d 的事件的 cumulative_factor，否则 1。
-- as_of 限定只使用 ex_date <= as_of 的事件（防未来函数）。
+- bar 日期 d 的因子 = C(第一个 ex_date > d) / C(第一个 ex_date > as_of)，C 不存在时为 1。
+- 这个 as_of 归一化会消除 computed_adjustment_factors 全链后缀积中未来事件的污染。
 
 区别在于这里一次 SQL 拉全市场、numpy 向量化套因子，供横截面研究使用；
 单标的精确读取仍走 utils.adjusted_prices.get_adjusted_daily_bars。
@@ -18,6 +18,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 DEFAULT_METHODOLOGY_VERSION = "raw_actions_v1"
+FACTOR_TRUST_FLOOR = date(2024, 5, 14)
 
 
 def research_engine(database_url: str | None = None) -> Engine:
@@ -83,7 +84,6 @@ def load_factor_events(
         from computed_adjustment_factors
         where methodology_version = :mv
           and factor_type = 'historical_adjustment'
-          and date <= :as_of
         group by security_id, date
         order by security_id, ex_date
         """
@@ -91,13 +91,18 @@ def load_factor_events(
     return pd.read_sql_query(sql, engine, params={"mv": methodology_version, "as_of": as_of}, parse_dates=["ex_date"])
 
 
-def apply_adjustment(prices: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
+def apply_adjustment(prices: pd.DataFrame, events: pd.DataFrame, *, as_of: date | pd.Timestamp | None = None) -> pd.DataFrame:
     """为长表 prices 增加 adj_close 列（同口径后复权）。"""
     factor = np.ones(len(prices))
+    if prices.empty:
+        out = prices.copy()
+        out["adj_close"] = out.get("close", pd.Series(dtype=float))
+        return out
+    effective_as_of = pd.Timestamp(as_of) if as_of is not None else prices["date"].max()
     bar_dates = prices["date"].to_numpy()
     sid_values = prices["security_id"].to_numpy()
     grouped = {
-        sid: (g["ex_date"].to_numpy(), g["cumulative_factor"].to_numpy())
+        sid: (g["ex_date"].to_numpy(), g["cumulative_factor"].to_numpy(dtype=float))
         for sid, g in events.groupby("security_id")
     }
     # prices 按 (security_id, date) 排序，逐证券切片做 searchsorted
@@ -113,6 +118,11 @@ def apply_adjustment(prices: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame
         seg = np.ones(hi - lo)
         in_range = idx < len(cumulative)
         seg[in_range] = cumulative[idx[in_range]]
+
+        as_of_idx = np.searchsorted(ex_dates, effective_as_of.to_datetime64(), side="right")
+        denominator = cumulative[as_of_idx] if as_of_idx < len(cumulative) else 1.0
+        if denominator != 0:
+            seg = seg / denominator
         factor[lo:hi] = seg
     out = prices.copy()
     out["adj_close"] = out["close"] * factor
@@ -134,9 +144,15 @@ def load_adjusted_panel(
     include_inactive: bool = True,
 ) -> dict[str, pd.DataFrame]:
     """返回宽表字典：adj_close / close / volume / dollar_volume。"""
+    if start < FACTOR_TRUST_FLOOR:
+        raise ValueError(
+            f"start={start} 早于因子可信窗口 {FACTOR_TRUST_FLOOR}；"
+            "更早价格未保证复权，研究面板拒绝装载。"
+        )
+    effective_as_of = as_of or end
     prices = load_price_long(engine, start=start, end=end, types=types, include_inactive=include_inactive)
-    events = load_factor_events(engine, as_of=as_of or end)
-    prices = apply_adjustment(prices, events)
+    events = load_factor_events(engine, as_of=effective_as_of)
+    prices = apply_adjustment(prices, events, as_of=effective_as_of)
     prices["dollar_volume"] = prices["close"] * prices["volume"]
     return {
         "adj_close": to_wide(prices, "adj_close"),
@@ -160,7 +176,7 @@ def securities_with_uncovered_events(
 ) -> list[int]:
     """窗口内存在 corporate_actions 事件但无对应因子行的证券。
 
-    主要是因子构建只跑 is_active=True 导致的退市股缺口；缺因子的拆股会在
+    主要是因子构建曾只跑 is_active=True 导致的退市股缺口；缺因子的拆股/分红会在
     价格序列里留下假跳空，这些证券必须从横截面样本中剔除。
     """
     sql = text(
@@ -168,7 +184,7 @@ def securities_with_uncovered_events(
         select distinct ca.security_id
         from corporate_actions ca
         where ca.ex_date between :start and :end
-          and ca.action_type = 'SPLIT'
+          and ca.action_type in ('SPLIT', 'DIVIDEND')
           and not exists (
             select 1 from computed_adjustment_factors f
             where f.security_id = ca.security_id
