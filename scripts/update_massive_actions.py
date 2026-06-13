@@ -68,6 +68,8 @@ def _get_batch_start_date(
     recent_days: int = 0,
 ) -> str:
     if recent_days > 0:
+        if any(security.actions_last_updated_at is None for security in securities):
+            return history_floor.isoformat()
         return max(history_floor, date.today() - timedelta(days=recent_days)).isoformat()
     if force:
         return history_floor.isoformat()
@@ -254,7 +256,7 @@ def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseMan
     logger.info("  成功(无 actions): {}", results_counter["SUCCESS_NO_ACTIONS"])
     logger.info("  错误: {}", results_counter["ERROR"] + results_counter["FATAL_ERROR"])
     logger.info("--------------------")
-    return 0
+    return 1 if results_counter["ERROR"] + results_counter["FATAL_ERROR"] else 0
 
 
 def main(argv: list[str] | None = None) -> int:

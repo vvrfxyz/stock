@@ -135,25 +135,25 @@ def process_security_date(
         return symbol, "ERROR", None
 
 
-def main(argv: list[str] | None = None):
+def main(argv: list[str] | None = None) -> int:
     start_time = time.monotonic()
     setup_logging()
     parser = create_parser()
     args = parser.parse_args(argv)
 
-    dates = _get_dates(args.start_date, args.end_date)
-    if not dates:
-        raise ValueError("日期范围为空。")
-
     db_manager = None
     source = None
     try:
+        dates = _get_dates(args.start_date, args.end_date)
+        if not dates:
+            raise ValueError("日期范围为空。")
+
         security_scope = {}
         db_manager = DatabaseManager()
         security_scope = get_security_scope(db_manager, args)
         if not security_scope:
             logger.success("没有需要处理的证券。")
-            return
+            return 0
 
         api_keys = get_massive_api_keys()
         rate_limiter = KeyRateLimiter(api_keys, MASSIVE_RATE_LIMIT, MASSIVE_RATE_SECONDS, scope="massive")
@@ -193,6 +193,10 @@ def main(argv: list[str] | None = None):
         logger.info("  错误: {}", results_counter["ERROR"])
         logger.info("  写入行数: {}", total_rows)
         logger.info("--------------------")
+        return 1 if results_counter["ERROR"] else 0
+    except Exception as exc:
+        logger.opt(exception=exc).critical("update_open_close_summary 执行失败: {}", exc)
+        return 1
     finally:
         if source:
             source.close()
@@ -202,4 +206,4 @@ def main(argv: list[str] | None = None):
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

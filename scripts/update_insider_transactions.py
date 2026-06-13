@@ -8,7 +8,8 @@ insider_transactions。先跑 update_sec_filings 建好索引。
 - --since 限制 filing_date 范围（与 scheduled_update 周度增量配合）。
 - 对策略最有价值的是公开市场买卖（transaction_code P/S）；授予(A)、行权(M)、
   赠与(G)、税务代扣(F) 等语义不同，消费端必须按 transaction_code 分层。
-- 多 owner 合并申报按 owner 复制行；security_id 取 filing 挂的 primary security。
+- 多 owner 合并申报按 owner 复制行；security_id 以 XML issuer_cik 反查发行人为准，
+  反查不到才回退 filing.security_id，避免公司型 10% 股东申报错挂到申报方。
 """
 import argparse
 import sys
@@ -23,8 +24,8 @@ project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from data_models.models import InsiderTransaction, SecFiling, Security
-from data_sources.sec_edgar_source import SecEdgarSource, parse_ownership_document
+from data_models.models import InsiderTransaction, SecFiling, Security, SecurityIdentifier
+from data_sources.sec_edgar_source import SecEdgarSource, cik_to_10digit, parse_ownership_document
 from db_manager import DatabaseManager
 from utils.script_logging import setup_logging as configure_script_logging
 
@@ -76,14 +77,63 @@ def get_pending_filings(db_manager: DatabaseManager, args: argparse.Namespace) -
         if args.since:
             query = query.filter(SecFiling.filing_date >= date.fromisoformat(args.since))
         if not args.reparse:
-            parsed = session.query(InsiderTransaction.accession_number).filter(
-                InsiderTransaction.source == "SEC_EDGAR"
-            ).distinct().subquery()
-            query = query.filter(SecFiling.accession_number.notin_(parsed.select()))
+            parsed_exists = session.query(InsiderTransaction.id).filter(
+                InsiderTransaction.source == "SEC_EDGAR",
+                InsiderTransaction.accession_number == SecFiling.accession_number,
+            ).exists()
+            query = query.filter(~parsed_exists)
         query = query.order_by(SecFiling.filing_date.desc(), SecFiling.id.asc())
         if args.limit > 0:
             query = query.limit(args.limit)
         return query.all()
+
+def resolve_issuer_security_id(
+    db_manager: DatabaseManager,
+    issuer_cik: str | None,
+    fallback_security_id: int | None,
+) -> int | None:
+    """用 XML issuer_cik 反查发行人 security_id；无唯一命中时回退 filing.security_id。"""
+    issuer_cik_10 = cik_to_10digit(issuer_cik)
+    if not issuer_cik_10:
+        return fallback_security_id
+
+    # securities.cik 通常是 10 位补零；兼容历史上未补零的值。security_identifiers
+    # 中 id_value 应为 10 位，但同样放入未补零变体以便修旧数据时更稳健。
+    issuer_cik_short = issuer_cik_10.lstrip("0") or "0"
+    cik_values = {issuer_cik_10, issuer_cik_short}
+    with db_manager.get_session() as session:
+        security_ids = {
+            row.id
+            for row in session.query(Security.id).filter(Security.cik.in_(cik_values)).all()
+        }
+        security_ids.update(
+            row.security_id
+            for row in session.query(SecurityIdentifier.security_id)
+            .filter(
+                SecurityIdentifier.id_type == "CIK",
+                SecurityIdentifier.id_value.in_(cik_values),
+            )
+            .all()
+        )
+
+    if len(security_ids) == 1:
+        resolved = next(iter(security_ids))
+        if fallback_security_id and resolved != fallback_security_id:
+            logger.info(
+                "Form ownership issuer_cik={} 归属 security_id={}，覆盖 filing.security_id={}。",
+                issuer_cik_10,
+                resolved,
+                fallback_security_id,
+            )
+        return resolved
+    if len(security_ids) > 1:
+        logger.warning(
+            "Form ownership issuer_cik={} 命中多个 security_id={}，回退 filing.security_id={}。",
+            issuer_cik_10,
+            sorted(security_ids),
+            fallback_security_id,
+        )
+    return fallback_security_id
 
 
 def process_filing(filing, source: SecEdgarSource, db_manager: DatabaseManager) -> tuple[str, int]:
@@ -94,9 +144,11 @@ def process_filing(filing, source: SecEdgarSource, db_manager: DatabaseManager) 
     rows = parse_ownership_document(xml_text, filing.accession_number)
     if not rows:
         return "SUCCESS_EMPTY", 0
+    issuer_cik = rows[0].get("issuer_cik")
+    issuer_security_id = resolve_issuer_security_id(db_manager, issuer_cik, filing.security_id)
     for row in rows:
         row["filing_id"] = filing.id
-        row["security_id"] = filing.security_id
+        row["security_id"] = issuer_security_id
         row["filing_date"] = filing.filing_date
     written = db_manager.upsert_insider_transactions(rows)
     return "SUCCESS", written
@@ -140,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
         for status, count in sorted(counters.items()):
             logger.info("  {}: {}", status, count)
         logger.info("  明细行写入/更新: {}", total_rows)
-        return 1 if failed and failed == len(filings) else 0
+        return 1 if failed else 0
     except Exception as e:
         logger.opt(exception=e).critical("update_insider_transactions 执行失败: {}", e)
         return 1

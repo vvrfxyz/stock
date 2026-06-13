@@ -133,7 +133,13 @@ def _is_first_weekday_of_month(run_date: date, weekday: int) -> bool:
 def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[ScheduledStep]:
     market = (market or "US").upper()
     end_trading_date = get_last_completed_trading_date(market)
+    open_close_start = shift_trading_date(market, end_trading_date, sessions=-5)
     steps: list[ScheduledStep] = [
+        ScheduledStep(
+            "sync_massive_universe",
+            sync_massive_universe_main,
+            ["--market", market],
+        ),
         ScheduledStep(
             "update_massive_prices",
             update_massive_prices_main,
@@ -148,6 +154,11 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
             "update_massive_actions_recent",
             update_actions_main,
             ["--market", market, "--all", "--recent-days", "14"],
+        ),
+        ScheduledStep(
+            "update_adjustment_factors",
+            update_adjustment_factors_main,
+            ["--market", market, "--changed-since", "3"],
         ),
         ScheduledStep(
             "update_open_close_summary",
@@ -184,6 +195,19 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
                 ],
             )
         )
+        # 周度 5 日窗口补漏：每日只跑当日，这里补回任何单日漏掉的盘前/盘后。
+        steps.append(
+            ScheduledStep(
+                "update_open_close_summary_catchup",
+                update_open_close_summary_main,
+                [
+                    "--market", market,
+                    "--all",
+                    "--start-date", open_close_start.isoformat(),
+                    "--end-date", end_trading_date.isoformat(),
+                ],
+            )
+        )
     if run_date.weekday() == 6:
         steps.append(
             ScheduledStep(
@@ -197,6 +221,13 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
                 "update_massive_actions",
                 update_actions_main,
                 ["--market", market, "--all", "--force"],
+            )
+        )
+        steps.append(
+            ScheduledStep(
+                "update_adjustment_factors_full",
+                update_adjustment_factors_main,
+                ["--market", market, "--all"],
             )
         )
         steps.append(
@@ -780,7 +811,7 @@ def main():
 
     p_adjustment = subparsers.add_parser('update_adjustment_factors', help="重建内部复权因子 cache，并与供应商 reference 对账")
     p_adjustment.add_argument('symbols', nargs='*', help="要处理的股票代码列表。")
-    p_adjustment.add_argument('--all', action='store_true', help="处理所有活跃 CS/ETF。")
+    p_adjustment.add_argument('--all', action='store_true', help='处理所有保留类型 CS/ETF（含 inactive，用于避免退市股因子缺口）。')
     p_adjustment.add_argument('--market', type=str, default='US', help="当前仅支持 US。")
     p_adjustment.add_argument('--source', type=str, default='MASSIVE', help="公司行动/供应商因子来源。")
     p_adjustment.add_argument('--limit', type=int, default=0, help="限制处理证券数量。")

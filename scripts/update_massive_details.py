@@ -64,9 +64,13 @@ def ensure_missing_symbols_exist(
         return inserted
 
     with db_manager.get_session() as session:
+        # 只把"活跃行"算作已存在：某 symbol 仅以退市(inactive)行存在时，
+        # 复用该代码重新上市的新证券仍应作为新活跃行插入（与 active-only 部分唯一索引一致）。
         existing = {
             symbol
-            for (symbol,) in session.query(Security.symbol).filter(Security.symbol.in_(symbols)).all()
+            for (symbol,) in session.query(Security.symbol)
+            .filter(Security.symbol.in_(symbols), Security.is_active.is_(True))
+            .all()
         }
 
     missing = [symbol for symbol in symbols if symbol not in existing]
@@ -134,7 +138,7 @@ def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseMan
     logger.info("  跳过(无数据): {}", results_counter["SKIPPED_NO_DATA"])
     logger.info("  错误: {}", results_counter["ERROR"] + results_counter["FATAL_ERROR"])
     logger.info("----------------------")
-    return 0
+    return 1 if results_counter["ERROR"] + results_counter["FATAL_ERROR"] else 0
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -95,7 +95,7 @@ def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseMan
     logger.info("  错误: {}", results_counter["ERROR"] + results_counter["FATAL_ERROR"])
     logger.info("  写入 symbol history 行数: {}", total_rows)
     logger.info("------------------------------")
-    return 0
+    return 1 if results_counter["ERROR"] + results_counter["FATAL_ERROR"] else 0
 
 
 def main(argv: list[str] | None = None) -> int:

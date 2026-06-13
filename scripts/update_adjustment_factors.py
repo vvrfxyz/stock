@@ -6,7 +6,7 @@ import sys
 import time
 from bisect import bisect_left
 from collections import Counter
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, localcontext
 
 from loguru import logger
@@ -49,7 +49,14 @@ def create_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("symbols", nargs="*", help="要处理的股票代码列表。")
-    parser.add_argument("--all", action="store_true", help="处理所有活跃 CS/ETF。")
+    parser.add_argument("--all", action="store_true", help="处理所有保留类型 CS/ETF（含 inactive，用于避免退市股因子缺口）。")
+    parser.add_argument(
+        "--changed-since",
+        type=int,
+        default=0,
+        help="只重建最近 N 天 corporate_actions(分红/拆股)内容有新增或修订的证券（增量重建，"
+             "配合每日调度避免全量 churn；按事件 updated_at 判定，非 securities 水位线）。",
+    )
     parser.add_argument("--market", type=str, default="US", help="当前仅支持 US。")
     parser.add_argument("--source", type=str, default="MASSIVE", help="公司行动/供应商因子来源。")
     parser.add_argument("--limit", type=int, default=0, help="限制处理数量。")
@@ -337,10 +344,24 @@ def get_securities_to_update(db_manager: DatabaseManager, args: argparse.Namespa
         query = session.query(Security).filter(
             func.upper(Security.market) == enforce_us_market(args.market),
             func.upper(Security.type).in_(ALLOWED_US_SECURITY_TYPES),
-            Security.is_active == True,
         )
         if args.symbols:
             query = query.filter(Security.symbol.in_([item.lower() for item in args.symbols]))
+        if getattr(args, "changed_since", 0) and not args.symbols:
+            # 增量重建：只取最近 N 天 corporate_actions 内容真正变化过的证券，避免每日全量
+            # DELETE+INSERT churn。注意不能用 securities.actions_last_updated_at——该水位线
+            # 每次 actions 拉取都会被刷新（即便无新事件），整张表会每天全量命中。
+            cutoff = datetime.now() - timedelta(days=args.changed_since)
+            changed_subq = (
+                session.query(CorporateAction.security_id)
+                .filter(
+                    func.upper(CorporateAction.source) == args.source.upper(),
+                    CorporateAction.action_type.in_(["DIVIDEND", "SPLIT"]),
+                    CorporateAction.updated_at >= cutoff,
+                )
+                .distinct()
+            )
+            query = query.filter(Security.id.in_(changed_subq))
         query = query.order_by(Security.symbol.asc())
         if args.limit > 0:
             query = query.limit(args.limit)

@@ -63,14 +63,13 @@ class TestDetailsRun:
         assert details.run(details.create_parser().parse_args([]), source, db) == 0
         db.upsert_security_info.assert_not_called()
 
-    def test_process_error_does_not_fail_run(self, monkeypatch):
+    def test_process_error_returns_one(self, monkeypatch):
         monkeypatch.setattr(details, "ensure_missing_symbols_exist", lambda db, src, syms: 0)
         monkeypatch.setattr(details, "get_securities_to_update", lambda db, args: [_security()])
         source, db = Mock(), Mock()
         source.get_security_info.side_effect = RuntimeError("api down")
 
-        # 单 symbol 失败计入 ERROR 统计，但 details 整体退出码保持 0（与原行为一致）
-        assert details.run(details.create_parser().parse_args([]), source, db) == 0
+        assert details.run(details.create_parser().parse_args([]), source, db) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +146,7 @@ class TestActionsRun:
         assert factor_rows[0]["factor_key"] == "dividend:d1"
         db.update_security_timestamp.assert_called_once_with(1, "actions_last_updated_at")
 
-    def test_db_error_counts_but_run_returns_zero(self, monkeypatch):
+    def test_db_error_counts_and_run_returns_one(self, monkeypatch):
         monkeypatch.setattr(actions, "get_last_completed_trading_date", lambda market: END_DATE)
         monkeypatch.setattr(actions, "get_securities_to_update", lambda db, args: [_security()])
         source, db = Mock(), Mock()
@@ -155,7 +154,7 @@ class TestActionsRun:
         source.get_splits_batch.return_value = []
         db.upsert_vendor_adjustment_factors.side_effect = RuntimeError("db down")
 
-        assert actions.run(actions.create_parser().parse_args([]), source, db) == 0
+        assert actions.run(actions.create_parser().parse_args([]), source, db) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +186,17 @@ class TestEventsRun:
         ]
         db.update_security_timestamp.assert_called_once_with(1, "events_last_updated_at")
 
+    def test_process_error_returns_one(self, monkeypatch):
+        monkeypatch.setattr(events, "get_securities_to_update", lambda db, args: [_security()])
+        source, db = Mock(), Mock()
+        source.get_ticker_events.side_effect = RuntimeError("api down")
+
+        assert events.run(events.create_parser().parse_args([]), source, db) == 1
+
 
 # ---------------------------------------------------------------------------
 # short data
 # ---------------------------------------------------------------------------
-
 class TestShortDataRun:
     def test_happy_path_returns_zero(self, monkeypatch):
         sec = _security()
