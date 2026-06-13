@@ -53,7 +53,9 @@ STOCK_BACKUP_DIR=/data/stock_backups STOCK_BACKUP_RETENTION_DAYS=30 scripts/back
 ```
 
 - 默认 `STOCK_BACKUP_MODE=docker`，读 `.env` 的 `POSTGRES_USER`/`POSTGRES_DB`，容器名可用
-  `STOCK_PG_CONTAINER` 覆盖（默认 `stock-postgres`）。
+  `STOCK_PG_CONTAINER` 覆盖（默认 `stock-postgres`）。运行用户若不在 docker 组但有免密
+  `sudo docker`（253 即如此），`STOCK_DOCKER_SUDO=auto`（默认）会自动回退到 `sudo -n docker`；
+  可用 `STOCK_DOCKER_SUDO=1/0` 显式强制。
 - 设 `STOCK_BACKUP_MODE=host` 改用宿主机 `pg_dump` + `DATABASE_URL`（需自行装 postgresql-client）。
 - dump 产出空文件会直接报错退出，systemd unit 已挂 `OnFailure=stock-notify-failure@%n`，
   备份失败会走告警链而非静默。
