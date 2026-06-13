@@ -78,8 +78,12 @@ def _next_open_after(value: pd.Timestamp) -> pd.Timestamp:
 def _event_visible_at(accepted_at, filing_date) -> pd.Timestamp:
     """EDGAR 受理时刻 -> 可用于事件研究的 PIT 可见时刻。"""
     if pd.isna(accepted_at):
-        visible_date = pd.Timestamp(filing_date).date() + timedelta(days=1)
-        return pd.Timestamp.combine(visible_date, _OPEN_TIME).tz_localize(_ET).tz_convert("UTC")
+        # 无 accepted_at 时按 filing_date+1 起算,仍要经 _next_open_after 走 weekday + 收盘后跳天逻辑,
+        # 否则周五 filing 会落到周六导致 relative_day=0 含义跟非 NULL 分支不一致。
+        fallback = pd.Timestamp.combine(
+            pd.Timestamp(filing_date).date() + timedelta(days=1), _OPEN_TIME
+        ).tz_localize(_ET)
+        return _next_open_after(fallback)
 
     accepted = pd.Timestamp(accepted_at)
     if accepted.tzinfo is None:

@@ -99,6 +99,13 @@ def test_visibility_nan_accepted_at_uses_filing_date_next_open():
     assert visible == pd.Timestamp("2026-06-11 13:30:00Z")
 
 
+def test_visibility_null_accepted_at_on_friday_skips_to_monday():
+    # filing_date = 周五 (2026-06-12);+1 天落在周六 → 必须 skip 到周一开盘,
+    # 否则 relative_day=0 的含义跟非 NULL 分支不一致(那条分支已正确处理周末)。
+    visible = _event_visible_at(None, date(2026, 6, 12))
+    assert visible == pd.Timestamp("2026-06-15 13:30:00Z")
+
+
 def test_attach_event_to_returns_relative_day_zero_is_visible_day():
     events = pd.DataFrame([_event("a1", 1, "2026-06-10 21:00:00Z")])
     attached = attach_event_to_returns(events, _returns(), window=(-1, 1))
