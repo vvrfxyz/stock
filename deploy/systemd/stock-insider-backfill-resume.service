@@ -1,0 +1,14 @@
+[Unit]
+Description=Resume Stock insider backfill after Sunday scheduled_update finishes
+ConditionPathExists=/home/wenruifeng/projects/stock/scripts/insider_backfill_resume.sh
+
+[Service]
+Type=oneshot
+User=wenruifeng
+Group=wenruifeng
+WorkingDirectory=/home/wenruifeng/projects/stock
+# 脚本内部 sleep 60 等 scheduled_update 结束(最多 4h),给 systemd 5h 余量
+TimeoutStartSec=5h
+ExecStart=/home/wenruifeng/projects/stock/scripts/insider_backfill_resume.sh
+StandardOutput=journal
+StandardError=journal

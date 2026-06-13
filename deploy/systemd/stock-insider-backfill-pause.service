@@ -1,0 +1,12 @@
+[Unit]
+Description=Pause Stock insider backfill during Sunday SEC scheduled_update window
+ConditionPathExists=/home/wenruifeng/projects/stock/scripts/insider_backfill_pause.sh
+
+[Service]
+Type=oneshot
+User=wenruifeng
+Group=wenruifeng
+WorkingDirectory=/home/wenruifeng/projects/stock
+ExecStart=/home/wenruifeng/projects/stock/scripts/insider_backfill_pause.sh
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,12 @@
+[Unit]
+Description=Resume insider backfill timer (poll-based, fires after pause + 30min)
+
+[Timer]
+# 在 pause 之后 30 分钟启动 resume,它内部 polling 等 scheduled_update 真退出再 CONT。
+# 实际 scheduled_update 1-2 小时跑完,resume 脚本会等到那时再发 CONT。
+OnCalendar=Sun *-*-* 02:25:00 UTC
+Persistent=false
+Unit=stock-insider-backfill-resume.service
+
+[Install]
+WantedBy=timers.target

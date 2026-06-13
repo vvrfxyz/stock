@@ -1,0 +1,10 @@
+[Unit]
+Description=Sunday 01:55 UTC pause of insider backfill (before stock-daily-run at 02:00 UTC)
+
+[Timer]
+OnCalendar=Sun *-*-* 01:55:00 UTC
+Persistent=false
+Unit=stock-insider-backfill-pause.service
+
+[Install]
+WantedBy=timers.target
