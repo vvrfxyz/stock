@@ -12,7 +12,7 @@ from data_models.models import (
     ShortVolume,
 )
 
-from .helpers import _clean_for_model, _normalize_batch_rows
+from .helpers import _clean_for_model, _dedupe_rows_by_key, _normalize_batch_rows
 
 
 class MarketDataMixin:
@@ -24,6 +24,7 @@ class MarketDataMixin:
         if not price_data:
             return 0
 
+        price_data = _dedupe_rows_by_key(price_data, ['security_id', 'date'])
         stmt = pg_insert(DailyPrice).values(price_data)
         # 动态构建更新集
         update_keys = set().union(*(row.keys() for row in price_data))
@@ -80,12 +81,19 @@ class MarketDataMixin:
         if not rows:
             return 0
 
+        rows = _dedupe_rows_by_key(rows, ['security_id', 'filing_date', 'source'])
+
         stmt = pg_insert(HistoricalShare).values(rows)
         update_keys = set().union(*(row.keys() for row in rows))
         update_columns = {}
         if 'total_shares' in update_keys: update_columns['total_shares'] = stmt.excluded.total_shares
-        if 'float_shares' in update_keys: update_columns['float_shares'] = stmt.excluded.float_shares
-        if 'free_float_percent' in update_keys: update_columns['free_float_percent'] = stmt.excluded.free_float_percent
+        if 'float_shares' in update_keys:
+            update_columns['float_shares'] = func.coalesce(stmt.excluded.float_shares, HistoricalShare.float_shares)
+        if 'free_float_percent' in update_keys:
+            update_columns['free_float_percent'] = func.coalesce(
+                stmt.excluded.free_float_percent,
+                HistoricalShare.free_float_percent,
+            )
         if 'period_end_date' in update_keys: update_columns['period_end_date'] = stmt.excluded.period_end_date
 
         if not update_columns:
@@ -112,6 +120,8 @@ class MarketDataMixin:
         if not rows:
             return 0
 
+        rows = _dedupe_rows_by_key(rows, ['security_id', 'effective_date', 'source'])
+
         stmt = pg_insert(HistoricalFloat).values(rows)
         update_columns = {
             'free_float': stmt.excluded.free_float,
@@ -133,6 +143,8 @@ class MarketDataMixin:
         rows = [row for row in rows if row.get('security_id') and row.get('settlement_date') and row.get('short_interest') is not None]
         if not rows:
             return 0
+
+        rows = _dedupe_rows_by_key(rows, ['security_id', 'settlement_date', 'source'])
 
         stmt = pg_insert(ShortInterest).values(rows)
         update_columns = {
@@ -157,6 +169,8 @@ class MarketDataMixin:
         rows = [row for row in rows if row.get('security_id') and row.get('date') and row.get('short_volume') is not None]
         if not rows:
             return 0
+
+        rows = _dedupe_rows_by_key(rows, ['security_id', 'date', 'source'])
 
         stmt = pg_insert(ShortVolume).values(rows)
         update_keys = set().union(*(row.keys() for row in rows))

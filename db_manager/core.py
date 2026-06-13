@@ -7,7 +7,7 @@ from loguru import logger
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from .helpers import _build_upsert_statement
+from .helpers import _build_upsert_statement, _dedupe_rows_by_key
 
 load_dotenv()
 
@@ -95,6 +95,8 @@ class DatabaseManagerCore:
         """通用批量插入/忽略冲突的方法"""
         if not data_list:
             return 0
+
+        data_list = _dedupe_rows_by_key(data_list, index_elements)
 
         stmt = _build_upsert_statement(
             model,

@@ -1,5 +1,5 @@
 """身份映射、symbol 历史、SEC filing/XBRL 事实与新闻的写入。"""
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from data_models.models import (
@@ -14,7 +14,7 @@ from data_models.models import (
     SecuritySymbolHistory,
 )
 
-from .helpers import ACTION_SOURCE_MASSIVE, _clean_for_model, _group_rows_by_key_set
+from .helpers import ACTION_SOURCE_MASSIVE, _clean_for_model, _dedupe_rows_by_key, _group_rows_by_key_set
 
 
 class ReferenceDataMixin:
@@ -56,7 +56,12 @@ class ReferenceDataMixin:
         if not rows:
             return 0
 
+        rows = _dedupe_rows_by_key(rows, ["security_id", "id_type", "id_value", "source"])
+
         with self.engine.connect() as conn:
+            # 唯一约束含 start_date(NULL) 无法保护“当前快照”身份行；用事务级 advisory
+            # lock 串行化 check-then-insert，避免并发回填重复写入同一身份映射。
+            conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"), {"lock_key": "security-identifiers:insert-missing"})
             existing = {
                 (r.security_id, r.id_type, r.id_value, r.source)
                 for r in conn.execute(

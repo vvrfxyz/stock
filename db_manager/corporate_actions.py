@@ -9,7 +9,7 @@ from data_models.models import (
     VendorAdjustmentFactor,
 )
 
-from .helpers import ACTION_SOURCE_MASSIVE, _clean_for_model, _format_action_decimal
+from .helpers import ACTION_SOURCE_MASSIVE, _clean_for_model, _dedupe_rows_by_key, _format_action_decimal
 
 
 class CorporateActionsMixin:
@@ -139,19 +139,40 @@ class CorporateActionsMixin:
 
         stmt = text(
             f"""
+            WITH action_counts AS (
+                SELECT
+                    security_id,
+                    action_type,
+                    ex_date,
+                    upper(source) AS source_key,
+                    count(*) FILTER (WHERE source_event_id LIKE :synthetic_prefix) AS synthetic_count,
+                    count(*) FILTER (WHERE source_event_id NOT LIKE :synthetic_prefix) AS real_count
+                FROM corporate_actions
+                WHERE security_id = :security_id
+                  AND action_type = :action_type
+                  AND upper(source) = upper(:source)
+                GROUP BY security_id, action_type, ex_date, upper(source)
+            )
             DELETE FROM corporate_actions AS synthetic
-            USING corporate_actions AS real
+            USING corporate_actions AS real, action_counts AS counts
             WHERE synthetic.security_id = :security_id
               AND real.security_id = synthetic.security_id
+              AND counts.security_id = synthetic.security_id
               AND synthetic.id <> real.id
               AND synthetic.action_type = :action_type
               AND real.action_type = synthetic.action_type
+              AND counts.action_type = synthetic.action_type
               AND synthetic.ex_date = real.ex_date
+              AND counts.ex_date = synthetic.ex_date
               AND upper(synthetic.source) = upper(:source)
               AND upper(real.source) = upper(synthetic.source)
+              AND counts.source_key = upper(synthetic.source)
               AND synthetic.source_event_id LIKE :synthetic_prefix
               AND real.source_event_id NOT LIKE :synthetic_prefix
-              AND {matching_predicate}
+              AND (
+                ({matching_predicate})
+                OR (counts.synthetic_count = 1 AND counts.real_count = 1)
+              )
             """
         )
         with self.engine.connect() as conn:
@@ -181,6 +202,8 @@ class CorporateActionsMixin:
         ]
         if not rows:
             return 0
+
+        rows = _dedupe_rows_by_key(rows, ['security_id', 'source', 'factor_key'])
 
         stmt = pg_insert(VendorAdjustmentFactor).values(rows)
         update_keys = set().union(*(row.keys() for row in rows))
@@ -237,6 +260,8 @@ class CorporateActionsMixin:
             if not rows:
                 conn.commit()
                 return 0
+
+            rows = _dedupe_rows_by_key(rows, ['security_id', 'methodology_version', 'factor_key'])
 
             self._lock_model_sequence_sync(conn, ComputedAdjustmentFactor)
             self._sync_model_id_sequence(conn, ComputedAdjustmentFactor)

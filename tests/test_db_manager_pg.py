@@ -116,6 +116,28 @@ class TestUpsertSecuritiesBySymbol:
         stamp = _scalar(pg_db, "SELECT info_last_updated_at FROM securities WHERE id=1")
         assert stamp.year >= 2026
 
+    def test_symbol_conflict_with_different_identity_is_not_merged(self, pg_db):
+        _insert_security(pg_db, 1, "abcd", name="Old Co", composite_figi="BBGOLD", cik="0000000001")
+
+        written = pg_db.upsert_securities_by_symbol(
+            [{"symbol": "abcd", "market": "US", "type": "CS", "name": "New Co", "composite_figi": "BBGNEW", "cik": "0000000002"}]
+        )
+
+        assert written == 0
+        assert _scalar(pg_db, "SELECT name FROM securities WHERE symbol='abcd'") == "Old Co"
+        assert _scalar(pg_db, "SELECT composite_figi FROM securities WHERE symbol='abcd'") == "BBGOLD"
+
+    def test_inactive_symbol_can_be_reused_for_new_identity(self, pg_db):
+        _insert_security(pg_db, 1, "abcd", name="Old Co", composite_figi="BBGOLD", cik="0000000001", is_active=False)
+
+        written = pg_db.upsert_securities_by_symbol(
+            [{"symbol": "abcd", "market": "US", "type": "CS", "name": "New Co", "composite_figi": "BBGNEW", "cik": "0000000002"}]
+        )
+
+        assert written == 1
+        assert _scalar(pg_db, "SELECT count(*) FROM securities WHERE symbol='abcd'") == 2
+        assert _scalar(pg_db, "SELECT name FROM securities WHERE symbol='abcd' AND is_active IS TRUE") == "New Co"
+
     def test_sequence_synced_after_manual_id_insert(self, pg_db):
         # 手工导库（显式 id=100）后序列落后；批量 upsert 必须自动追平，不撞 pkey
         _insert_security(pg_db, 100, "aapl")
@@ -173,6 +195,14 @@ class TestCorporateActions:
         pg_db.upsert_dividends(1, [dict(self.DIV)])
         assert _scalar(pg_db, "SELECT count(*) FROM corporate_actions") == 1
 
+    def test_dividend_batch_duplicate_source_event_last_row_wins(self, pg_db):
+        _insert_security(pg_db)
+        first = dict(self.DIV)
+        second = {**self.DIV, "cash_amount": Decimal("0.30")}
+        pg_db.upsert_dividends(1, [first, second])
+        assert _scalar(pg_db, "SELECT count(*) FROM corporate_actions") == 1
+        assert _scalar(pg_db, "SELECT cash_amount FROM corporate_actions") == Decimal("0.3000000000")
+
     def test_dividend_missing_required_fields_skipped(self, pg_db):
         _insert_security(pg_db)
         inserted = pg_db.upsert_dividends(1, [{"cash_amount": Decimal("1"), "currency": "USD"}])  # 无 ex_date
@@ -199,12 +229,14 @@ class TestCorporateActions:
         assert _scalar(pg_db, "SELECT count(*) FROM corporate_actions") == 1
         assert _scalar(pg_db, "SELECT source_event_id FROM corporate_actions") == "ev-split-1"
 
-    def test_synthetic_cleanup_keeps_different_amounts(self, pg_db):
-        """金额不同的合成行不是重复，不能被误删。"""
+    def test_synthetic_dividend_replaced_by_real_vendor_event_even_if_amount_revised(self, pg_db):
+        """vendor 补发真实 ID 时金额可能修订；单笔 synthetic+real 仍视为同一经济事件。"""
         _insert_security(pg_db)
         pg_db.upsert_dividends(1, [{"ex_dividend_date": date(2026, 5, 11), "cash_amount": Decimal("0.50"), "currency": "USD"}])
-        pg_db.upsert_dividends(1, [dict(self.DIV)])  # 真实事件, 金额 0.27
-        assert _scalar(pg_db, "SELECT count(*) FROM corporate_actions") == 2
+        pg_db.upsert_dividends(1, [dict(self.DIV)])  # 真实事件, 金额修订为 0.27
+        assert _scalar(pg_db, "SELECT count(*) FROM corporate_actions") == 1
+        assert _scalar(pg_db, "SELECT source_event_id FROM corporate_actions") == "ev-div-1"
+        assert _scalar(pg_db, "SELECT cash_amount FROM corporate_actions") == Decimal("0.2700000000")
 
 
 class TestAdjustmentFactors:
@@ -265,6 +297,14 @@ class TestDailyPrices:
         assert _scalar(pg_db, "SELECT count(*) FROM daily_prices") == 1
         assert _scalar(pg_db, "SELECT close FROM daily_prices") == Decimal("3.000000")
 
+    def test_batch_duplicate_price_key_last_row_wins(self, pg_db):
+        _insert_security(pg_db)
+        row = {"security_id": 1, "date": date(2026, 6, 10), "close": 2, "volume": 100}
+        pg_db.upsert_daily_prices([row, {**row, "close": 3, "volume": 200}])
+        assert _scalar(pg_db, "SELECT count(*) FROM daily_prices") == 1
+        assert _scalar(pg_db, "SELECT close FROM daily_prices") == Decimal("3.000000")
+        assert _scalar(pg_db, "SELECT volume FROM daily_prices") == 200
+
     def test_partial_row_does_not_null_other_columns(self, pg_db):
         """open_close_summary 只回填盘前/盘后字段时，不能把 OHLCV 抹掉。"""
         _insert_security(pg_db)
@@ -299,6 +339,18 @@ class TestHistoricalSharesAndFloats:
         assert _scalar(pg_db, "SELECT count(*) FROM historical_shares") == 1
         assert _scalar(pg_db, "SELECT total_shares FROM historical_shares") == 1100
         assert _scalar(pg_db, "SELECT float_shares FROM historical_shares") == 900
+
+    def test_upsert_shares_does_not_overwrite_float_with_null(self, pg_db):
+        _insert_security(pg_db)
+        row = {
+            "security_id": 1, "filing_date": date(2026, 3, 31), "period_end_date": date(2026, 3, 31),
+            "total_shares": 1000, "float_shares": 800, "free_float_percent": Decimal("80"), "source": "MASSIVE",
+        }
+        pg_db.upsert_historical_shares([row])
+        pg_db.upsert_historical_shares([{**row, "total_shares": 1100, "float_shares": None, "free_float_percent": None}])
+        assert _scalar(pg_db, "SELECT total_shares FROM historical_shares") == 1100
+        assert _scalar(pg_db, "SELECT float_shares FROM historical_shares") == 800
+        assert _scalar(pg_db, "SELECT free_float_percent FROM historical_shares") == Decimal("80.0000")
 
     def test_upsert_shares_skips_incomplete_rows(self, pg_db):
         _insert_security(pg_db)
@@ -364,6 +416,12 @@ class TestSecurityIdentifiers:
         row = {"security_id": 1, "id_type": "CIK", "id_value": "0000320193", "source": "SEC"}
         assert pg_db.insert_missing_security_identifiers([row]) == 1
         assert pg_db.insert_missing_security_identifiers([row]) == 0
+        assert _scalar(pg_db, "SELECT count(*) FROM security_identifiers") == 1
+
+    def test_batch_duplicate_identifier_inserted_once(self, pg_db):
+        _insert_security(pg_db)
+        row = {"security_id": 1, "id_type": "CIK", "id_value": "0000320193", "source": "SEC"}
+        assert pg_db.insert_missing_security_identifiers([row, dict(row)]) == 1
         assert _scalar(pg_db, "SELECT count(*) FROM security_identifiers") == 1
 
 

@@ -28,6 +28,18 @@ def _normalize_batch_rows(model, rows: list[dict]) -> list[dict]:
     return [{key: row.get(key) for key in all_keys} for row in cleaned_rows]
 
 
+def _dedupe_rows_by_key(rows: list[dict], key_columns: list[str]) -> list[dict]:
+    """批内按冲突键去重，避免 PostgreSQL ON CONFLICT 同语句 CardinalityViolation。
+
+    后出现的行胜出，符合“同一批里更靠后的 vendor 修订覆盖前值”的直觉。
+    调用方应先过滤掉缺少冲突键的行。
+    """
+    deduped: dict[tuple, dict] = {}
+    for row in rows:
+        deduped[tuple(row.get(column) for column in key_columns)] = row
+    return list(deduped.values())
+
+
 def _group_rows_by_key_set(rows: list[dict]) -> list[list[dict]]:
     """
     多行 VALUES 插入要求所有 dict 键集一致，否则 SQLAlchemy 直接 CompileError。
