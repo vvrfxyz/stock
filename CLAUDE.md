@@ -141,3 +141,31 @@ python -m pytest tests/ -q -m "not integration"  # 仅纯单元测试
 - Script entrypoints are `main(argv: list[str] | None = None)` parsing via `parse_args(argv)` and returning an int exit code (0/1); `__main__` uses `raise SystemExit(main())`. `main.py` invokes scripts in-process by passing the argv list — never mutate `sys.argv`. `scheduled_update` isolates step failures and exits non-zero if any step failed.
 - `update_massive_*` scripts build on `utils/massive_task.py` (`run_massive_task` + `select_us_securities` + `run_concurrently`); keep per-script code to parser extras, selection filters, and `process_*` logic.
 - Multi-row `pg_insert().values()` requires homogeneous dict keys; group heterogeneous rows with `_group_rows_by_key_set` (see `upsert_securities_by_symbol`).
+
+## Sub-repo / Explore / Team safety rule
+
+当当前 cwd 不在 git 仓库内，或准备使用 Explore、Agent、team /task 工作流时，必须先校验运行前提，禁止在已知前提不满足时重复重试。
+
+规则：
+
+- 如果当前目录不是 git 仓库，不要直接重复调用需要 worktree isolation 的 Explore / Agent。
+- 先定位目标项目目录，并检查该目录是否为 git 仓库。
+- 如果目标子目录是 git 仓库：
+  - 不要假设可以在父目录直接稳定使用 worktree isolation。
+  - 如果必须继续使用子代理，直接切到那个目标子仓库目录后再继续。
+  - 在无法切换到目标目录前，只允许使用 Glob / Grep / Read 做只读调研。
+- 同一个前提错误如果已经出现一次，不得继续用同样方式重试。
+- 包括但不限于：
+  - `Cannot create agent worktree: not in a git repository and no WorktreeCreate hooks are configured`
+  - `Team "team" does not exist. Call spawnTeam first to create the team.`
+- 在使用 team /task/ Explore 的 team 模式前，必须先确认目标 team 当前存在。
+- 不要假设名为 team 的默认 team 一定存在。
+- 如果 team 不存在：
+  - 不要继续用同一个 team 名重试。
+  - 如果任务只是普通探索，直接退回非 team 模式。
+  - 只有在确实需要协作拆分任务时，才重新创建 team。
+- 上下文压缩后，如果无法确认 team 是否仍存在，默认按 “不存在” 处理，先不要使用 team 模式。
+- 对于普通代码探索，优先级如下：
+  1. 明确搜索：Grep / Glob / Read
+  2. 开放式探索：非 team 的 Explore
+  3. 只有在确实需要多人协作或任务拆分时，才使用 team

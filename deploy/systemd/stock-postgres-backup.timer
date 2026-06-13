@@ -1,0 +1,10 @@
+[Unit]
+Description=Stock PostgreSQL nightly backup timer
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+Unit=stock-postgres-backup.service
+
+[Install]
+WantedBy=timers.target

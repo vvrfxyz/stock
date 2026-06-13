@@ -38,4 +38,12 @@ timestamp() {
   "$PYTHON_BIN" main.py scheduled_update --market "$MARKET"
 
   echo "[$(timestamp)] scheduled_update success"
+
+  if [[ -n "${STOCK_HEALTHCHECK_URL:-}" ]]; then
+    if /usr/bin/curl -fsS --max-time 10 --retry 3 "$STOCK_HEALTHCHECK_URL" >/dev/null; then
+      echo "[$(timestamp)] healthcheck ping sent"
+    else
+      echo "[$(timestamp)] WARNING: healthcheck ping failed"
+    fi
+  fi
 } 9>"$LOCK_FILE" >> "$LOG_FILE" 2>&1
