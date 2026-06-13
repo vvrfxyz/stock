@@ -117,7 +117,12 @@ def load_industry_panel(
     security_ids: list[int] | None = None,
 ) -> pd.DataFrame:
     """从 securities 读取当前 SIC 并映射 FF12 长表。"""
-    id_clause = "where id = any(:security_ids)" if security_ids else ""
+    if security_ids is not None and not security_ids:
+        # 显式空列表 -> 空结果(不打 DB);用 None 才表示"不过滤,取所有"
+        return pd.DataFrame(
+            columns=["security_id", "sic_code", "ff12", "ff12_coverage_reason"]
+        ).astype({"security_id": "int64"})
+    id_clause = "where id = any(:security_ids)" if security_ids is not None else ""
     sql = text(
         f"""
         select id as security_id, sic_code, type, is_active
@@ -126,7 +131,7 @@ def load_industry_panel(
         order by id
         """
     )
-    params = {"security_ids": security_ids} if security_ids else None
+    params = {"security_ids": security_ids} if security_ids is not None else None
     panel = pd.read_sql_query(sql, engine, params=params)
     panel["ff12"] = [sic_to_ff12(value) for value in panel["sic_code"]]
     panel["ff12_coverage_reason"] = [

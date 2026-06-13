@@ -147,6 +147,18 @@ def test_load_industry_panel_filters_security_ids(pg_db):
 
 
 @pytest.mark.integration
+def test_load_industry_panel_empty_security_ids_returns_empty(pg_db):
+    # 显式空列表必须返回空 panel,而不是"忽略过滤"取全表(Python truthiness 陷阱)。
+    _insert_security(pg_db, 1, "aapl", "2010")
+    _insert_security(pg_db, 2, "bank", "6020")
+
+    panel = load_industry_panel(pg_db.engine, security_ids=[])
+
+    assert panel.empty
+    assert list(panel.columns) == ["security_id", "sic_code", "ff12", "ff12_coverage_reason"]
+
+
+@pytest.mark.integration
 def test_coverage_report_against_production_like_panel(pg_db):
     sics = ["2010"] * 70 + ["6020"] * 20 + [None] * 5 + ["99999"] * 5
     for idx, sic_code in enumerate(sics, start=1):
