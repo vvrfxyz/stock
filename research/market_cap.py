@@ -6,6 +6,8 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from research.factors.asof import event_table_to_asof_panel
+
 _SHARES_COLUMNS = ["security_id", "visible_date", "period_end_date", "total_shares"]
 
 
@@ -127,32 +129,16 @@ def compute_market_cap_panel(
     if len(dates) == 0 or len(security_ids) == 0:
         return pd.DataFrame(index=dates, columns=security_ids, dtype=np.float64)
 
-    shares = pd.DataFrame(np.nan, index=dates, columns=security_ids, dtype=np.float64)
-    if not ev.empty:
-        ev["effective_visible_date"] = ev["visible_date"] + pd.Timedelta(days=visible_delay_days)
-        grid = pd.DataFrame(
-            {
-                "date": np.repeat(dates.to_numpy(), len(security_ids)),
-                "security_id": np.tile(security_ids.to_numpy(), len(dates)),
-            }
-        )
-        joined = pd.merge_asof(
-            grid.sort_values("date"),
-            ev.sort_values(
-                ["effective_visible_date", "period_end_date"], kind="mergesort"
-            ),
-            left_on="date",
-            right_on="effective_visible_date",
-            by="security_id",
-            direction="backward",
-        )
-        stale = joined["effective_visible_date"] < joined["date"] - pd.Timedelta(
-            days=max_staleness_days
-        )
-        joined.loc[stale, "total_shares"] = np.nan
-        shares = joined.pivot_table(
-            index="date", columns="security_id", values="total_shares", aggfunc="last"
-        ).reindex(index=dates, columns=security_ids)
+    shares = event_table_to_asof_panel(
+        ev,
+        dates=dates,
+        value_column="total_shares",
+        visible_date_column="visible_date",
+        staleness_anchor_column="visible_date",
+        visible_delay_days=visible_delay_days,
+        max_staleness_days=max_staleness_days,
+        security_universe=security_ids,
+    )
 
     return (prices * shares).astype(np.float64)
 

@@ -34,6 +34,8 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from research.factors.asof import event_table_to_asof_panel
+
 
 @dataclass(frozen=True)
 class MetricSpec:
@@ -417,33 +419,19 @@ def asof_panel(
     覆盖旧值）；默认后移一天，避免 filed_date 当日盘后 EDGAR 申报被 t 日收盘建仓提前看到。
     period_end 落后 date 超过 max_staleness_days 的值视为停止披露，置 NaN。
     """
-    dates = pd.DatetimeIndex(sorted(pd.to_datetime(dates))).astype("datetime64[ns]")
+    dates = pd.DatetimeIndex(pd.to_datetime(dates)).astype("datetime64[ns]")
     panels: dict[str, pd.DataFrame] = {}
-    staleness = pd.Timedelta(days=max_staleness_days)
-    visible_delay = pd.Timedelta(days=visible_delay_days)
     for metric, ev in events.groupby("metric"):
         ev = _to_ns(ev.copy(), ("period_end", "visible_date"))
-        ev["effective_visible_date"] = ev["visible_date"] + visible_delay
-        secs = ev["security_id"].unique()
-        grid = pd.DataFrame(
-            {
-                "date": np.repeat(dates.to_numpy(), len(secs)),
-                "security_id": np.tile(secs, len(dates)),
-            }
+        panels[metric] = event_table_to_asof_panel(
+            ev,
+            dates=dates,
+            value_column="value",
+            visible_date_column="visible_date",
+            staleness_anchor_column="period_end",
+            visible_delay_days=visible_delay_days,
+            max_staleness_days=max_staleness_days,
         )
-        joined = pd.merge_asof(
-            grid.sort_values("date"),
-            ev.sort_values("effective_visible_date"),
-            left_on="date",
-            right_on="effective_visible_date",
-            by="security_id",
-            direction="backward",
-        )
-        stale = joined["period_end"] < joined["date"] - staleness
-        joined.loc[stale, "value"] = np.nan
-        panels[metric] = joined.pivot_table(
-            index="date", columns="security_id", values="value", aggfunc="last"
-        ).reindex(dates)
     return panels
 
 
