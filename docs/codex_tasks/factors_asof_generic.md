@@ -70,7 +70,7 @@ def event_table_to_asof_panel(
 **算法**:
 
 1. dates 标准化到 datetime64[ns]
-2. events 过滤掉缺 `security_id` / `visible_date_column` / `value_column` 的行
+2. events 过滤掉缺 `security_id` / `visible_date_column` / `value_column` 的行。**此外**:若 `staleness_anchor_column != visible_date_column` 且 `max_staleness_days is not None`,**同时过滤 `staleness_anchor_column` 为 NaT 的行** — 因为 `pandas NaT < timestamp` 返回 False,陈旧值会静默绕过步骤 7 的 staleness 过滤。当前两个 caller (fundamentals SQL 硬过滤 period_end / market_cap anchor=visible_date 退化为同列)均不受影响,此条是 hygiene 性契约澄清。
 3. `effective_visible_date = visible_date_column + Timedelta(visible_delay_days)`
 4. `security_universe`:
    - 如果用户给了 → 用用户的(int64 + sorted),不在 events 里的 security 那一列全 NaN
@@ -83,13 +83,26 @@ def event_table_to_asof_panel(
 
 **关键不变量**(必须有测试锁):
 
-1. **PIT 不漏 future**: events 里 visible_date=2026-06-10 的行不能影响 date=2026-06-09 的格子
+1. **PIT 不漏 future**: events 里 visible_date=2026-06-10 的行不能影响 date=2026-06-09 的格子(visible_delay_days=0 时;>0 时类推)
 2. **空 events** 不抛错,返回 dates × security_universe 形状的全 NaN panel
 3. **空 dates** 不抛错,返回 0 × security_universe
 4. **security_universe 给了但事件全没有这些 security** → 全 NaN panel,不抛
 5. **staleness=None** → 不做过滤(即"不会因为太老就消失")
-6. **staleness=0** → 任何事件都立刻 stale → 任何不在 visible 当日的格子是 NaN
-7. **同一个 (security_id, visible_date) 有多个事件**(罕见但发生): pivot 用 `aggfunc="last"`,以**输入 events 里出现的顺序**为准。如果调用方要 last-wins 按某个其他列排序,**应该在调用前** sort_values 好
+6. **staleness 精确公式**(anchor-relative,不变量必须按此口径写测试):
+
+   - `staleness=k` (k ≥ 0,整数天) → 对 joined 后每个格子,当 `joined[staleness_anchor_column] < date - Timedelta(days=k)` 时该格 `value=NaN`。
+   - `staleness=0` 退化为 `anchor < date`,即 anchor 等于 date 当日仍保留,严格更早的格子置 NaN。
+   - `staleness=None` 跳过过滤。
+   - **anchor 选型对结果有强烈影响**(测 staleness=0 时务必显式选 anchor):
+     - `anchor=visible_date_column`(market_cap 默认) → 只在"披露当日及之后 staleness 天窗口内"保留;staleness=0 时只在披露当日保留。
+     - `anchor=period_end_column`(fundamentals 默认,period_end 通常远早于 visible_date) → 几乎所有 fundamentals 面板在 staleness=0 时被擦成 NaN,这是预期行为不是 bug。
+
+7. **同 (security_id, effective_visible_date) 多事件的胜出规则**(精确公式):
+
+   - 工具内部按 `events.sort_values(["effective_visible_date", staleness_anchor_column], kind="mergesort")` 排序后调 `pd.merge_asof(direction="backward")`。
+   - 真实的胜出规则是 `merge_asof` 取**右表 `staleness_anchor_column` 最大**的那一条;anchor 相同时退化为输入物理顺序(mergesort 稳定)。
+   - `pivot_table(aggfunc="last")` **不是**同日多事件的去重机制 — 它仅在输入 `dates` 含重复值时参与决策。
+   - 调用方若需要其他 tie-breaker,**应该在调用前** sort_values 好。
 8. **dates 重复值**: 输出 index 必须等于输入 dates(包括重复),pivot+reindex 自然处理
 
 ### `research.factors.asof.attach_event_to_returns` (不做)
@@ -117,6 +130,8 @@ def asof_panel(
 旧的 staleness 行为是**用 `period_end < date - staleness`** (源码 `joined["period_end"] < joined["date"] - staleness`),所以 `staleness_anchor_column="period_end"`。
 visible_delay_days 默认仍是 1(fundamentals 特定)。
 
+**dates 行为差异**: 旧实现入口 `pd.DatetimeIndex(sorted(pd.to_datetime(dates)))` 把 dates 强制排序;新实现遵循 `event_table_to_asof_panel` 的输出契约 "index 完全等于输入,不排序不去重"。现有所有 caller(`load_fundamental_panel` + 全部测试用例)均已传升序 dates,**实测不受影响**;此条仅为消除 Codex 实施时的犹豫:**不要在 wrapper 里再加一次 sorted()** —— 把排序责任交还给调用方。
+
 事件 schema 没变,所有调用方零改动,所有测试零改动,**只是内部 refactor**。
 
 ### `research.market_cap.compute_market_cap_panel`
@@ -141,7 +156,20 @@ def compute_market_cap_panel(
 
 **注意 staleness_anchor_column 是 `"visible_date"`,不是 `"period_end_date"`** — 这跟 fundamentals 不同,因为 market_cap 的现有实现里 staleness 用的是 `effective_visible_date < date - staleness`,不是用 period_end_date。**这是有意的**(shares 的"过期"是基于披露日,不是报告期末日),保留原语义。
 
-测试 `tests/test_research_market_cap.py::test_stale_shares_become_nan` 是这个语义的 lock,refactor 后必须仍然过。
+**`visible_delay_days` 与 anchor 的 staleness 行为差异说明**:
+
+- 老实现 staleness 对比的是 `effective_visible_date`(= visible_date + delay)。
+- 新工具按 spec 用 `staleness_anchor_column="visible_date"`,即 staleness 窗口从**原始**披露日起算。
+- `visible_delay_days=0` 时 `visible_date == effective_visible_date`,**两套实现等价**——当前所有生产 caller (`load_market_cap_panel` / `load_log_market_cap_panel`) 都用 delay=0,所以测试和生产都不会变。
+- `visible_delay_days>0` 时新实现会比老实现**早 `visible_delay_days` 天置 NaN**,这是有意的语义收紧(shares 的"过期"应基于实际披露发生时刻,与 effective delay 是两个独立维度;延后可见≠延后过期)。"行为完全不变" 严格只适用于 `visible_delay_days=0` 的现有 caller。
+
+测试 `tests/test_research_market_cap.py::test_stale_shares_become_nan` 用 `visible_delay_days=0`,是这个语义的 lock,refactor 后必须仍然过。
+
+**`(security_id, visible_date)` 多事件的"取最新报告期"语义**:
+
+老实现按 `sort_values(["effective_visible_date", "period_end_date"], kind="mergesort")` 双键排序,同 visible_date 下多个重述事件被强制按 `period_end_date` 升序物理排列,`merge_asof(backward)` 因此取到 `period_end_date` 最大的一条。新工具按 spec 用 `sort_values(["effective_visible_date", staleness_anchor_column], kind="mergesort")`,而 market_cap 模式下 `staleness_anchor_column == visible_date_column`,两列退化为同序副键,选择**完全依赖输入行的物理顺序**。
+
+生产中 `load_shares_events` 的 SQL `ORDER BY security_id, filing_date, period_end_date` 恰好保证 `period_end_date` 升序在物理后位,与新工具的稳定 mergesort 结合,效果等价于老实现。**重构必须保持 `load_shares_events` 的 ORDER BY 不变**,任何修改会无声破坏此隐式契约。调用方若传入自定义 events,需自行 pre-sort,工具内部不再追加 `period_end_date` 副排序键。
 
 ## 测试
 
@@ -159,9 +187,11 @@ def compute_market_cap_panel(
 8. `test_empty_events_returns_all_nan` — events 空 → 全 NaN panel,不抛
 9. `test_empty_dates_returns_empty` — dates 空 → 0 × universe shape
 10. `test_dates_order_and_duplicates_preserved` — dates 含重复 + 非升序 → 输出 index **不被排序、不被去重**
-11. `test_multiple_events_same_security_same_visible_date_last_wins` — 同 (sec, visible_date) 两行不同 value → aggfunc=last 取最后
+11. `test_multiple_events_same_security_same_effective_visible_date_anchor_max_wins` — 同 (sec, effective_visible_date) 两行不同 `staleness_anchor_column` 值 → `merge_asof(backward)` 取 anchor 最大那一条;anchor 相同时取输入物理顺序最后一条(mergesort 稳定)
 12. `test_nan_values_in_events_filtered` — events 有 value=NaN 的行 → 被过滤,不影响其他行
 13. `test_explicit_staleness_anchor_column` — value_column=total_shares, staleness_anchor=visible_date(market_cap 模式) → 验证行为对
+14. `test_anchor_choice_changes_staleness_behavior` — 同一组 events,staleness=30,anchor 分别选 `visible_date` 和 `period_end`(差距 100 天) → 两种 anchor 给出可区分的 NaN 模式;锁定不变量 6 的 anchor-relative 公式
+15. `test_nat_in_staleness_anchor_filtered_when_distinct_from_visible_date` — events 含一行 anchor=NaT(anchor ≠ visible_date 时),staleness 给定 → 该行在步骤 2 被过滤,**不**因 `NaT < timestamp == False` 静默逃过 staleness 检查
 
 ### 现有测试零改动
 
@@ -185,11 +215,11 @@ python -m pytest tests/test_research_fundamentals.py -q
 # 4. market_cap 仍然全过
 python -m pytest tests/test_research_market_cap.py -q
 
-# 5. 全套无回归 — 至少 278 passed(当前基线)+ 13 新 = 291 passed
+# 5. 全套无回归 — 至少 278 passed(当前基线)+ 15 新 = 293 passed
 python -m pytest tests/ -q
 ```
 
-`tests/test_factors_asof.py` ≥ 13 个测试 passed。`tests/ -q` ≥ 291 passed。**fundamentals 和 market_cap 的现有测试全部 unchanged**。
+`tests/test_factors_asof.py` ≥ 15 个测试 passed。`tests/ -q` ≥ 293 passed(基线 278 + 新 15)。**fundamentals 和 market_cap 的现有测试全部 unchanged**。
 
 ## 反需求 (绝不能做)
 
@@ -200,8 +230,14 @@ python -m pytest tests/ -q
 5. **不要**改任何数据库 schema、alembic、db_manager
 6. **不要**改 `research/__init__.py` 注册 factors 子包(让它自然 import,不用 re-export)
 7. **不要**引入新依赖(pandas/numpy/sqlalchemy 之外)
-8. **不要**加任何"通用 timezone 处理"或"通用 dtype coerce" — 输入 events 已经在调用方 normalize 好了
+8. **不要**加任何"通用 timezone 处理"或"通用 dtype coerce" — 输入 events 已经在**包装层** normalize 好了(见下方"wrapper 层 dtype 归一化责任")
 9. **不要**改 events.py(那是事件研究,不是 as-of)
+
+### wrapper 层 dtype 归一化责任(澄清反需求 8)
+
+`event_table_to_asof_panel` 不做 dtype 校验也不 coerce `visible_date_column` / `staleness_anchor_column` 列(遵守反需求 8)。**但**包装层 `fundamentals.asof_panel` 和 `market_cap.compute_market_cap_panel` **必须保留各自的 `_to_ns(...)` 调用**,把 events 的 `visible_date` / `period_end` / `period_end_date` 列强转为 `datetime64[ns]` 再交给工具。
+
+理由:这两个包装层就是工具的直接调用方,上游 `load_*` 函数从 PostgreSQL 读出的时间列常为 object / date / `datetime64[us]` dtype,直接 `Timedelta` 加法或 `merge_asof` 会静默坏(`merge_asof` 要求两侧 dtype 一致,pandas 3.x 默认推断为 ns 之外的精度会触发 cast)。**反需求 8 的"已在调用方 normalize"指的是包装层这一层,不是 `load_*` 函数。** Codex 不得以 "DRY" 为由删除 `_to_ns` 调用。
 
 ## 实现建议
 
