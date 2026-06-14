@@ -3,11 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar
 
-import numpy as np
 import pandas as pd
 
 from research.factors.protocol import FactorContext, register
-from research.market_cap import load_market_cap_panel
+from research.market_cap import load_log_market_cap_panel
 
 
 @dataclass(frozen=True)
@@ -15,15 +14,12 @@ class SizeFactor:
     name: ClassVar[str] = "size"
 
     def compute(self, ctx: FactorContext) -> pd.DataFrame:
-        mcap = load_market_cap_panel(
+        log_mcap = load_log_market_cap_panel(
             ctx.engine,
             dates=ctx.dates,
             security_ids=ctx.security_universe.tolist(),
         )
-        log_mcap = np.log(mcap.where(mcap > 0))
-        return log_mcap.reindex(index=ctx.dates, columns=ctx.security_universe).astype(
-            np.float64
-        )
+        return log_mcap.reindex(index=ctx.dates, columns=ctx.security_universe)
 
 
 register(SizeFactor())
