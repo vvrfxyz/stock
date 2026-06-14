@@ -101,8 +101,10 @@
 
 | 任务 | 文件 | 状态 |
 |---|---|---|
-| #8a SIC→FF12 行业静态映射 | `industry_ff12_mapping.md` | TODO |
-| #8b PIT 市值面板 | `pit_market_cap_panel.md` | TODO |
-| #9 财报事件日历 | `earnings_event_calendar.md` | TODO |
+| #8a SIC→FF12 行业静态映射 | `industry_ff12_mapping.md` | ✅ Merged (2ca3a82, 2ab377f, e5f0c70) |
+| #8b PIT 市值面板 | `pit_market_cap_panel.md` | ✅ Merged (7b71f13) |
+| #9 财报事件日历 | `earnings_event_calendar.md` | ✅ Merged (278028b, 6f42c12) |
+| #6a 通用 as-of 工具 + refactor | `factors_asof_generic.md` | TODO — **下一个** |
+| #6b 因子协议 + 注册表 + 示例因子 | `factors_protocol_and_examples.md` | TODO(依赖 #6a 先 merge) |
 
-任务推荐顺序: **#8a → #9 → #8b**(#8a 最小,先跑通约定;#8b 最难,放最后)。三个任务彼此独立,Codex 可并行做三个 PR。
+执行顺序: **#6a → #6b**。#6b 直接 import #6a 的 `event_table_to_asof_panel`,所以**串行**。
