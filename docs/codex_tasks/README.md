@@ -31,7 +31,7 @@
   - 纯单元: `python -m pytest tests/ -q -m "not integration"`
   - 全部: `python -m pytest tests/ -q`
 - **新代码必须配测试**,核心语义都要有断言锁
-- 不引入新依赖,坚持 `pandas / numpy / sqlalchemy`。需要新包必须先在 PR 描述里说明并改 `requirements.txt`
+- 不引入新依赖,坚持 `pandas / numpy / sqlalchemy`。需要新包必须先在 PR 描述里说明并改 `requirements.txt`。**当前豁免**: `pyarrow >= 14.0` 限定用于 `research/` 列式 I/O (trials.parquet 等),**不得渗透进** `db_manager / data_sources / utils`
 
 ### 风格
 
@@ -104,7 +104,8 @@
 | #8a SIC→FF12 行业静态映射 | `industry_ff12_mapping.md` | ✅ Merged (2ca3a82, 2ab377f, e5f0c70) |
 | #8b PIT 市值面板 | `pit_market_cap_panel.md` | ✅ Merged (7b71f13) |
 | #9 财报事件日历 | `earnings_event_calendar.md` | ✅ Merged (278028b, 6f42c12) |
-| #6a 通用 as-of 工具 + refactor | `factors_asof_generic.md` | TODO — **下一个** |
-| #6b 因子协议 + 注册表 + 示例因子 | `factors_protocol_and_examples.md` | TODO(依赖 #6a 先 merge) |
+| #6a 通用 as-of 工具 + refactor | `factors_asof_generic.md` | ✅ Merged (PR #2, fe731f4) |
+| #6b 因子协议 + 注册表 + 示例因子 | `factors_protocol_and_examples.md` | ✅ Merged (PR #4, 14ebc9d) |
+| #7 因子评估层 (rank-IC + 分位 IR + trials.parquet) | `factor_evaluation.md` | TODO — **下一个** |
 
-执行顺序: **#6a → #6b**。#6b 直接 import #6a 的 `event_table_to_asof_panel`,所以**串行**。
+执行顺序: **#7 评估层依赖 #6b 协议,直接 import `research.factors.protocol.get / list_factors`**。
