@@ -170,8 +170,15 @@ def _write_frame(df: pd.DataFrame, path: Path) -> None:
     pa, pq = _pyarrow()
     table = pa.Table.from_pylist(rows, schema=_arrow_schema())
     tmp = path.with_name(f".{path.name}.tmp")
-    pq.write_table(table, tmp)
-    os.replace(tmp, path)
+    try:
+        pq.write_table(table, tmp)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def append_trial(result: "EvaluationResult", path: Path) -> str:
