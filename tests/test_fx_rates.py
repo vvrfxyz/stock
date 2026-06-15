@@ -3,7 +3,10 @@ from datetime import date
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
 from data_sources.ecb_fx_source import parse_ecb_fx_csv
+from data_sources.fred_source import parse_fred_rate_csv
 from scripts.update_adjustment_factors import (
     compute_adjustment_factor_rows,
     evaluate_vendor_comparison,
@@ -29,6 +32,42 @@ class TestParseEcbCsv:
     def test_since_filter(self):
         rows = parse_ecb_fx_csv(ECB_CSV, since=date(2026, 6, 10))
         assert {r["rate_date"] for r in rows} == {date(2026, 6, 10), date(2026, 6, 11)}
+
+
+FRED_CSV = """observation_date,DTB3
+2026-06-05,4.28
+2026-06-06,.
+2026-06-08,4.30
+"""
+
+
+class TestParseFredCsv:
+    def test_rows_parsed_and_missing_skipped(self):
+        rows = parse_fred_rate_csv(FRED_CSV)
+
+        assert rows == [
+            {"date": date(2026, 6, 5), "series_id": "DTB3", "rate_pct": Decimal("4.28")},
+            {"date": date(2026, 6, 8), "series_id": "DTB3", "rate_pct": Decimal("4.30")},
+        ]
+
+    def test_since_filter(self):
+        rows = parse_fred_rate_csv(FRED_CSV, since=date(2026, 6, 8))
+
+        assert rows == [{"date": date(2026, 6, 8), "series_id": "DTB3", "rate_pct": Decimal("4.30")}]
+
+    def test_missing_series_column_raises(self):
+        with pytest.raises(ValueError, match="missing DTB3 column"):
+            parse_fred_rate_csv("observation_date,OTHER\n2026-06-05,4.28\n")
+
+    def test_bad_date_and_bad_value_raise(self):
+        with pytest.raises(ValueError, match="invalid observation date"):
+            parse_fred_rate_csv("observation_date,DTB3\nnot-a-date,4.28\n")
+        with pytest.raises(ValueError, match="invalid DTB3 rate"):
+            parse_fred_rate_csv("observation_date,DTB3\n2026-06-05,bad\n")
+
+    def test_no_rows_after_filter_raises(self):
+        with pytest.raises(ValueError, match="contained no DTB3 rows"):
+            parse_fred_rate_csv(FRED_CSV, since=date(2099, 1, 1))
 
 
 class _StubFx:

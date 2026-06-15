@@ -106,6 +106,6 @@
 | #9 财报事件日历 | `earnings_event_calendar.md` | ✅ Merged (278028b, 6f42c12) |
 | #6a 通用 as-of 工具 + refactor | `factors_asof_generic.md` | ✅ Merged (PR #2, fe731f4) |
 | #6b 因子协议 + 注册表 + 示例因子 | `factors_protocol_and_examples.md` | ✅ Merged (PR #4, 14ebc9d) |
-| #7 因子评估层 (rank-IC + 分位 IR + trials.parquet) | `factor_evaluation.md` | TODO — **下一个** |
+| #7 因子评估层 (rank-IC + 分位 IR + trials.parquet) | `factor_evaluation.md` | ✅ Merged (PR #7, 2d004cc) |
 
-执行顺序: **#7 评估层依赖 #6b 协议,直接 import `research.factors.protocol.get / list_factors`**。
+后续优先级: 清 #7 follow-up hygiene 后,继续接 FRED DTB3 / short_volumes / 13F 等研究扩展。

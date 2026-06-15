@@ -44,8 +44,6 @@ def _result(note: str | None = None, factor_name: str = "demo") -> EvaluationRes
             "factor_coverage": [0.9, 0.95, 1.0],
             "fwd_ret_coverage_given_factor": [0.98, 0.99, 1.0],
             "pit_violations": [0, 0, 0],
-            "n_active": [100, 100, 100],
-            "n_delisted": [0, 0, 0],
         },
         index=dates,
     )
@@ -95,9 +93,12 @@ def test_append_twice_accumulates_rows_idempotently(tmp_path):
 
     first = append_trial(result, path)
     n_rows = len(load_trials(path))
-    second = append_trial(_result(), path)
+    duplicate = _result()
+    second = append_trial(duplicate, path)
 
     assert first == second
+    assert duplicate.trial_id == first
+    assert duplicate.created_at is None
     assert len(load_trials(path)) == n_rows
 
 
@@ -176,3 +177,31 @@ def test_load_trials_latest_only_collapses_older_rows(tmp_path):
     latest = load_trials(path, latest_only=True)
 
     assert set(latest["trial_id"]) == {"newer"}
+
+
+def test_load_trials_latest_only_logs_summary_not_full_id_list(tmp_path, monkeypatch):
+    import research._trials_store as store
+
+    path = tmp_path / "trials.parquet"
+    append_trial(_result(factor_name="a"), path)
+    rows = load_trials(path)
+    updated = rows.copy()
+    updated["trial_id"] = "newer"
+    updated["created_at"] = pd.Timestamp("2099-01-01", tz="UTC")
+    pq.write_table(pa.Table.from_pandas(pd.concat([rows, updated], ignore_index=True), preserve_index=False), path)
+    messages = []
+
+    class _Logger:
+        def warning(self, message, *args):
+            messages.append(("warning", message.format(*args)))
+
+        def debug(self, message, *args):
+            messages.append(("debug", message.format(*args)))
+
+    monkeypatch.setattr(store, "logger", _Logger())
+
+    load_trials(path, latest_only=True)
+
+    warnings = [message for level, message in messages if level == "warning"]
+    assert any("latest_only collapsed" in message for message in warnings)
+    assert not any("latest_only dropped trial_ids=[" in message for message in warnings)

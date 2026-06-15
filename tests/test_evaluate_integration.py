@@ -111,6 +111,7 @@ def test_earnings_yield_full_pipeline(pg_db, tmp_path):
         trials_path=tmp_path / "trials.parquet",
         min_median_dollar_volume=1,
         eligibility_window=1,
+        risk_free_series=None,
     )
 
     assert result.ic_table.shape[0] == 1
@@ -136,6 +137,7 @@ def test_size_full_pipeline_with_output_dir(pg_db, tmp_path):
         trials_path=tmp_path / "nested" / "trials.parquet",
         min_median_dollar_volume=1,
         eligibility_window=1,
+        risk_free_series=None,
     )
 
     assert result.status == "ok"

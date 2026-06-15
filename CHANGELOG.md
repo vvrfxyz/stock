@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added (2026-06-15)
+
+- Risk-free reference layer for research metrics: `risk_free_rates` table (migration `a6b7c8d9e0f1`) + `update_risk_free_rates` FRED CSV sync + `utils/risk_free_rates.load_risk_free_daily_returns`. Sunday `scheduled_update` refreshes DTB3 for the last 30 days.
+
+### Changed (2026-06-15)
+
+- `research.evaluate` now reports quantile Sharpe/IR on risk-free excess returns by default (`DTB3`, actual/360, held-exposure aligned). Use `--no-risk-free` to reproduce the old rf=0 evaluation basis.
+- Cleaned #7 evaluation follow-up nits: coverage no longer exposes non-PIT listing snapshot columns, strict PIT failures persist trials before raising, repeated trial appends set `trial_id` on the skipped result, `latest_only` logs an aggregate warning, and CLI `--start` validation uses argparse exit code 2.
+
 ### Added (2026-06-12)
 
 - T3 insider ingestion: `update_insider_transactions` parses Form 3/4/5 ownership XML from the `sec_filings` index into `insider_transactions` (one row per entry × reporting owner, `source+accession+row_hash` idempotency, footnote resolution); weekly incremental added to Sunday `scheduled_update`.

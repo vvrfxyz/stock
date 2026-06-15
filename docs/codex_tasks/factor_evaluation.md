@@ -99,7 +99,7 @@ def run_evaluation(
 7. 自算 `forward_returns = {h: adj_close.ffill().shift(-h) / adj_close.ffill() - 1, masked by adj_close.notna() & adj_close.ffill().shift(-h).notna()}` for each `h in horizons`
 8. `result = evaluate_factor(factor_values, forward_returns, eligibility=eligible.loc[ctx.dates], horizons=, ..., factor_name=factor_obj.name)`
 9. PIT 漏检三件套 (见下方"诊断"小节)
-10. 若 `trials_path is not None`: `append_trial(result, trials_path)` → 设置 `result.trial_id`
+10. 若 `trials_path is not None`: `append_trial(result, trials_path)` → 设置 `result.trial_id`；`strict=True` 的 PIT 失败也必须先尝试落 trials 再 raise。
 
 ### `research.evaluate.evaluate_all` (多因子循环)
 
@@ -138,7 +138,7 @@ class EvaluationResult:
     ic_table: pd.DataFrame                       # rows=horizon, cols=[mean_ic, std_ic, nw_t, nw_lag, n_obs, is_noisy]
     ic_decay: pd.DataFrame                       # long: cols=[horizon, lag, ic]; lag ∈ [0, max(horizons)]
     quantile_metrics: pd.DataFrame               # rows=(horizon, quantile_label) where label ∈ {q1..q5, ls_q5_q1}, cols=[ann_return, ann_vol, sharpe_gross, sharpe_net, ann_turnover, max_drawdown]
-    coverage: pd.DataFrame                       # rows=date, cols=[n_universe, factor_coverage, fwd_ret_coverage_given_factor, pit_violations, n_active, n_delisted]
+    coverage: pd.DataFrame                       # rows=date, cols=[n_universe, factor_coverage, fwd_ret_coverage_given_factor, pit_violations]
     diagnostics: Mapping[str, Any]               # pit_regression_max_abs_diff, factor_freshness_gap_days, unexpected_coverage_jump_days, skipped_horizons, lookahead_suspect
     status: str = "ok"                           # "ok" | "skipped_all_nan" | "failed"
     trial_id: str | None = None                  # append_trial 设置
@@ -211,7 +211,7 @@ def load_trials(
 ) -> pd.DataFrame:
     """读 trials.parquet. latest_only=True 时按
     (factor_name, factor_version, horizon, metric, metric_param, params_hash)
-    取 created_at 最大行, 折叠丢行时 logger.warning 列出被丢的 trial_id."""
+    取 created_at 最大行, 折叠丢行时 logger.warning 输出摘要,详细 trial_id 仅 debug。"""
 
 def _git_meta() -> tuple[str | None, bool]:
     """subprocess.run(['git','rev-parse','HEAD'], cwd=repo_root, timeout=2, check=False).
@@ -235,7 +235,7 @@ python -m research.evaluate \
   [--strict]                                  # PIT break 或 lookahead suspect raise
 ```
 
-`--factors` 与 `--all` 互斥。`--start` 默认且强制 ≥ `FACTOR_TRUST_FLOOR = 2024-05-14` (因子可信下限,违反 `raise`,与 `run_baselines` 同硬规)。`stdout` 打印 markdown 表 (`horizon × [ic_mean, nw_t(*=noisy), q_ls_sharpe_net, coverage_p05, pit_violations_max, n_obs]`,`*` 表示 `is_noisy`),同步落 `research/output/evaluate_{factor}_{start}_{end}.md` 含 IC 衰减 + 5 分位明细 + PIT 检查明细。
+`--factors` 与 `--all` 互斥。`--start` 默认且强制 ≥ `FACTOR_TRUST_FLOOR = 2024-05-14` (因子可信下限,违反 `raise`,与 `run_baselines` 同硬规)。分位组合 Sharpe/IR 默认用 `--risk-free-series DTB3` 扣无风险收益；复现旧口径时显式传 `--no-risk-free`。`stdout` 打印 markdown 表 (`horizon × [ic_mean, nw_t(*=noisy), q_ls_sharpe_net, coverage_p05, pit_violations_max, n_obs]`,`*` 表示 `is_noisy`),同步落 `research/output/evaluate_{factor}_{start}_{end}.md` 含 IC 衰减 + 5 分位明细 + PIT 检查明细。
 
 ## 关键不变量 (必须测试锁)
 
@@ -252,13 +252,14 @@ python -m research.evaluate \
 6. **再平衡间隔 = horizon 个交易日**: `index[::horizon]`,**不用 `rebalance_dates('M')`**。每个 rebalance 日先按 `eligibility[t]` mask 再分桶,有效 N<100 当日整组空。NaN 信号名字从分位分配剔除。
 7. **IR 复用 `run_backtest`**: 三组权重 (`q5_long_only`, `q1_long_only`, `q5_minus_q1`) 各跑两轮 `run_backtest(name, weights, adj_close, cost_bps=10.0, hold_through_gaps=True)` 与 `cost_bps=0`,取 `.metrics()['sharpe']` 作 `sharpe_net` / `sharpe_gross`。long-only 额外报 `sharpe_vs_equal_universe_basis` (basis = 等权 eligible universe `run_backtest` 的 `daily_returns`)。
 
-### 覆盖率 4 维
+### 覆盖率 3 列
 
-8. **逐日 4 列**:
+8. **逐日 3 列**:
    - (a) `factor_coverage[t] = (factor.notna() & eligible).sum(axis=1) / eligible.sum(axis=1)`,分母=0 当日剔除
    - (b) `fwd_ret_coverage_given_factor[t] = (factor.notna() & fwd_ret.notna() & eligible).sum(axis=1) / (factor.notna() & eligible).sum(axis=1)`
-   - (c) `by_listing_status`: `n_active`、`n_delisted` 两列 (按 `securities.is_active`)
-   - (d) `pit_violations[t]` = factor 在 `date > ctx.as_of` 的非 NaN cell 数,期望 0 (主防线)
+   - (c) `pit_violations[t]` = factor 在 `date > ctx.as_of` 的非 NaN cell 数,期望 0 (主防线)
+
+`securities.is_active` 是当前快照,不是 PIT listing 状态；v1 不在 coverage 里暴露 `n_active` / `n_delisted`，避免 survivorship 语义混入诊断列。
 9. **聚合落 trials**: `coverage_factor_mean / coverage_factor_p05 / coverage_fwd_given_factor_p05 / n_universe_mean / n_universe_min`。`fwd_ret_coverage_given_factor_p5_floor = 0.95` 是 spec 阈值,**仅 flag 不擦数据**。
 
 ### PIT 漏检防回归
@@ -282,7 +283,7 @@ python -m research.evaluate \
 14. **params_hash 范围**: `sha256(canonical_json sort_keys=True separators=(',',':') ensure_ascii=False)` 含 **全部 eval params + factor params + universe filter**,**排除 `note`**。`float` 用 `repr`,拒绝 NaN/Inf (raise)。
 15. **append 实现**: 单文件 `read+concat+atomic os.replace`,**单写者约定** (无 fcntl)。schema 演进通过 `TRIALS_SCHEMA_VERSION` bump + `reindex` 旧行 NaN;**禁止 delete/rename 列**。row count > 100_000 logger.warning 建议归档,不自动滚动。不分区 (MVP)。
 16. **trials.parquet 入 `.gitignore`**: 二进制 + 频繁 append 会膨胀历史。spec 顺便写一份 `research/output/trials_README.md` 说明导出协议 (csv 跨机器搬运)。
-17. **`load_trials(latest_only=True)`**: 按 `(factor_name, factor_version, horizon, metric, metric_param, params_hash)` 取 `created_at` max,折叠丢行时 `logger.warning` 列出被折叠的 `trial_id`。
+17. **`load_trials(latest_only=True)`**: 按 `(factor_name, factor_version, horizon, metric, metric_param, params_hash)` 取 `created_at` max,折叠丢行时 `logger.warning` 只报摘要,详细 `trial_id` 走 debug。
 
 ### universe 过滤管道 (在 run_evaluation 中)
 

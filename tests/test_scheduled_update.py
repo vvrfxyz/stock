@@ -41,6 +41,7 @@ def test_scheduled_update_staggers_weekly_tasks():
     assert "update_insider_transactions_recent" in sunday_names
     assert "update_institutional_holdings_recent" in sunday_names
     assert "update_fx_rates" in sunday_names
+    assert "update_risk_free_rates" in sunday_names
     assert "sync_cusip_identifiers" in sunday_names
     # CUSIP 映射先于 13F 写入，新持仓行才能在写入时拿到 security_id
     assert sunday_names.index("sync_cusip_identifiers") < sunday_names.index(

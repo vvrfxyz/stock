@@ -17,6 +17,7 @@ import scripts.update_massive_news as news
 import scripts.update_massive_prices as prices
 import scripts.update_massive_shares as shares
 import scripts.update_massive_short_data as short_data
+import scripts.update_risk_free_rates as risk_free
 
 END_DATE = date(2026, 6, 11)
 
@@ -246,6 +247,30 @@ class TestNewsRun:
         source.get_news.side_effect = RuntimeError("api down")
 
         assert news.run(news.create_parser().parse_args([]), source, db) == 1
+
+
+class TestRiskFreeRatesMain:
+    def test_happy_path_fetches_and_upserts(self, monkeypatch):
+        rows = [{"date": date(2026, 6, 5), "series_id": "DTB3", "rate_pct": "4.28"}]
+        db = Mock()
+        db.upsert_risk_free_rates.return_value = 1
+        monkeypatch.setattr(risk_free, "fetch_fred_series", lambda series_id, since=None: rows)
+        monkeypatch.setattr(risk_free, "DatabaseManager", lambda: db)
+
+        assert risk_free.main(["--series-id", "DTB3", "--since", "2026-06-01"]) == 0
+
+        db.upsert_risk_free_rates.assert_called_once_with(rows)
+        db.close.assert_called_once()
+
+    def test_fetch_error_returns_one(self, monkeypatch):
+        monkeypatch.setattr(risk_free, "fetch_fred_series", lambda series_id, since=None: (_ for _ in ()).throw(RuntimeError("down")))
+
+        assert risk_free.main([]) == 1
+
+    def test_empty_fetch_returns_one(self, monkeypatch):
+        monkeypatch.setattr(risk_free, "fetch_fred_series", lambda series_id, since=None: [])
+
+        assert risk_free.main([]) == 1
 
 
 # ---------------------------------------------------------------------------

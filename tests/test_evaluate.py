@@ -17,6 +17,7 @@ from research.evaluate import (
     _rank_ic_series,
     default_nw_lag,
     evaluate_factor,
+    parse_args,
 )
 from research.factors.protocol import FactorContext
 
@@ -152,6 +153,59 @@ def test_quantile_ir_matches_run_backtest_directly():
     assert result.quantile_metrics.loc[(1, "q5"), "sharpe_net"] == pytest.approx(direct)
 
 
+def test_quantile_sharpe_subtracts_risk_free_for_net_exposure_only():
+    dates, universe, factor = _panel(n_dates=90, n_names=120)
+    fwd = factor.rank(axis=1, pct=True) / 1000
+    adj_close = _prices_from_returns(fwd)
+    eligible = pd.DataFrame(True, index=dates, columns=universe)
+    rf = pd.Series(0.0001, index=dates, name="DTB3")
+
+    no_rf = evaluate_factor(
+        factor,
+        {1: _forward_return(adj_close, 1)},
+        eligibility=eligible,
+        horizons=(1,),
+        adj_close=adj_close,
+        cost_bps=0,
+        min_coverage=50,
+    )
+    with_rf = evaluate_factor(
+        factor,
+        {1: _forward_return(adj_close, 1)},
+        eligibility=eligible,
+        horizons=(1,),
+        adj_close=adj_close,
+        cost_bps=0,
+        min_coverage=50,
+        risk_free_returns=rf,
+    )
+
+    assert with_rf.quantile_metrics.loc[(1, "q5"), "sharpe_net"] < no_rf.quantile_metrics.loc[(1, "q5"), "sharpe_net"]
+    assert with_rf.quantile_metrics.loc[(1, "ls_q5_q1"), "sharpe_net"] == pytest.approx(
+        no_rf.quantile_metrics.loc[(1, "ls_q5_q1"), "sharpe_net"]
+    )
+
+
+def test_quantile_sharpe_rejects_missing_risk_free_dates():
+    dates, universe, factor = _panel(n_dates=90, n_names=120)
+    fwd = factor.rank(axis=1, pct=True) / 1000
+    adj_close = _prices_from_returns(fwd)
+    eligible = pd.DataFrame(True, index=dates, columns=universe)
+    rf = pd.Series(0.0001, index=dates[:-1], name="DTB3")
+
+    with pytest.raises(FactorEvaluationError, match="risk_free_returns missing"):
+        evaluate_factor(
+            factor,
+            {1: _forward_return(adj_close, 1)},
+            eligibility=eligible,
+            horizons=(1,),
+            adj_close=adj_close,
+            cost_bps=0,
+            min_coverage=50,
+            risk_free_returns=rf,
+        )
+
+
 def test_coverage_diagnostic():
     _, _, factor = _panel(n_dates=80, n_names=120)
     factor.iloc[:, ::2] = np.nan
@@ -199,7 +253,6 @@ def test_factor_context_as_of_truncates_dates(monkeypatch):
     factor = RecordingFactor()
     monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
     monkeypatch.setattr(ev, "securities_with_uncovered_events", lambda *args, **kwargs: [])
-    monkeypatch.setattr(ev, "_load_active_status", lambda engine, columns: pd.Series(True, index=columns))
     monkeypatch.setattr(ev, "_git_meta", lambda: (None, False), raising=False)
 
     ev.run_evaluation(
@@ -213,9 +266,50 @@ def test_factor_context_as_of_truncates_dates(monkeypatch):
         min_median_dollar_volume=1,
         eligibility_window=1,
         trials_path=None,
+        risk_free_series=None,
     )
 
     assert factor.seen_max_date <= dates[10]
+
+
+def test_run_evaluation_loads_risk_free_only_for_quantile_backtest_dates(monkeypatch):
+    import research.evaluate as ev
+
+    dates, universe, _ = _panel(n_dates=30, n_names=120)
+    end = dates[19].date()
+    eval_start = dates[5].date()
+    panel = {
+        "adj_close": pd.DataFrame(100.0, index=dates, columns=universe),
+        "close": pd.DataFrame(100.0, index=dates, columns=universe),
+        "dollar_volume": pd.DataFrame(10_000_000.0, index=dates, columns=universe),
+    }
+    seen_indexes = []
+
+    def fake_load_risk_free(engine, index, *, series_id):
+        loaded_index = pd.DatetimeIndex(index)
+        seen_indexes.append(loaded_index)
+        if loaded_index.max().date() > end:
+            raise AssertionError("risk-free loader saw unused forward-return buffer dates")
+        return pd.Series(0.0, index=loaded_index, name=series_id)
+
+    monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
+    monkeypatch.setattr(ev, "securities_with_uncovered_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ev, "load_risk_free_daily_returns", fake_load_risk_free)
+
+    ev.run_evaluation(
+        RecordingFactor(),
+        engine=object(),
+        start=dates.min().date(),
+        end=end,
+        horizons=(5,),
+        eval_start=eval_start,
+        min_median_dollar_volume=1,
+        eligibility_window=1,
+        trials_path=None,
+    )
+
+    assert len(seen_indexes) == 1
+    assert list(seen_indexes[0]) == list(dates[5:20])
 
 
 def test_run_evaluation_requires_eval_start_for_short_default_warmup(monkeypatch):
@@ -240,6 +334,7 @@ def test_run_evaluation_requires_eval_start_for_short_default_warmup(monkeypatch
             min_median_dollar_volume=1,
             eligibility_window=1,
             trials_path=None,
+            risk_free_series=None,
         )
 
 
@@ -266,3 +361,81 @@ def test_params_hash_excludes_note():
     other = config | {"note": "b"}
 
     assert _params_hash(config) == _params_hash(other)
+
+
+def test_parse_args_rejects_start_before_trust_floor():
+    with pytest.raises(SystemExit) as exc_info:
+        parse_args(["--factors", "size", "--start", "2024-05-13"])
+
+    assert exc_info.value.code == 2
+
+
+def test_run_evaluation_strict_persists_before_raise(monkeypatch, tmp_path):
+    import research.evaluate as ev
+
+    dates, universe, _ = _panel(n_dates=20, n_names=120)
+    panel = {
+        "adj_close": pd.DataFrame(100.0, index=dates, columns=universe),
+        "close": pd.DataFrame(100.0, index=dates, columns=universe),
+        "dollar_volume": pd.DataFrame(10_000_000.0, index=dates, columns=universe),
+    }
+    appended = []
+
+    def fake_append(result, path):
+        appended.append((result.factor_name, path, result.diagnostics["lookahead_suspect"]))
+        return "trial"
+
+    monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
+    monkeypatch.setattr(ev, "securities_with_uncovered_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ev, "_pit_regression", lambda *args, **kwargs: 1.0)
+    monkeypatch.setattr("research._trials_store.append_trial", fake_append)
+
+    with pytest.raises(FactorEvaluationError, match="failed PIT regression"):
+        ev.run_evaluation(
+            RecordingFactor(),
+            engine=object(),
+            start=dates.min().date(),
+            end=dates.max().date(),
+            horizons=(1,),
+            eval_start=dates[2].date(),
+            min_median_dollar_volume=1,
+            eligibility_window=1,
+            trials_path=tmp_path / "trials.parquet",
+            strict=True,
+            risk_free_series=None,
+        )
+
+    assert appended == [("recording", tmp_path / "trials.parquet", True)]
+
+
+def test_run_evaluation_raises_when_trial_append_fails(monkeypatch, tmp_path):
+    import research.evaluate as ev
+
+    dates, universe, _ = _panel(n_dates=20, n_names=120)
+    panel = {
+        "adj_close": pd.DataFrame(100.0, index=dates, columns=universe),
+        "close": pd.DataFrame(100.0, index=dates, columns=universe),
+        "dollar_volume": pd.DataFrame(10_000_000.0, index=dates, columns=universe),
+    }
+
+    def fake_append(result, path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
+    monkeypatch.setattr(ev, "securities_with_uncovered_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ev, "_pit_regression", lambda *args, **kwargs: 1.0)
+    monkeypatch.setattr("research._trials_store.append_trial", fake_append)
+
+    with pytest.raises(OSError, match="disk full"):
+        ev.run_evaluation(
+            RecordingFactor(),
+            engine=object(),
+            start=dates.min().date(),
+            end=dates.max().date(),
+            horizons=(1,),
+            eval_start=dates[2].date(),
+            min_median_dollar_volume=1,
+            eligibility_window=1,
+            trials_path=tmp_path / "trials.parquet",
+            risk_free_series=None,
+        )

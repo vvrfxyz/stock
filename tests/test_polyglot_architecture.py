@@ -11,6 +11,7 @@ from data_models.models import (
     HistoricalShare,
     InstitutionalHolding,
     InsiderTransaction,
+    RiskFreeRate,
     SecFiling,
     Security,
     SecurityIdentifier,
@@ -166,6 +167,17 @@ def test_exchange_calendar_models_are_mic_anchored():
     assert "open_at" in calendar_columns
     assert "close_at" in calendar_columns
     assert "holiday_name" in calendar_columns
+
+
+def test_risk_free_rate_model_stores_reference_rates_only():
+    columns = RiskFreeRate.__table__.columns
+
+    assert columns["date"].primary_key
+    assert columns["series_id"].primary_key
+    assert isinstance(columns["rate_pct"].type, Numeric)
+    assert columns["rate_pct"].type.precision == 12
+    assert columns["rate_pct"].type.scale == 6
+    assert not columns["fetched_at"].nullable
 
 
 def test_sec_foundation_models_are_point_in_time_and_identifier_ready():

@@ -14,7 +14,6 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from loguru import logger
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from research.backtest import eligibility_mask, hold_between_rebalances, run_backtest
@@ -22,6 +21,7 @@ from research.data import FACTOR_TRUST_FLOOR, load_adjusted_panel, research_engi
 from research.factors.builtins import earnings_yield as _earnings_yield  # noqa: F401
 from research.factors.builtins import size as _size  # noqa: F401
 from research.factors.protocol import Factor, FactorContext, get, list_factors
+from utils.risk_free_rates import DEFAULT_SERIES_ID as DEFAULT_RISK_FREE_SERIES, load_risk_free_daily_returns
 from utils.trading_calendar import shift_trading_date
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
@@ -195,11 +195,15 @@ def _quantile_metrics(
     horizons: tuple[int, ...],
     n_quantiles: int,
     cost_bps: float,
+    risk_free_returns: pd.Series | None = None,
 ) -> pd.DataFrame:
     columns = ["ann_return", "ann_vol", "sharpe_gross", "sharpe_net", "ann_turnover", "max_drawdown"]
     if adj_close is None:
         index = pd.MultiIndex.from_tuples([], names=["horizon", "quantile_label"])
         return pd.DataFrame(columns=columns, index=index, dtype="float64")
+    rf_aligned = None
+    if risk_free_returns is not None:
+        rf_aligned = _align_risk_free_returns(risk_free_returns, adj_close.index)
     rows: list[dict[str, Any]] = []
     labels = [f"q{i}" for i in range(1, n_quantiles + 1)] + [f"ls_q{n_quantiles}_q1"]
     for horizon in horizons:
@@ -214,24 +218,59 @@ def _quantile_metrics(
                 weights_by_label[label].loc[dt] = weights
         for label in labels:
             weights = hold_between_rebalances(weights_by_label[label], adj_close.index)
-            gross = run_backtest(f"{label}_h{horizon}_gross", weights, adj_close, cost_bps=0, hold_through_gaps=True).metrics()
+            gross_result = run_backtest(f"{label}_h{horizon}_gross", weights, adj_close, cost_bps=0, hold_through_gaps=True)
             net_result = run_backtest(
                 f"{label}_h{horizon}_net", weights, adj_close, cost_bps=cost_bps, hold_through_gaps=True
             )
+            gross = gross_result.metrics()
             net = net_result.metrics()
+            sharpe_gross = gross.get("sharpe", np.nan)
+            sharpe_net = net.get("sharpe", np.nan)
+            if rf_aligned is not None:
+                rf = rf_aligned.reindex(net_result.daily_returns.index)
+                exposure = weights.shift(1).sum(axis=1).reindex(net_result.daily_returns.index).ffill().fillna(0.0)
+                gross_excess = gross_result.daily_returns - rf * exposure
+                net_excess = net_result.daily_returns - rf * exposure
+                sharpe_gross = _annualized_sharpe(gross_excess)
+                sharpe_net = _annualized_sharpe(net_excess)
             rows.append(
                 {
                     "horizon": horizon,
                     "quantile_label": label,
                     "ann_return": net.get("cagr", np.nan),
                     "ann_vol": net.get("ann_vol", np.nan),
-                    "sharpe_gross": gross.get("sharpe", np.nan),
-                    "sharpe_net": net.get("sharpe", np.nan),
+                    "sharpe_gross": sharpe_gross,
+                    "sharpe_net": sharpe_net,
                     "ann_turnover": net.get("ann_turnover", np.nan),
                     "max_drawdown": net.get("max_drawdown", np.nan),
                 }
             )
     return pd.DataFrame(rows).set_index(["horizon", "quantile_label"]).sort_index()[columns]
+
+
+def _align_risk_free_returns(risk_free_returns: pd.Series, index: pd.Index) -> pd.Series:
+    target = _normalize_dates(index)
+    rf = risk_free_returns.copy()
+    rf.index = _normalize_dates(rf.index)
+    if rf.index.has_duplicates:
+        raise FactorEvaluationError("risk_free_returns index contains duplicate dates")
+    aligned = pd.to_numeric(rf.reindex(target), errors="coerce")
+    missing = aligned[aligned.isna()].index
+    if len(missing) > 0:
+        sample = ", ".join(str(ts.date()) for ts in missing[:5])
+        suffix = "" if len(missing) <= 5 else ", ..."
+        raise FactorEvaluationError(
+            f"risk_free_returns missing {len(missing)} dates required for quantile backtest: {sample}{suffix}"
+        )
+    return pd.Series(aligned.to_numpy(dtype="float64"), index=target, name=getattr(risk_free_returns, "name", None))
+
+
+def _annualized_sharpe(returns: pd.Series) -> float:
+    r = returns.dropna()
+    std = r.std()
+    if r.empty or std <= 0 or pd.isna(std):
+        return np.nan
+    return float(r.mean() / std * np.sqrt(252))
 
 
 def _coverage(
@@ -258,8 +297,6 @@ def _coverage(
             "factor_coverage": factor_present.sum(axis=1) / eligible_counts,
             "fwd_ret_coverage_given_factor": fwd_cov,
             "pit_violations": pit,
-            "n_active": eligibility.sum(axis=1).astype("int64"),
-            "n_delisted": 0,
         },
         index=factor.index,
     )
@@ -414,6 +451,7 @@ def evaluate_factor(
     nw_lag_rule: Callable[[int, int], int] | None = None,
     min_coverage: int = 50,
     factor_name: str = "anonymous",
+    risk_free_returns: pd.Series | None = None,
 ) -> EvaluationResult:
     factor = factor_values.copy().astype("float64")
     factor.index = _normalize_dates(factor.index)
@@ -425,6 +463,7 @@ def evaluate_factor(
         "horizons": horizons,
         "n_quantiles": n_quantiles,
         "cost_bps": cost_bps,
+        "risk_free_series": getattr(risk_free_returns, "name", None),
         "min_coverage": min_coverage,
         "noise_threshold": NOISE_THRESHOLD,
         "min_obs": MIN_OBS,
@@ -461,7 +500,7 @@ def evaluate_factor(
     ic_table = pd.DataFrame(ic_rows).set_index("horizon")
     ic_table["is_noisy"] = ic_table["is_noisy"].map(bool).astype(object)
     ic_decay = _ic_decay_table(factor, aligned_returns, horizons, min_coverage)
-    q_metrics = _quantile_metrics(factor, eligibility, adj_close, horizons, n_quantiles, cost_bps)
+    q_metrics = _quantile_metrics(factor, eligibility, adj_close, horizons, n_quantiles, cost_bps, risk_free_returns)
     coverage = _coverage(factor, aligned_returns, eligibility, as_of_ts)
     non_nan_dates = factor.dropna(how="all").index
     freshness = (factor.index.max() - non_nan_dates.max()).days if len(non_nan_dates) else np.nan
@@ -528,30 +567,6 @@ def _factor_version(factor: Factor, git_sha: str | None) -> str:
     return f"{prefix}:{path.name}:{digest}"
 
 
-def _load_active_status(engine: Engine, columns: pd.Index) -> pd.Series:
-    if len(columns) == 0:
-        return pd.Series(dtype=bool)
-    rows = pd.read_sql_query(
-        text("select id, is_active from securities where id = any(:ids)"),
-        engine,
-        params={"ids": [int(c) for c in columns]},
-    )
-    status = pd.Series(False, index=pd.Index(columns, dtype="int64"), dtype=bool)
-    for row in rows.itertuples(index=False):
-        status.loc[int(row.id)] = False if pd.isna(row.is_active) else bool(row.is_active)
-    return status
-
-
-def _apply_listing_coverage(result: EvaluationResult, eligibility: pd.DataFrame, active_status: pd.Series) -> EvaluationResult:
-    coverage = result.coverage.copy()
-    if coverage.empty:
-        return result
-    eligible = eligibility.reindex(index=coverage.index, columns=active_status.index).fillna(False).astype(bool)
-    coverage["n_active"] = int(active_status.fillna(False).sum())
-    coverage["n_delisted"] = int((~active_status.fillna(False)).sum())
-    return replace(result, coverage=coverage)
-
-
 def _pit_regression(
     factor_obj: Factor,
     live_values: pd.DataFrame,
@@ -598,6 +613,8 @@ def run_evaluation(
     note: str | None = None,
     strict: bool = False,
     run_id: str | None = None,
+    risk_free_returns: pd.Series | None = None,
+    risk_free_series: str | None = DEFAULT_RISK_FREE_SERIES,
 ) -> EvaluationResult:
     from research._trials_store import _git_meta, append_trial
 
@@ -635,6 +652,9 @@ def run_evaluation(
     eval_dates = ctx_dates[ctx_dates >= pd.Timestamp(effective_eval_start)]
     if len(eval_dates) == 0:
         raise FactorEvaluationError("no evaluation dates after eval_start")
+    quantile_adj_close = adj_close.reindex(index=ctx_dates, columns=universe).loc[pd.Timestamp(effective_eval_start):]
+    if risk_free_returns is None and risk_free_series:
+        risk_free_returns = load_risk_free_daily_returns(engine, quantile_adj_close.index, series_id=risk_free_series)
     forward_returns = {h: _forward_return(adj_close, h).reindex(index=eval_dates, columns=universe) for h in horizons}
     eval_start_ts = pd.Timestamp(effective_eval_start)
     for panel_returns in forward_returns.values():
@@ -648,6 +668,7 @@ def run_evaluation(
         "horizons": horizons,
         "n_quantiles": n_quantiles,
         "cost_bps": cost_bps,
+        "risk_free_series": getattr(risk_free_returns, "name", None) or risk_free_series,
         "types": types,
         "min_price": min_price,
         "min_median_dollar_volume": min_median_dollar_volume,
@@ -676,11 +697,11 @@ def run_evaluation(
         horizons=horizons,
         n_quantiles=n_quantiles,
         cost_bps=cost_bps,
-        adj_close=adj_close.reindex(index=ctx_dates, columns=universe).loc[pd.Timestamp(effective_eval_start):],
+        adj_close=quantile_adj_close,
         min_coverage=50,
         factor_name=factor_obj.name,
+        risk_free_returns=risk_free_returns,
     )
-    result = _apply_listing_coverage(result, eligible, _load_active_status(engine, universe))
     pit_diff = _pit_regression(factor_obj, factor_values, engine, eval_dates, universe)
     diagnostics = dict(result.diagnostics)
     diagnostics["pit_regression_max_abs_diff"] = pit_diff
@@ -688,10 +709,14 @@ def run_evaluation(
     result = replace(result, diagnostics=diagnostics)
     if pd.notna(pit_diff) and pit_diff > 1e-9:
         logger.warning("factor={} PIT regression max abs diff={}", factor_obj.name, pit_diff)
+    if trials_path is not None:
+        try:
+            append_trial(result, trials_path)
+        except Exception as exc:
+            logger.opt(exception=exc).error("failed to append trial for factor={}", factor_obj.name)
+            raise
     if strict and diagnostics["lookahead_suspect"]:
         raise FactorEvaluationError(f"factor {factor_obj.name!r} failed PIT regression")
-    if trials_path is not None:
-        append_trial(result, trials_path)
     return result
 
 
@@ -816,12 +841,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--horizons", type=_parse_csv_ints, default=DEFAULT_HORIZONS)
     parser.add_argument("--n-quantiles", type=int, default=5)
     parser.add_argument("--cost-bps", type=float, default=10.0)
+    parser.add_argument("--risk-free-series", default=DEFAULT_RISK_FREE_SERIES, help="risk_free_rates series_id；默认 DTB3。")
+    parser.add_argument("--no-risk-free", action="store_true", help="复现旧口径：Sharpe/IR 不扣 risk-free。")
     persist_group = parser.add_mutually_exclusive_group()
     persist_group.add_argument("--trials-path", type=Path, default=None)
     persist_group.add_argument("--no-persist", action="store_true")
     parser.add_argument("--note")
     parser.add_argument("--strict", action="store_true")
     args = parser.parse_args(argv)
+    if args.start < FACTOR_TRUST_FLOOR:
+        parser.error(f"--start must be >= {FACTOR_TRUST_FLOOR}")
     if args.trials_path is None and not args.no_persist:
         args.trials_path = DEFAULT_TRIALS_PATH
     return args
@@ -830,8 +859,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     args = parse_args(argv)
-    if args.start < FACTOR_TRUST_FLOOR:
-        raise ValueError(f"--start must be >= {FACTOR_TRUST_FLOOR}")
     if args.no_persist:
         args.trials_path = None
     engine = research_engine()
@@ -846,6 +873,7 @@ def main(argv: list[str] | None = None) -> int:
         horizons=args.horizons,
         n_quantiles=args.n_quantiles,
         cost_bps=args.cost_bps,
+        risk_free_series=None if args.no_risk_free else args.risk_free_series,
         trials_path=args.trials_path,
         note=args.note,
         strict=args.strict,

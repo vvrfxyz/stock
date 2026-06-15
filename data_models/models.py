@@ -559,3 +559,12 @@ class FxRate(Base):
     rate = Column(Numeric(20, 10), nullable=False)
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class RiskFreeRate(Base):
+    """FRED risk-free reference rates. DTB3 is stored as annual discount-basis percent."""
+    __tablename__ = 'risk_free_rates'
+    date = Column(Date, primary_key=True)
+    series_id = Column(String(30), primary_key=True)
+    rate_pct = Column(Numeric(12, 6), nullable=False)
+    fetched_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
