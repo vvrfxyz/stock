@@ -2,6 +2,7 @@ exchange_calendars
 loguru
 numpy
 pandas
+pyarrow>=14.0
 psycopg2-binary
 python-dotenv
 requests
