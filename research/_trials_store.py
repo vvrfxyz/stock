@@ -193,6 +193,7 @@ def append_trial(result: "EvaluationResult", path: Path) -> str:
     old = _read_frame(path)
     if not old.empty and trial_id in set(old["trial_id"].astype(str)):
         logger.info("trial_id={} already exists in {}, skipping", trial_id, path)
+        object.__setattr__(result, "trial_id", trial_id)
         return trial_id
     combined = pd.concat([old, new.reindex(columns=_schema_columns())], ignore_index=True)
     if len(combined) > 100_000:
@@ -217,5 +218,6 @@ def load_trials(path: Path = Path("research/output/trials.parquet"), *, latest_o
     latest = ordered.loc[latest_idx].drop(columns=["_created_at_sort"]).sort_values(keys).reset_index(drop=True)
     dropped = sorted(set(ordered["trial_id"].dropna()) - set(latest["trial_id"].dropna()))
     if dropped:
-        logger.warning("latest_only dropped trial_ids={}", dropped)
+        logger.warning("latest_only collapsed {} trial_ids (kept {})", len(dropped), len(latest))
+        logger.debug("latest_only dropped trial_ids={}", dropped)
     return latest

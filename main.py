@@ -30,6 +30,7 @@ from scripts.update_sec_fundamentals import main as update_sec_fundamentals_main
 from scripts.update_insider_transactions import main as update_insider_transactions_main
 from scripts.update_institutional_holdings import main as update_institutional_holdings_main
 from scripts.update_fx_rates import main as update_fx_rates_main
+from scripts.update_risk_free_rates import main as update_risk_free_rates_main
 from scripts.sync_cusip_identifiers import main as sync_cusip_identifiers_main
 from scripts.update_massive_shares import main as update_massive_shares_main
 from scripts.update_massive_events import main as update_massive_events_main
@@ -214,6 +215,13 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
                 "update_fx_rates",
                 update_fx_rates_main,
                 ["--since", (run_date - timedelta(days=30)).isoformat()],
+            )
+        )
+        steps.append(
+            ScheduledStep(
+                "update_risk_free_rates",
+                update_risk_free_rates_main,
+                ["--series-id", "DTB3", "--since", (run_date - timedelta(days=30)).isoformat()],
             )
         )
         steps.append(
@@ -524,6 +532,16 @@ def run_update_fx_rates(args):
     execute_script(update_fx_rates_main, cli_args)
 
 
+def run_update_risk_free_rates(args):
+    logger.info("执行: 同步 FRED risk-free reference rates")
+    cli_args = []
+    if args.series_id:
+        cli_args.extend(['--series-id', args.series_id])
+    if args.since:
+        cli_args.extend(['--since', args.since])
+    execute_script(update_risk_free_rates_main, cli_args)
+
+
 def run_sync_cusip_identifiers(args):
     logger.info("执行: 同步 FTD CUSIP 身份映射")
     cli_args = ['--market', args.market, '--months', str(args.months)]
@@ -716,6 +734,11 @@ def main():
     p_fx = subparsers.add_parser('update_fx_rates', help="同步 ECB 每日参考汇率（非 USD 分红折算用）")
     p_fx.add_argument('--since', type=str, default=None, help="只写入该日期之后的汇率；不传则全历史回填。")
     p_fx.set_defaults(func=run_update_fx_rates)
+
+    p_rf = subparsers.add_parser('update_risk_free_rates', help="同步 FRED DTB3 risk-free reference rates")
+    p_rf.add_argument('--series-id', type=str, default='DTB3', help="FRED series id，默认 DTB3。")
+    p_rf.add_argument('--since', type=str, default=None, help="只写入该日期之后的数据；不传则全历史回填。")
+    p_rf.set_defaults(func=run_update_risk_free_rates)
 
     p_cusip = subparsers.add_parser('sync_cusip_identifiers', help="用 SEC FTD 数据同步 CUSIP 身份映射并回填 13F security_id")
     p_cusip.add_argument('--market', type=str, default='US', help="当前仅支持 US。")

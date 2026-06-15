@@ -8,6 +8,7 @@ from data_models.models import (
     InstitutionalHolding,
     NewsArticle,
     NewsArticleInsight,
+    RiskFreeRate,
     SecFiling,
     SecFundamentalFact,
     SecurityIdentifier,
@@ -304,6 +305,30 @@ class ReferenceDataMixin:
                 stmt = stmt.on_conflict_do_update(
                     index_elements=["rate_date", "base_currency", "quote_currency", "source"],
                     set_={"rate": stmt.excluded.rate, "updated_at": func.now()},
+                )
+                result = conn.execute(stmt)
+                written += result.rowcount
+            conn.commit()
+        return written
+
+    def upsert_risk_free_rates(self, rows_data: list[dict]) -> int:
+        """写 FRED risk-free reference rates。冲突时刷新 rate_pct 与 fetched_at。"""
+        rows = [_clean_for_model(RiskFreeRate, row) for row in rows_data]
+        rows = [
+            row for row in rows
+            if row.get("date") and row.get("series_id") and row.get("rate_pct") is not None
+        ]
+        if not rows:
+            return 0
+
+        written = 0
+        with self.engine.connect() as conn:
+            for start in range(0, len(rows), 5000):
+                chunk = rows[start:start + 5000]
+                stmt = pg_insert(RiskFreeRate).values(chunk)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["date", "series_id"],
+                    set_={"rate_pct": stmt.excluded.rate_pct, "fetched_at": func.now()},
                 )
                 result = conn.execute(stmt)
                 written += result.rowcount

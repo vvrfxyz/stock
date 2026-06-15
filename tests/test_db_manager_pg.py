@@ -611,6 +611,37 @@ class TestFxRates:
         assert fx.rate_to_usd("XXX", date(2026, 6, 11)) is None
 
 
+class TestRiskFreeRates:
+    def _rows(self):
+        return [
+            {"date": date(2026, 6, 5), "series_id": "DTB3", "rate_pct": Decimal("4.28")},
+            {"date": date(2026, 6, 8), "series_id": "DTB3", "rate_pct": Decimal("4.30")},
+        ]
+
+    def test_upsert_idempotent_and_rate_refresh(self, pg_db):
+        assert pg_db.upsert_risk_free_rates(self._rows()) == 2
+        pg_db.upsert_risk_free_rates([{**self._rows()[0], "rate_pct": Decimal("4.31")}])
+        assert _scalar(pg_db, "SELECT count(*) FROM risk_free_rates") == 2
+        assert _scalar(
+            pg_db,
+            "SELECT rate_pct FROM risk_free_rates WHERE series_id='DTB3' AND date='2026-06-05'",
+        ) == Decimal("4.310000")
+
+    def test_load_risk_free_daily_returns(self, pg_db):
+        import pandas as pd
+
+        from utils.risk_free_rates import load_risk_free_daily_returns
+
+        pg_db.upsert_risk_free_rates(self._rows())
+        index = pd.to_datetime(["2026-06-05", "2026-06-08"])
+        returns = load_risk_free_daily_returns(pg_db.engine, index)
+        assert list(returns.index) == list(pd.DatetimeIndex(index))
+        assert returns.iloc[0] == pytest.approx(float(Decimal("4.28") / Decimal("100") / Decimal(360)))
+        assert returns.iloc[1] == pytest.approx(float(Decimal("4.30") / Decimal("100") * Decimal(3) / Decimal(360)))
+        with pytest.raises(LookupError, match="no fresh DTB3 row"):
+            load_risk_free_daily_returns(pg_db.engine, pd.to_datetime(["2026-06-20"]))
+
+
 class TestMapUnlinkedHoldings:
     def _holding(self, hash_ch, cusip, security_id=None):
         return {
