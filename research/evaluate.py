@@ -1,0 +1,865 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import inspect
+import json
+import math
+from dataclasses import dataclass, replace
+from datetime import date, timedelta
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+from loguru import logger
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
+
+from research.backtest import eligibility_mask, hold_between_rebalances, run_backtest
+from research.data import FACTOR_TRUST_FLOOR, load_adjusted_panel, research_engine, securities_with_uncovered_events
+from research.factors.builtins import earnings_yield as _earnings_yield  # noqa: F401
+from research.factors.builtins import size as _size  # noqa: F401
+from research.factors.protocol import Factor, FactorContext, get, list_factors
+from utils.trading_calendar import shift_trading_date
+
+OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+DEFAULT_TRIALS_PATH = OUTPUT_DIR / "trials.parquet"
+DEFAULT_HORIZONS = (1, 5, 10, 21)
+NOISE_THRESHOLD = 3.0
+MIN_OBS = 60
+
+
+class FactorEvaluationError(Exception):
+    pass
+
+
+def _normalize_dates(index: pd.Index) -> pd.DatetimeIndex:
+    return pd.DatetimeIndex(pd.to_datetime(index)).astype("datetime64[ns]")
+
+
+def _clean_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(k): _clean_json(v) for k, v in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_clean_json(v) for v in value]
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, (date, np.datetime64)):
+        return pd.Timestamp(value).date().isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        value = float(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("params_hash refuses NaN/Inf")
+        return repr(value)
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    return repr(value)
+
+
+def _canonical_json(value: Mapping[str, Any]) -> str:
+    return json.dumps(_clean_json(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _params_without_note(config: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in config.items() if k not in {"note", "run_id"}}
+
+
+def _params_hash(config: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json(_params_without_note(config)).encode("utf-8")).hexdigest()
+
+
+def _factor_params_snapshot(factor: Factor) -> dict[str, Any]:
+    raw = getattr(factor, "__dict__", {}) or {}
+    return {k: v for k, v in raw.items() if not k.startswith("_") and k != "engine"}
+
+
+def _universe_hash(columns: pd.Index) -> str:
+    values = sorted(int(c) for c in columns)
+    return hashlib.sha1(json.dumps(values, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def default_nw_lag(horizon: int, n_obs: int) -> int:
+    if n_obs <= 0:
+        return 0
+    return int(max(horizon, math.floor(4 * (n_obs / 100) ** (2 / 9))))
+
+
+def _newey_west_t(values: pd.Series, lag: int) -> float:
+    x = values.dropna().astype(float).to_numpy()
+    t = len(x)
+    if t < 2:
+        return np.nan
+    demeaned = x - x.mean()
+    effective_lag = min(max(int(lag), 0), t - 1)
+    long_run_var = float(np.dot(demeaned, demeaned) / t)
+    for k in range(1, effective_lag + 1):
+        cov = float(np.dot(demeaned[k:], demeaned[:-k]) / t)
+        long_run_var += 2 * (1 - k / (effective_lag + 1)) * cov
+    if long_run_var <= 0:
+        mean = float(x.mean())
+        if mean == 0:
+            return np.nan
+        return math.copysign(np.inf, mean)
+    return float(x.mean() / math.sqrt(long_run_var / t))
+
+
+def _rank_ic_series(factor: pd.DataFrame, forward_return: pd.DataFrame, min_coverage: int) -> pd.Series:
+    aligned_factor, aligned_return = factor.align(forward_return, join="left", axis=None)
+    valid = aligned_factor.notna() & aligned_return.notna()
+    f_rank = aligned_factor.rank(axis=1, method="average", na_option="keep")
+    r_rank = aligned_return.rank(axis=1, method="average", na_option="keep")
+    rows: list[float] = []
+    for dt in f_rank.index:
+        mask = valid.loc[dt]
+        if int(mask.sum()) < min_coverage:
+            rows.append(np.nan)
+            continue
+        x = f_rank.loc[dt, mask]
+        y = r_rank.loc[dt, mask]
+        x_std = x.std(ddof=1)
+        y_std = y.std(ddof=1)
+        if x_std == 0 or y_std == 0 or pd.isna(x_std) or pd.isna(y_std):
+            rows.append(np.nan)
+        else:
+            rows.append(float(x.corr(y)))
+    return pd.Series(rows, index=f_rank.index, dtype="float64")
+
+
+def _ic_decay_table(
+    factor: pd.DataFrame,
+    forward_returns: Mapping[int, pd.DataFrame],
+    horizons: tuple[int, ...],
+    min_coverage: int,
+) -> pd.DataFrame:
+    rows: list[dict[str, float | int]] = []
+    max_lag = max(horizons) if horizons else 0
+    for horizon in horizons:
+        returns = forward_returns[horizon].reindex(index=factor.index, columns=factor.columns)
+        for lag in range(max_lag + 1):
+            ic = _rank_ic_series(factor, returns.shift(-lag), min_coverage).mean()
+            rows.append({"horizon": horizon, "lag": lag, "ic": float(ic) if pd.notna(ic) else np.nan})
+    return pd.DataFrame(rows, columns=["horizon", "lag", "ic"])
+
+
+def _decay_halflife(ic_decay: pd.DataFrame, horizon: int) -> float:
+    series = ic_decay[ic_decay["horizon"] == horizon].sort_values("lag")["ic"].abs().reset_index(drop=True)
+    if series.empty or pd.isna(series.iloc[0]) or series.iloc[0] == 0:
+        return np.nan
+    threshold = series.iloc[0] / 2
+    hits = series[series <= threshold]
+    return float(hits.index[0]) if not hits.empty else np.inf
+
+
+def _forward_return(adj_close: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    filled = adj_close.ffill()
+    shifted = filled.shift(-horizon)
+    valid_pair = adj_close.notna() & shifted.notna()
+    return (shifted / filled - 1).where(valid_pair)
+
+
+def _quantile_weights_for_day(signal: pd.Series, eligible: pd.Series, n_quantiles: int) -> dict[str, pd.Series]:
+    base = pd.Series(0.0, index=signal.index, dtype="float64")
+    tradable = signal[eligible.fillna(False) & signal.notna()]
+    if len(tradable) < 100:
+        return {f"q{i}": base.copy() for i in range(1, n_quantiles + 1)} | {f"ls_q{n_quantiles}_q1": base.copy()}
+    ranks = tradable.rank(method="first")
+    labels = np.minimum(((ranks - 1) * n_quantiles // len(tradable)).astype(int) + 1, n_quantiles)
+    out: dict[str, pd.Series] = {}
+    for q in range(1, n_quantiles + 1):
+        weights = base.copy()
+        members = labels.index[labels == q]
+        if len(members) > 0:
+            weights.loc[members] = 1.0 / len(members)
+        out[f"q{q}"] = weights
+    long_short = base.copy()
+    low = labels.index[labels == 1]
+    high = labels.index[labels == n_quantiles]
+    if len(low) > 0 and len(high) > 0:
+        long_short.loc[high] = 0.5 / len(high)
+        long_short.loc[low] = -0.5 / len(low)
+    out[f"ls_q{n_quantiles}_q1"] = long_short
+    return out
+
+
+def _quantile_metrics(
+    factor: pd.DataFrame,
+    eligibility: pd.DataFrame,
+    adj_close: pd.DataFrame | None,
+    horizons: tuple[int, ...],
+    n_quantiles: int,
+    cost_bps: float,
+) -> pd.DataFrame:
+    columns = ["ann_return", "ann_vol", "sharpe_gross", "sharpe_net", "ann_turnover", "max_drawdown"]
+    if adj_close is None:
+        index = pd.MultiIndex.from_tuples([], names=["horizon", "quantile_label"])
+        return pd.DataFrame(columns=columns, index=index, dtype="float64")
+    rows: list[dict[str, Any]] = []
+    labels = [f"q{i}" for i in range(1, n_quantiles + 1)] + [f"ls_q{n_quantiles}_q1"]
+    for horizon in horizons:
+        rebalance_index = factor.index[::horizon]
+        weights_by_label = {
+            label: pd.DataFrame(0.0, index=rebalance_index, columns=factor.columns, dtype="float64")
+            for label in labels
+        }
+        for dt in rebalance_index:
+            day_weights = _quantile_weights_for_day(factor.loc[dt], eligibility.loc[dt], n_quantiles)
+            for label, weights in day_weights.items():
+                weights_by_label[label].loc[dt] = weights
+        for label in labels:
+            weights = hold_between_rebalances(weights_by_label[label], adj_close.index)
+            gross = run_backtest(f"{label}_h{horizon}_gross", weights, adj_close, cost_bps=0, hold_through_gaps=True).metrics()
+            net_result = run_backtest(
+                f"{label}_h{horizon}_net", weights, adj_close, cost_bps=cost_bps, hold_through_gaps=True
+            )
+            net = net_result.metrics()
+            rows.append(
+                {
+                    "horizon": horizon,
+                    "quantile_label": label,
+                    "ann_return": net.get("cagr", np.nan),
+                    "ann_vol": net.get("ann_vol", np.nan),
+                    "sharpe_gross": gross.get("sharpe", np.nan),
+                    "sharpe_net": net.get("sharpe", np.nan),
+                    "ann_turnover": net.get("ann_turnover", np.nan),
+                    "max_drawdown": net.get("max_drawdown", np.nan),
+                }
+            )
+    return pd.DataFrame(rows).set_index(["horizon", "quantile_label"]).sort_index()[columns]
+
+
+def _coverage(
+    factor: pd.DataFrame,
+    forward_returns: Mapping[int, pd.DataFrame],
+    eligibility: pd.DataFrame,
+    as_of: pd.Timestamp | None,
+) -> pd.DataFrame:
+    eligible_counts = eligibility.sum(axis=1).replace(0, np.nan)
+    factor_present = factor.notna() & eligibility
+    factor_counts = factor_present.sum(axis=1).replace(0, np.nan)
+    first_horizon = sorted(forward_returns)[0] if forward_returns else None
+    if first_horizon is None:
+        fwd_cov = pd.Series(np.nan, index=factor.index)
+    else:
+        fwd = forward_returns[first_horizon].reindex(index=factor.index, columns=factor.columns)
+        fwd_cov = (factor_present & fwd.notna()).sum(axis=1) / factor_counts
+    pit = pd.Series(0, index=factor.index, dtype="int64")
+    if as_of is not None:
+        pit.loc[pit.index > as_of] = factor.loc[factor.index > as_of].notna().sum(axis=1).astype("int64")
+    coverage = pd.DataFrame(
+        {
+            "n_universe": eligibility.sum(axis=1).astype("int64"),
+            "factor_coverage": factor_present.sum(axis=1) / eligible_counts,
+            "fwd_ret_coverage_given_factor": fwd_cov,
+            "pit_violations": pit,
+            "n_active": eligibility.sum(axis=1).astype("int64"),
+            "n_delisted": 0,
+        },
+        index=factor.index,
+    )
+    return coverage.dropna(subset=["factor_coverage"], how="all")
+
+
+@dataclass(frozen=True)
+class EvaluationResult:
+    factor_name: str
+    factor_version: str
+    code_git_sha: str | None
+    code_git_dirty: bool
+    horizons: tuple[int, ...]
+    eval_dates: pd.DatetimeIndex
+    as_of: pd.Timestamp | None
+    cost_bps: float
+    n_quantiles: int
+    universe_hash: str
+    universe_size_mean: float
+    universe_size_min: int
+    params_hash: str
+    config: Mapping[str, Any]
+    ic_table: pd.DataFrame
+    ic_decay: pd.DataFrame
+    quantile_metrics: pd.DataFrame
+    coverage: pd.DataFrame
+    diagnostics: Mapping[str, Any]
+    status: str = "ok"
+    trial_id: str | None = None
+    created_at: pd.Timestamp | None = None
+
+    def is_noisy(self, t_threshold: float = NOISE_THRESHOLD, min_obs: int = MIN_OBS) -> dict[int, bool]:
+        out: dict[int, bool] = {}
+        for horizon, row in self.ic_table.iterrows():
+            t_value = row.get("nw_t", np.nan)
+            n_obs = row.get("n_obs", 0)
+            out[int(horizon)] = bool(pd.isna(t_value) or abs(float(t_value)) < t_threshold or int(n_obs) < min_obs)
+        return out
+
+    def _trial_id_value(self) -> str:
+        eval_start = self.eval_dates.min().date().isoformat() if len(self.eval_dates) else ""
+        eval_end = self.eval_dates.max().date().isoformat() if len(self.eval_dates) else ""
+        as_of = self.as_of.date().isoformat() if self.as_of is not None else ""
+        raw = "|".join(
+            [
+                self.factor_name,
+                self.factor_version,
+                self.universe_hash,
+                self.params_hash,
+                f"{eval_start}:{eval_end}",
+                as_of,
+                self.code_git_sha or "",
+            ]
+        )
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    def to_trial_rows(self) -> list[dict[str, Any]]:
+        from research._trials_store import TRIALS_SCHEMA_VERSION
+
+        trial_id = self.trial_id or self._trial_id_value()
+        created_at = self.created_at or pd.Timestamp.now(tz="UTC")
+        params_json = _canonical_json(_params_without_note(self.config))
+        start = pd.Timestamp(self.config.get("start", self.eval_dates.min() if len(self.eval_dates) else pd.NaT))
+        end = pd.Timestamp(self.config.get("end", self.eval_dates.max() if len(self.eval_dates) else pd.NaT))
+        effective = pd.Timestamp(self.eval_dates.min()) if len(self.eval_dates) else pd.NaT
+        base = {
+            "trial_id": trial_id,
+            "schema_version": TRIALS_SCHEMA_VERSION,
+            "created_at": created_at,
+            "run_id": self.config.get("run_id"),
+            "factor_name": self.factor_name,
+            "factor_version": self.factor_version,
+            "code_git_sha": self.code_git_sha,
+            "code_git_dirty": self.code_git_dirty,
+            "eval_start": None if pd.isna(start) else start.date(),
+            "eval_end": None if pd.isna(end) else end.date(),
+            "eval_start_effective": None if pd.isna(effective) else effective.date(),
+            "as_of": self.as_of.date() if self.as_of is not None else None,
+            "universe_hash": self.universe_hash,
+            "universe_size_mean": self.universe_size_mean,
+            "universe_size_min": self.universe_size_min,
+            "n_dates": len(self.eval_dates),
+            "params_hash": self.params_hash,
+            "params_json": params_json,
+            "cost_bps": self.cost_bps,
+            "n_quantiles": self.n_quantiles,
+            "note": self.config.get("note"),
+        }
+
+        rows: list[dict[str, Any]] = []
+
+        def add(horizon: int, metric: str, value: Any, metric_param: int | None = None) -> None:
+            rows.append(
+                base
+                | {
+                    "horizon": int(horizon),
+                    "metric": metric,
+                    "metric_param": metric_param,
+                    "value": float(value) if pd.notna(value) else np.nan,
+                    "is_noisy": self.is_noisy().get(int(horizon), False),
+                }
+            )
+
+        metric_map = {
+            "mean_ic": "ic_mean",
+            "std_ic": "ic_std",
+            "nw_t": "ic_nw_t",
+            "nw_lag": "ic_nw_lag",
+            "n_obs": "n_obs",
+        }
+        for horizon, row in self.ic_table.iterrows():
+            for column, metric in metric_map.items():
+                add(int(horizon), metric, row.get(column, np.nan))
+        for row in self.ic_decay.itertuples(index=False):
+            add(int(row.horizon), "ic_decay", row.ic, int(row.lag))
+
+        q_metric_map = {
+            "ann_return": "q_ann_return",
+            "ann_vol": "q_ann_vol",
+            "sharpe_gross": "q_sharpe_gross",
+            "sharpe_net": "q_sharpe_net",
+            "ann_turnover": "q_ann_turnover",
+            "max_drawdown": "q_max_drawdown",
+        }
+        for (horizon, label), row in self.quantile_metrics.iterrows():
+            metric_param = 0 if str(label).startswith("ls_") else int(str(label).removeprefix("q"))
+            for column, metric in q_metric_map.items():
+                add(int(horizon), metric, row.get(column, np.nan), metric_param)
+
+        if not self.coverage.empty:
+            add(0, "coverage_factor_mean", self.coverage["factor_coverage"].mean())
+            add(0, "coverage_factor_p05", self.coverage["factor_coverage"].quantile(0.05))
+            add(0, "coverage_fwd_given_factor_p05", self.coverage["fwd_ret_coverage_given_factor"].quantile(0.05))
+            add(0, "n_universe_mean", self.coverage["n_universe"].mean())
+            add(0, "n_universe_min", self.coverage["n_universe"].min())
+        for metric in ("pit_regression_max_abs_diff", "factor_freshness_gap_days", "unexpected_coverage_jump_days"):
+            add(0, metric, self.diagnostics.get(metric, np.nan))
+        for horizon in self.diagnostics.get("skipped_horizons", ()):
+            add(int(horizon), "flag_horizon_skipped", 1.0)
+        return rows
+
+
+def evaluate_factor(
+    factor_values: pd.DataFrame,
+    forward_returns: dict[int, pd.DataFrame],
+    *,
+    eligibility: pd.DataFrame,
+    horizons: tuple[int, ...] = DEFAULT_HORIZONS,
+    n_quantiles: int = 5,
+    cost_bps: float = 10.0,
+    adj_close: pd.DataFrame | None = None,
+    nw_lag_rule: Callable[[int, int], int] | None = None,
+    min_coverage: int = 50,
+    factor_name: str = "anonymous",
+) -> EvaluationResult:
+    factor = factor_values.copy().astype("float64")
+    factor.index = _normalize_dates(factor.index)
+    eligibility = eligibility.reindex(index=factor.index, columns=factor.columns).fillna(False).astype(bool)
+    if factor.dropna(how="all", axis=0).empty:
+        raise FactorEvaluationError(f"factor {factor_name!r} is empty or all NaN")
+    aligned_returns = {h: forward_returns[h].reindex(index=factor.index, columns=factor.columns) for h in horizons}
+    config = dict(factor.attrs.get("config", {})) | {
+        "horizons": horizons,
+        "n_quantiles": n_quantiles,
+        "cost_bps": cost_bps,
+        "min_coverage": min_coverage,
+        "noise_threshold": NOISE_THRESHOLD,
+        "min_obs": MIN_OBS,
+    }
+    as_of = factor.attrs.get("as_of")
+    as_of_ts = pd.Timestamp(as_of) if as_of is not None else None
+    lag_rule = nw_lag_rule or default_nw_lag
+    ic_rows: list[dict[str, Any]] = []
+    skipped: list[int] = []
+    for horizon in horizons:
+        fwd = aligned_returns[horizon]
+        if fwd.dropna(how="all").empty:
+            logger.warning("factor={} horizon={} skipped because forward returns are all NaN", factor_name, horizon)
+            skipped.append(horizon)
+            ic_rows.append({"horizon": horizon, "mean_ic": np.nan, "std_ic": np.nan, "nw_t": np.nan, "nw_lag": 0, "n_obs": 0, "is_noisy": True})
+            continue
+        ic = _rank_ic_series(factor, fwd, min_coverage)
+        n_obs = int(ic.notna().sum())
+        requested_lag = int(lag_rule(horizon, n_obs)) if n_obs else 0
+        effective_lag = min(requested_lag, max(n_obs - 1, 0))
+        nw_t = _newey_west_t(ic, effective_lag) if n_obs else np.nan
+        is_noisy = bool(pd.isna(nw_t) or abs(float(nw_t)) < NOISE_THRESHOLD or n_obs < MIN_OBS)
+        ic_rows.append(
+            {
+                "horizon": horizon,
+                "mean_ic": float(ic.mean()) if n_obs else np.nan,
+                "std_ic": float(ic.std(ddof=1)) if n_obs > 1 else np.nan,
+                "nw_t": nw_t,
+                "nw_lag": effective_lag,
+                "n_obs": n_obs,
+                "is_noisy": is_noisy,
+            }
+        )
+    ic_table = pd.DataFrame(ic_rows).set_index("horizon")
+    ic_table["is_noisy"] = ic_table["is_noisy"].map(bool).astype(object)
+    ic_decay = _ic_decay_table(factor, aligned_returns, horizons, min_coverage)
+    q_metrics = _quantile_metrics(factor, eligibility, adj_close, horizons, n_quantiles, cost_bps)
+    coverage = _coverage(factor, aligned_returns, eligibility, as_of_ts)
+    non_nan_dates = factor.dropna(how="all").index
+    freshness = (factor.index.max() - non_nan_dates.max()).days if len(non_nan_dates) else np.nan
+    jumps = int((coverage["factor_coverage"].diff().abs() > 0.25).sum()) if not coverage.empty else 0
+    halflife = _decay_halflife(ic_decay, min(horizons)) if horizons else np.nan
+    decay_lookahead = bool(
+        horizons
+        and pd.notna(ic_table.loc[min(horizons), "mean_ic"])
+        and ic_table.loc[min(horizons), "mean_ic"] > 0.5
+        and pd.notna(halflife)
+        and halflife < 2
+    )
+    pit_lookahead = bool(coverage["pit_violations"].max() > 0) if not coverage.empty else False
+    diagnostics = {
+        "pit_regression_max_abs_diff": np.nan,
+        "factor_freshness_gap_days": float(freshness) if pd.notna(freshness) else np.nan,
+        "unexpected_coverage_jump_days": jumps,
+        "skipped_horizons": tuple(skipped),
+        "lookahead_suspect": bool(decay_lookahead or pit_lookahead),
+        "ic_decay_halflife": halflife,
+    }
+    universe_sizes = eligibility.sum(axis=1)
+    config.setdefault("factor_name", factor_name)
+    params_hash = factor.attrs.get("params_hash") or _params_hash(config)
+    return EvaluationResult(
+        factor_name=factor_name,
+        factor_version=factor.attrs.get("factor_version", "unknown"),
+        code_git_sha=factor.attrs.get("code_git_sha"),
+        code_git_dirty=bool(factor.attrs.get("code_git_dirty", False)),
+        horizons=tuple(horizons),
+        eval_dates=factor.index,
+        as_of=as_of_ts,
+        cost_bps=cost_bps,
+        n_quantiles=n_quantiles,
+        universe_hash=_universe_hash(factor.columns),
+        universe_size_mean=float(universe_sizes.mean()) if len(universe_sizes) else 0.0,
+        universe_size_min=int(universe_sizes.min()) if len(universe_sizes) else 0,
+        params_hash=params_hash,
+        config=config,
+        ic_table=ic_table,
+        ic_decay=ic_decay,
+        quantile_metrics=q_metrics,
+        coverage=coverage,
+        diagnostics=diagnostics,
+        status="skipped_all_nan" if len(skipped) == len(horizons) else "ok",
+    )
+
+
+def _buffered_end(end: date, max_horizon: int, market: str = "US") -> date:
+    try:
+        return shift_trading_date(market, end, max_horizon)
+    except Exception as exc:
+        logger.debug("trading calendar shift failed, using natural-day buffer: {}", exc)
+        return end + timedelta(days=math.ceil(max_horizon * 7 / 5) + 5)
+
+
+def _factor_version(factor: Factor, git_sha: str | None) -> str:
+    source = inspect.getsourcefile(factor.__class__) or inspect.getsourcefile(factor)
+    if source is None:
+        return f"{git_sha or 'nogit'}:unknown"
+    path = Path(source)
+    digest = hashlib.sha1(path.read_bytes()).hexdigest()[:12]
+    prefix = git_sha or "nogit"
+    return f"{prefix}:{path.name}:{digest}"
+
+
+def _load_active_status(engine: Engine, columns: pd.Index) -> pd.Series:
+    if len(columns) == 0:
+        return pd.Series(dtype=bool)
+    rows = pd.read_sql_query(
+        text("select id, is_active from securities where id = any(:ids)"),
+        engine,
+        params={"ids": [int(c) for c in columns]},
+    )
+    status = pd.Series(False, index=pd.Index(columns, dtype="int64"), dtype=bool)
+    for row in rows.itertuples(index=False):
+        status.loc[int(row.id)] = False if pd.isna(row.is_active) else bool(row.is_active)
+    return status
+
+
+def _apply_listing_coverage(result: EvaluationResult, eligibility: pd.DataFrame, active_status: pd.Series) -> EvaluationResult:
+    coverage = result.coverage.copy()
+    if coverage.empty:
+        return result
+    eligible = eligibility.reindex(index=coverage.index, columns=active_status.index).fillna(False).astype(bool)
+    coverage["n_active"] = int(active_status.fillna(False).sum())
+    coverage["n_delisted"] = int((~active_status.fillna(False)).sum())
+    return replace(result, coverage=coverage)
+
+
+def _pit_regression(
+    factor_obj: Factor,
+    live_values: pd.DataFrame,
+    engine: Engine,
+    eval_dates: pd.DatetimeIndex,
+    universe: pd.Index,
+) -> float:
+    if len(eval_dates) == 0:
+        return np.nan
+    offsets = (60, 120, 180)
+    sample_pos = sorted({max(len(eval_dates) - offset, 0) for offset in offsets if len(eval_dates) > offset})
+    if not sample_pos:
+        return np.nan
+    diffs: list[float] = []
+    for pos in sample_pos:
+        ts = eval_dates[pos]
+        replay_dates = pd.DatetimeIndex(live_values.index[live_values.index <= ts])
+        ctx = FactorContext(engine=engine, dates=replay_dates, security_universe=universe, as_of=ts)
+        recomputed = factor_obj.compute(ctx).reindex(index=[ts], columns=universe)
+        live = live_values.reindex(index=[ts], columns=universe)
+        diff = (recomputed - live).abs().to_numpy(dtype=float)
+        if np.isfinite(diff).any():
+            diffs.append(float(np.nanmax(diff)))
+    return max(diffs) if diffs else np.nan
+
+
+def run_evaluation(
+    factor: str | Factor,
+    *,
+    engine: Engine,
+    start: date,
+    end: date,
+    as_of: date | None = None,
+    horizons: tuple[int, ...] = DEFAULT_HORIZONS,
+    n_quantiles: int = 5,
+    cost_bps: float = 10.0,
+    types: tuple[str, ...] = ("CS",),
+    min_price: float = 3.0,
+    min_median_dollar_volume: float = 2_000_000.0,
+    eligibility_window: int = 63,
+    eval_start: date | None = None,
+    extra_drop_ids: list[int] | None = None,
+    trials_path: Path | None = DEFAULT_TRIALS_PATH,
+    note: str | None = None,
+    strict: bool = False,
+    run_id: str | None = None,
+) -> EvaluationResult:
+    from research._trials_store import _git_meta, append_trial
+
+    effective_as_of = as_of or end
+    panel = load_adjusted_panel(engine, start=start, end=_buffered_end(end, max(horizons)), types=types, as_of=effective_as_of)
+    bad = set(securities_with_uncovered_events(engine, start=start, end=end)) | set(extra_drop_ids or [])
+    if bad:
+        for key in panel:
+            panel[key] = panel[key].drop(columns=[c for c in panel[key].columns if int(c) in bad], errors="ignore")
+    eligible = eligibility_mask(
+        panel["close"],
+        panel["dollar_volume"],
+        min_price=min_price,
+        min_median_dollar_volume=min_median_dollar_volume,
+        window=eligibility_window,
+    )
+    keep = eligible.any(axis=0)
+    for key in panel:
+        panel[key] = panel[key].loc[:, keep]
+    eligible = eligible.loc[:, keep]
+    adj_close = panel["adj_close"]
+    ctx_end = min(pd.Timestamp(end), pd.Timestamp(effective_as_of))
+    ctx_dates = adj_close.index[(adj_close.index >= pd.Timestamp(start)) & (adj_close.index <= ctx_end)]
+    universe = pd.Index(adj_close.columns, dtype="int64")
+    factor_obj = get(factor) if isinstance(factor, str) else factor
+    factor_params = _factor_params_snapshot(factor_obj)
+    ctx = FactorContext(engine=engine, dates=ctx_dates, security_universe=universe, as_of=pd.Timestamp(effective_as_of))
+    factor_values = factor_obj.compute(ctx).reindex(index=ctx_dates, columns=universe).astype("float64")
+    if factor_values.dropna(how="all", axis=0).empty:
+        raise FactorEvaluationError(f"factor {factor_obj.name!r} is empty or all NaN")
+    default_eval_start = ctx_dates[252].date() if eval_start is None and len(ctx_dates) > 252 else None
+    effective_eval_start = eval_start or default_eval_start
+    if effective_eval_start is None:
+        raise FactorEvaluationError("not enough trading dates for default 252-day warmup; pass eval_start")
+    eval_dates = ctx_dates[ctx_dates >= pd.Timestamp(effective_eval_start)]
+    if len(eval_dates) == 0:
+        raise FactorEvaluationError("no evaluation dates after eval_start")
+    forward_returns = {h: _forward_return(adj_close, h).reindex(index=eval_dates, columns=universe) for h in horizons}
+    eval_start_ts = pd.Timestamp(effective_eval_start)
+    for panel_returns in forward_returns.values():
+        panel_returns.loc[panel_returns.index < eval_start_ts] = np.nan
+    code_git_sha, code_git_dirty = _git_meta()
+    config = {
+        "start": start,
+        "end": end,
+        "as_of": effective_as_of,
+        "eval_start": effective_eval_start,
+        "horizons": horizons,
+        "n_quantiles": n_quantiles,
+        "cost_bps": cost_bps,
+        "types": types,
+        "min_price": min_price,
+        "min_median_dollar_volume": min_median_dollar_volume,
+        "eligibility_window": eligibility_window,
+        "extra_drop_ids": sorted(int(x) for x in (extra_drop_ids or [])),
+        "factor_name": factor_obj.name,
+        "factor_params": factor_params,
+        "run_id": run_id,
+        "note": note,
+    }
+    factor_eval = factor_values.reindex(index=eval_dates, columns=universe)
+    factor_eval.attrs.update(
+        {
+            "as_of": pd.Timestamp(effective_as_of),
+            "factor_version": _factor_version(factor_obj, code_git_sha),
+            "code_git_sha": code_git_sha,
+            "code_git_dirty": code_git_dirty,
+            "config": config,
+            "params_hash": _params_hash(config),
+        }
+    )
+    result = evaluate_factor(
+        factor_eval,
+        forward_returns,
+        eligibility=eligible.reindex(index=eval_dates, columns=universe),
+        horizons=horizons,
+        n_quantiles=n_quantiles,
+        cost_bps=cost_bps,
+        adj_close=adj_close.reindex(index=ctx_dates, columns=universe).loc[pd.Timestamp(effective_eval_start):],
+        min_coverage=50,
+        factor_name=factor_obj.name,
+    )
+    result = _apply_listing_coverage(result, eligible, _load_active_status(engine, universe))
+    pit_diff = _pit_regression(factor_obj, factor_values, engine, eval_dates, universe)
+    diagnostics = dict(result.diagnostics)
+    diagnostics["pit_regression_max_abs_diff"] = pit_diff
+    diagnostics["lookahead_suspect"] = bool(diagnostics.get("lookahead_suspect", False) or (pd.notna(pit_diff) and pit_diff > 1e-6))
+    result = replace(result, diagnostics=diagnostics)
+    if pd.notna(pit_diff) and pit_diff > 1e-9:
+        logger.warning("factor={} PIT regression max abs diff={}", factor_obj.name, pit_diff)
+    if strict and diagnostics["lookahead_suspect"]:
+        raise FactorEvaluationError(f"factor {factor_obj.name!r} failed PIT regression")
+    if trials_path is not None:
+        append_trial(result, trials_path)
+    return result
+
+
+def evaluate_all(
+    *,
+    engine: Engine,
+    start: date,
+    end: date,
+    names: list[str] | None = None,
+    **kwargs: Any,
+) -> list[EvaluationResult]:
+    factor_names = names or list_factors()
+    results: list[EvaluationResult] = []
+    run_id = hashlib.sha1(f"{pd.Timestamp.now(tz='UTC').isoformat()}:{factor_names}".encode()).hexdigest()
+    for name in factor_names:
+        try:
+            result = run_evaluation(name, engine=engine, start=start, end=end, run_id=run_id, **kwargs)
+            results.append(result)
+        except Exception as exc:
+            if kwargs.get("strict"):
+                raise
+            logger.opt(exception=exc).error("factor={} evaluation failed", name)
+            results.append(
+                EvaluationResult(
+                    factor_name=name,
+                    factor_version="unknown",
+                    code_git_sha=None,
+                    code_git_dirty=False,
+                    horizons=tuple(kwargs.get("horizons", DEFAULT_HORIZONS)),
+                    eval_dates=pd.DatetimeIndex([]),
+                    as_of=pd.Timestamp(kwargs.get("as_of")) if kwargs.get("as_of") is not None else pd.Timestamp(end),
+                    cost_bps=float(kwargs.get("cost_bps", 10.0)),
+                    n_quantiles=int(kwargs.get("n_quantiles", 5)),
+                    universe_hash="",
+                    universe_size_mean=0.0,
+                    universe_size_min=0,
+                    params_hash="",
+                    config={"start": start, "end": end, "run_id": run_id, "error": repr(exc)},
+                    ic_table=pd.DataFrame(),
+                    ic_decay=pd.DataFrame(columns=["horizon", "lag", "ic"]),
+                    quantile_metrics=pd.DataFrame(),
+                    coverage=pd.DataFrame(),
+                    diagnostics={"error": repr(exc)},
+                    status="failed",
+                )
+            )
+    return results
+
+
+def _parse_csv_ints(value: str) -> tuple[int, ...]:
+    return tuple(int(part.strip()) for part in value.split(",") if part.strip())
+
+
+def _result_summary(result: EvaluationResult) -> pd.DataFrame:
+    rows = []
+    for horizon, row in result.ic_table.iterrows():
+        label = f"{row['nw_t']:.3f}{'*' if bool(row['is_noisy']) else ''}" if pd.notna(row["nw_t"]) else "nan*"
+        q_label = f"ls_q{result.n_quantiles}_q1"
+        q_sharpe = np.nan
+        if not result.quantile_metrics.empty and (horizon, q_label) in result.quantile_metrics.index:
+            q_sharpe = result.quantile_metrics.loc[(horizon, q_label), "sharpe_net"]
+        rows.append(
+            {
+                "horizon": horizon,
+                "ic_mean": row["mean_ic"],
+                "nw_t": label,
+                "q_ls_sharpe_net": q_sharpe,
+                "coverage_p05": result.coverage["factor_coverage"].quantile(0.05) if not result.coverage.empty else np.nan,
+                "pit_violations_max": result.coverage["pit_violations"].max() if not result.coverage.empty else np.nan,
+                "n_obs": row["n_obs"],
+            }
+        )
+    return pd.DataFrame(rows).set_index("horizon")
+
+
+def _markdown_table(df: pd.DataFrame, *, include_index: bool = True) -> str:
+    table = df.reset_index() if include_index else df.copy()
+    if table.empty:
+        return "(empty)"
+    headers = [str(col) for col in table.columns]
+    body = []
+    for row in table.itertuples(index=False):
+        body.append(["" if pd.isna(value) else str(value) for value in row])
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
+    lines.extend("| " + " | ".join(row) + " |" for row in body)
+    return "\n".join(lines)
+
+
+def _write_markdown_report(result: EvaluationResult, output_dir: Path) -> Path:
+    output_dir.mkdir(exist_ok=True)
+    start = result.eval_dates.min().date() if len(result.eval_dates) else "empty"
+    end = result.eval_dates.max().date() if len(result.eval_dates) else "empty"
+    path = output_dir / f"evaluate_{result.factor_name}_{start}_{end}.md"
+    parts = [
+        f"# Factor evaluation: {result.factor_name}",
+        "",
+        "## Summary",
+        _markdown_table(_result_summary(result)),
+        "",
+        "## IC decay",
+        _markdown_table(result.ic_decay, include_index=False),
+        "",
+        "## Quantile metrics",
+        _markdown_table(result.quantile_metrics.reset_index(), include_index=False),
+        "",
+        "## PIT diagnostics",
+        _markdown_table(pd.Series(result.diagnostics, name="value").to_frame()),
+    ]
+    path.write_text("\n".join(parts), encoding="utf-8")
+    return path
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="因子评估层")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--factors", help="逗号分隔因子名")
+    group.add_argument("--all", action="store_true", help="评估所有注册因子")
+    parser.add_argument("--start", type=date.fromisoformat, default=FACTOR_TRUST_FLOOR)
+    parser.add_argument("--end", type=date.fromisoformat, default=date.today())
+    parser.add_argument("--as-of", type=date.fromisoformat, default=None)
+    parser.add_argument("--eval-start", type=date.fromisoformat, default=None)
+    parser.add_argument("--horizons", type=_parse_csv_ints, default=DEFAULT_HORIZONS)
+    parser.add_argument("--n-quantiles", type=int, default=5)
+    parser.add_argument("--cost-bps", type=float, default=10.0)
+    persist_group = parser.add_mutually_exclusive_group()
+    persist_group.add_argument("--trials-path", type=Path, default=None)
+    persist_group.add_argument("--no-persist", action="store_true")
+    parser.add_argument("--note")
+    parser.add_argument("--strict", action="store_true")
+    args = parser.parse_args(argv)
+    if args.trials_path is None and not args.no_persist:
+        args.trials_path = DEFAULT_TRIALS_PATH
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    load_dotenv()
+    args = parse_args(argv)
+    if args.start < FACTOR_TRUST_FLOOR:
+        raise ValueError(f"--start must be >= {FACTOR_TRUST_FLOOR}")
+    if args.no_persist:
+        args.trials_path = None
+    engine = research_engine()
+    names = None if args.all else [part.strip() for part in args.factors.split(",") if part.strip()]
+    results = evaluate_all(
+        engine=engine,
+        start=args.start,
+        end=args.end,
+        names=names,
+        as_of=args.as_of,
+        eval_start=args.eval_start,
+        horizons=args.horizons,
+        n_quantiles=args.n_quantiles,
+        cost_bps=args.cost_bps,
+        trials_path=args.trials_path,
+        note=args.note,
+        strict=args.strict,
+    )
+    for result in results:
+        if result.status == "failed":
+            print(f"## {result.factor_name}\n\nfailed: {result.diagnostics.get('error')}")
+            continue
+        print(f"## {result.factor_name}")
+        print(_markdown_table(_result_summary(result)))
+        report = _write_markdown_report(result, OUTPUT_DIR)
+        print(f"\nreport: {report}\n")
+    return 0 if all(result.status != "failed" for result in results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
