@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from data_sources.ecb_fx_source import parse_ecb_fx_csv
-from data_sources.fred_source import parse_fred_rate_csv
+from data_sources.fred_source import parse_fred_observations
 from scripts.update_adjustment_factors import (
     compute_adjustment_factor_rows,
     evaluate_vendor_comparison,
@@ -34,40 +34,37 @@ class TestParseEcbCsv:
         assert {r["rate_date"] for r in rows} == {date(2026, 6, 10), date(2026, 6, 11)}
 
 
-FRED_CSV = """observation_date,DTB3
-2026-06-05,4.28
-2026-06-06,.
-2026-06-08,4.30
-"""
+FRED_PAYLOAD = {
+    "observations": [
+        {"date": "2026-06-05", "value": "4.28"},
+        {"date": "2026-06-06", "value": "."},
+        {"date": "2026-06-08", "value": "4.30"},
+    ]
+}
 
 
-class TestParseFredCsv:
+class TestParseFredObservations:
     def test_rows_parsed_and_missing_skipped(self):
-        rows = parse_fred_rate_csv(FRED_CSV)
+        rows = parse_fred_observations(FRED_PAYLOAD)
 
         assert rows == [
             {"date": date(2026, 6, 5), "series_id": "DTB3", "rate_pct": Decimal("4.28")},
             {"date": date(2026, 6, 8), "series_id": "DTB3", "rate_pct": Decimal("4.30")},
         ]
 
-    def test_since_filter(self):
-        rows = parse_fred_rate_csv(FRED_CSV, since=date(2026, 6, 8))
-
-        assert rows == [{"date": date(2026, 6, 8), "series_id": "DTB3", "rate_pct": Decimal("4.30")}]
-
-    def test_missing_series_column_raises(self):
-        with pytest.raises(ValueError, match="missing DTB3 column"):
-            parse_fred_rate_csv("observation_date,OTHER\n2026-06-05,4.28\n")
+    def test_missing_observations_key_raises(self):
+        with pytest.raises(ValueError, match="missing 'observations'"):
+            parse_fred_observations({})
 
     def test_bad_date_and_bad_value_raise(self):
         with pytest.raises(ValueError, match="invalid observation date"):
-            parse_fred_rate_csv("observation_date,DTB3\nnot-a-date,4.28\n")
-        with pytest.raises(ValueError, match="invalid DTB3 rate"):
-            parse_fred_rate_csv("observation_date,DTB3\n2026-06-05,bad\n")
+            parse_fred_observations({"observations": [{"date": "not-a-date", "value": "4.28"}]})
+        with pytest.raises(ValueError, match="invalid rate"):
+            parse_fred_observations({"observations": [{"date": "2026-06-05", "value": "bad"}]})
 
-    def test_no_rows_after_filter_raises(self):
+    def test_empty_observations_raises(self):
         with pytest.raises(ValueError, match="contained no DTB3 rows"):
-            parse_fred_rate_csv(FRED_CSV, since=date(2099, 1, 1))
+            parse_fred_observations({"observations": []})
 
 
 class _StubFx:
