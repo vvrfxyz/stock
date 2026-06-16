@@ -78,14 +78,14 @@ def test_si_staleness_truncates():
     panel = _compute(
         events,
         shares,
-        ["2026-01-29", "2026-02-14", "2026-02-15"],
+        ["2026-01-29", "2026-02-28", "2026-03-01"],
         visible_delay_days=14,
         si_max_staleness_days=30,
     )
 
     assert panel.loc["2026-01-29", 1] == 0.10
-    assert panel.loc["2026-02-14", 1] == 0.10
-    assert np.isnan(panel.loc["2026-02-15", 1])
+    assert panel.loc["2026-02-28", 1] == 0.10
+    assert np.isnan(panel.loc["2026-03-01", 1])
 
 
 def test_shares_staleness_independent():
@@ -133,6 +133,22 @@ def test_empty_events():
     empty_panel = _compute(_si_events(), _shares_events(), dates)
     assert empty_panel.columns.tolist() == []
     assert empty_panel.columns.dtype == np.dtype("int64")
+
+
+def test_compute_with_events_but_empty_shares():
+    dates = pd.DatetimeIndex(pd.to_datetime(["2026-01-15", "2026-01-16"]))
+    events = _si_events(
+        (1, "2026-01-15", "2026-01-15", 100),
+        (2, "2026-01-15", "2026-01-15", 200),
+    )
+
+    panel = _compute(events, _shares_events(), dates)
+
+    assert panel.index.equals(dates)
+    assert panel.columns.tolist() == [1, 2]
+    assert panel.columns.dtype == np.dtype("int64")
+    assert panel.dtypes.tolist() == [np.float64, np.float64]
+    assert panel.isna().to_numpy().all()
 
 
 def test_universe_is_union():
@@ -198,6 +214,26 @@ def test_loader_security_ids_filter(monkeypatch):
     empty = load_short_interest_ratio_panel(object(), dates=dates, security_ids=[])
     assert empty.columns.tolist() == []
     assert calls == [("si", None), ("shares", None), ("si", [2, 999]), ("shares", [2, 999])]
+
+
+def test_load_ratio_panel_dedupes_duplicate_security_ids(monkeypatch):
+    dates = pd.DatetimeIndex(pd.to_datetime(["2026-01-15"]))
+
+    def fake_load_short_interest_events(engine, *, security_ids=None):
+        return _si_events((2, "2026-01-15", "2026-01-15", 200))
+
+    def fake_load_shares_events(engine, *, security_ids=None):
+        return _shares_events((2, "2026-01-01", "2025-12-31", 2_000))
+
+    monkeypatch.setattr(short_interest, "load_short_interest_events", fake_load_short_interest_events)
+    monkeypatch.setattr(short_interest, "load_shares_events", fake_load_shares_events)
+
+    panel = load_short_interest_ratio_panel(object(), dates=dates, security_ids=[2, 2, 999], visible_delay_days=0)
+
+    assert panel.columns.tolist() == [2, 999]
+    assert panel.columns.dtype == np.dtype("int64")
+    assert panel.loc["2026-01-15", 2] == 0.10
+    assert panel[999].isna().all()
 
 
 def test_compute_empty_dates():

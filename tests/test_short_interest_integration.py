@@ -82,3 +82,16 @@ def test_load_short_interest_events_against_real_schema(pg_db):
     empty = load_short_interest_events(object(), security_ids=[])
     assert list(empty.columns) == ["security_id", "visible_date", "settlement_date", "short_interest"]
     assert empty.empty
+
+
+@pytest.mark.integration
+def test_distinct_on_id_desc_tiebreaker_when_created_at_equal(pg_db):
+    _insert_security(pg_db, 1, "aapl")
+    created_at = "2026-01-20 00:00:00+00"
+    _insert_short_interest(pg_db, 1, "2026-01-15", 100, "MASSIVE", created_at)
+    _insert_short_interest(pg_db, 1, "2026-01-15", 150, "TEST", created_at)
+
+    events = load_short_interest_events(pg_db.engine)
+
+    assert len(events) == 1
+    assert events["short_interest"].tolist() == [150]

@@ -84,6 +84,7 @@ def compute_short_interest_ratio_panel(
         ev = ev[pd.notna(ev["short_interest"])]
         ev["security_id"] = ev["security_id"].astype(np.int64)
         ev["short_interest"] = ev["short_interest"].astype(np.float64)
+    ev["effective_visible_date"] = ev["visible_date"] + pd.Timedelta(days=visible_delay_days)
 
     shares = shares_events.reindex(columns=_SHARES_COLUMNS).copy()
     if not shares.empty:
@@ -107,7 +108,7 @@ def compute_short_interest_ratio_panel(
         dates=dates,
         value_column="short_interest",
         visible_date_column="visible_date",
-        staleness_anchor_column="visible_date",
+        staleness_anchor_column="effective_visible_date",
         visible_delay_days=visible_delay_days,
         max_staleness_days=si_max_staleness_days,
         security_universe=security_ids,
@@ -138,6 +139,10 @@ def load_short_interest_ratio_panel(
     dates = pd.DatetimeIndex(pd.to_datetime(list(dates))).astype("datetime64[ns]")
     if security_ids is not None and not security_ids:
         return pd.DataFrame(index=dates, columns=pd.Index([], dtype=np.int64), dtype=np.float64)
+    requested_security_ids = None
+    if security_ids is not None:
+        requested_security_ids = pd.Index(security_ids, dtype=np.int64).drop_duplicates()
+        security_ids = requested_security_ids.tolist()
 
     events = load_short_interest_events(engine, security_ids=security_ids)
     shares_events = load_shares_events(engine, security_ids=security_ids)
@@ -149,6 +154,6 @@ def load_short_interest_ratio_panel(
         si_max_staleness_days=si_max_staleness_days,
         shares_max_staleness_days=shares_max_staleness_days,
     )
-    if security_ids is not None:
-        return panel.reindex(columns=pd.Index(security_ids, dtype=np.int64)).astype(np.float64)
+    if requested_security_ids is not None:
+        return panel.reindex(columns=requested_security_ids).astype(np.float64)
     return panel
