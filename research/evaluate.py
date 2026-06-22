@@ -202,9 +202,11 @@ def _quantile_metrics(
     if adj_close is None:
         index = pd.MultiIndex.from_tuples([], names=["horizon", "quantile_label"])
         return pd.DataFrame(columns=columns, index=index, dtype="float64")
-    rf_aligned = None
-    if risk_free_returns is not None:
-        rf_aligned = _align_risk_free_returns(risk_free_returns, adj_close.index)
+    rf_aligned = (
+        _align_risk_free_returns(risk_free_returns, adj_close.index)
+        if risk_free_returns is not None
+        else None
+    )
     rows: list[dict[str, Any]] = []
     labels = [f"q{i}" for i in range(1, n_quantiles + 1)] + [f"ls_q{n_quantiles}_q1"]
     for horizon in horizons:
@@ -225,15 +227,14 @@ def _quantile_metrics(
             )
             gross = gross_result.metrics()
             net = net_result.metrics()
-            sharpe_gross = gross.get("sharpe", np.nan)
-            sharpe_net = net.get("sharpe", np.nan)
-            if rf_aligned is not None:
-                rf = rf_aligned.reindex(net_result.daily_returns.index)
-                exposure = weights.shift(1).sum(axis=1).reindex(net_result.daily_returns.index).ffill().fillna(0.0)
-                gross_excess = gross_result.daily_returns - rf * exposure
-                net_excess = net_result.daily_returns - rf * exposure
-                sharpe_gross = _annualized_sharpe(gross_excess)
-                sharpe_net = _annualized_sharpe(net_excess)
+            if rf_aligned is None:
+                sharpe_gross = gross.get("sharpe", np.nan)
+                sharpe_net = net.get("sharpe", np.nan)
+            else:
+                exposure = weights.shift(1).sum(axis=1).fillna(0.0)
+                rf_drag = rf_aligned * exposure
+                sharpe_gross = _annualized_sharpe(gross_result.daily_returns - rf_drag)
+                sharpe_net = _annualized_sharpe(net_result.daily_returns - rf_drag)
             rows.append(
                 {
                     "horizon": horizon,
@@ -251,11 +252,14 @@ def _quantile_metrics(
 
 def _align_risk_free_returns(risk_free_returns: pd.Series, index: pd.Index) -> pd.Series:
     target = _normalize_dates(index)
-    rf = risk_free_returns.copy()
-    rf.index = _normalize_dates(rf.index)
+    rf = pd.Series(
+        pd.to_numeric(risk_free_returns.to_numpy(), errors="coerce"),
+        index=_normalize_dates(risk_free_returns.index),
+        name=getattr(risk_free_returns, "name", None),
+    )
     if rf.index.has_duplicates:
         raise FactorEvaluationError("risk_free_returns index contains duplicate dates")
-    aligned = pd.to_numeric(rf.reindex(target), errors="coerce")
+    aligned = rf.reindex(target)
     missing = aligned[aligned.isna()].index
     if len(missing) > 0:
         sample = ", ".join(str(ts.date()) for ts in missing[:5])
@@ -263,7 +267,7 @@ def _align_risk_free_returns(risk_free_returns: pd.Series, index: pd.Index) -> p
         raise FactorEvaluationError(
             f"risk_free_returns missing {len(missing)} dates required for quantile backtest: {sample}{suffix}"
         )
-    return pd.Series(aligned.to_numpy(dtype="float64"), index=target, name=getattr(risk_free_returns, "name", None))
+    return aligned
 
 
 def _annualized_sharpe(returns: pd.Series) -> float:
