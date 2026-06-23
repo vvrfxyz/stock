@@ -121,7 +121,7 @@ def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseMan
     securities = get_securities_to_update(db_manager, args)
     if not securities:
         logger.success("没有需要更新详情的证券。")
-        return 0
+        return 0, {"processed": 0, "written": 0, "failed": 0}
 
     logger.info("共 {} 支证券需要更新详情，将使用最多 {} 个线程。", len(securities), args.workers)
     outputs, results_counter = run_concurrently(
@@ -138,7 +138,10 @@ def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseMan
     logger.info("  跳过(无数据): {}", results_counter["SKIPPED_NO_DATA"])
     logger.info("  错误: {}", results_counter["ERROR"] + results_counter["FATAL_ERROR"])
     logger.info("----------------------")
-    return 1 if results_counter["ERROR"] + results_counter["FATAL_ERROR"] else 0
+    errors = results_counter["ERROR"] + results_counter["FATAL_ERROR"]
+    exit_code = 1 if errors else 0
+    stats = {"processed": len(securities), "written": results_counter["SUCCESS"], "failed": errors}
+    return exit_code, stats
 
 
 def main(argv: list[str] | None = None) -> int:

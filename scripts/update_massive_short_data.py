@@ -155,7 +155,7 @@ def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseMan
     securities = get_securities_to_update(db_manager, args, end_date)
     if not securities:
         logger.success("没有需要更新 short data 的证券。")
-        return 0
+        return 0, {"processed": 0, "written": 0, "failed": 0}
 
     batches = iter_chunks(securities, API_BATCH_SIZE)
     outputs, results_counter = run_concurrently(
@@ -178,7 +178,10 @@ def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseMan
     logger.info("  short_interest 写入行数: {}", total_interests)
     logger.info("  short_volume 写入行数: {}", total_volumes)
     logger.info("---------------------------")
-    return 1 if results_counter["FATAL_ERROR"] else 0
+    errors = results_counter["FATAL_ERROR"]
+    exit_code = 1 if errors else 0
+    stats = {"processed": len(securities), "written": total_interests + total_volumes, "failed": errors}
+    return exit_code, stats
 
 
 def main(argv: list[str] | None = None) -> int:

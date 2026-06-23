@@ -110,9 +110,9 @@ def report_identity_health(session) -> int:
     """)).scalar()
     if row > 0:
         issues += row
-        logger.warning("  同 FIGI 多 security_id: {} 组", row)
+        logger.warning("  [P0] 同 FIGI 多 security_id: {} 组", row)
     else:
-        logger.info("  同 FIGI 多 security_id: 0 (OK)")
+        logger.info("  [P0] 同 FIGI 多 security_id: 0 (OK)")
 
     # 同 CIK 多 id
     row = session.execute(text("""
@@ -189,12 +189,12 @@ def report_pipeline_runs(session, days: int) -> int:
     return issues
 
 
-def report_price_data_consistency(session) -> int:
-    """价格数据一致性快速检查。"""
+def report_price_data_consistency(session) -> tuple[int, int]:
+    """价格数据一致性快速检查。返回 (p0_issues, p1_issues)。"""
     _section("价格数据一致性")
-    issues = 0
+    p0 = p1 = 0
 
-    # securities.price_data_latest_date 与实际 daily_prices 不一致
+    # P0: securities.price_data_latest_date 与实际 daily_prices 不一致
     row = session.execute(text("""
         SELECT count(*) FROM securities s
         WHERE s.is_active AND s.price_data_latest_date IS NOT NULL
@@ -203,12 +203,12 @@ def report_price_data_consistency(session) -> int:
           )
     """)).scalar()
     if row > 0:
-        issues += row
-        logger.warning("  price_data_latest_date 与实际不一致: {} 只", row)
+        p0 += row
+        logger.warning("  [P0] price_data_latest_date 与实际不一致: {} 只", row)
     else:
-        logger.info("  price_data_latest_date 一致性: OK")
+        logger.info("  [P0] price_data_latest_date 一致性: OK")
 
-    # 活跃证券无价格数据
+    # P1: 活跃证券无价格数据
     row = session.execute(text("""
         SELECT count(*) FROM securities s
         WHERE s.is_active AND upper(s.market) = 'US'
@@ -216,11 +216,37 @@ def report_price_data_consistency(session) -> int:
           AND s.price_data_latest_date IS NULL
     """)).scalar()
     if row > 0:
-        logger.warning("  活跃证券无价格数据: {} 只", row)
+        p1 += row
+        logger.warning("  [P1] 活跃证券无价格数据: {} 只", row)
     else:
-        logger.info("  活跃证券无价格数据: 0 (OK)")
+        logger.info("  [P1] 活跃证券无价格数据: 0 (OK)")
 
-    return issues
+    return p0, p1
+
+
+def report_staleness(session) -> int:
+    """P2 advisory: 各数据域的新鲜度。"""
+    _section("数据新鲜度 (P2 Advisory)")
+    p2 = 0
+    stale_checks = [
+        ("info_last_updated_at", 30, "详情 (details)"),
+        ("shares_last_updated_at", 14, "股本 (shares)"),
+        ("actions_last_updated_at", 90, "公司行动 (actions)"),
+        ("short_data_last_updated_at", 7, "空头数据 (short)"),
+    ]
+    for col, max_days, label in stale_checks:
+        row = session.execute(text(f"""
+            SELECT count(*) FROM securities
+            WHERE is_active AND upper(market) = 'US'
+              AND type IN ('CS', 'ETF')
+              AND ({col} IS NULL OR {col} < now() - make_interval(days => :days))
+        """), {"days": max_days}).scalar()
+        if row > 0:
+            p2 += 1
+            logger.info("  [P2] {} 超过 {} 天未更新: {} 只", label, max_days, row)
+        else:
+            logger.info("  [P2] {} 新鲜度: OK", label)
+    return p2
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -231,19 +257,28 @@ def main(argv: list[str] | None = None) -> int:
     db_manager = None
     try:
         db_manager = DatabaseManager()
-        total_issues = 0
+        p0_total = p1_total = p2_total = 0
         with db_manager.get_session() as session:
             report_securities_summary(session)
-            total_issues += report_table_freshness(session)
-            total_issues += report_price_data_consistency(session)
-            total_issues += report_identity_health(session)
-            total_issues += report_pipeline_runs(session, args.days)
+            p1_total += report_table_freshness(session)
+            p0, p1 = report_price_data_consistency(session)
+            p0_total += p0
+            p1_total += p1
+            p0_total += report_identity_health(session)
+            p1_total += report_pipeline_runs(session, args.days)
+            p2_total += report_staleness(session)
 
-        _section("汇总")
-        if total_issues > 0:
-            logger.warning("  发现 {} 项需要关注的问题。", total_issues)
-        else:
-            logger.success("  所有检查通过。")
+        _section("汇总（按严重度分层）")
+        logger.info("  P0 BLOCKING : {} 项", p0_total)
+        logger.info("  P1 WARNING  : {} 项", p1_total)
+        logger.info("  P2 ADVISORY : {} 项", p2_total)
+        if p0_total > 0:
+            logger.error("  存在 P0 阻塞性问题，需要立即处理。")
+            return 2
+        if p1_total > 0:
+            logger.warning("  存在 P1 告警，建议关注。")
+            return 1
+        logger.success("  所有检查通过。")
 
         return 1 if total_issues > 0 else 0
     except Exception as exc:

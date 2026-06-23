@@ -342,8 +342,8 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             if issues > 0:
-                logger.error("发现数据一致性问题（样例计数）: {}", issues)
-                return 1
+                logger.error("发现 {} 项阻塞性数据一致性问题。", issues)
+                return 2
             logger.success("数据一致性检查通过。")
             return 0
     except Exception as exc:

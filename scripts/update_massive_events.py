@@ -77,7 +77,7 @@ def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseMan
     securities = get_securities_to_update(db_manager, args)
     if not securities:
         logger.success("没有需要更新 ticker events 的证券。")
-        return 0
+        return 0, {"processed": 0, "written": 0, "failed": 0}
 
     outputs, results_counter = run_concurrently(
         securities,
@@ -95,7 +95,10 @@ def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseMan
     logger.info("  错误: {}", results_counter["ERROR"] + results_counter["FATAL_ERROR"])
     logger.info("  写入 symbol history 行数: {}", total_rows)
     logger.info("------------------------------")
-    return 1 if results_counter["ERROR"] + results_counter["FATAL_ERROR"] else 0
+    errors = results_counter["ERROR"] + results_counter["FATAL_ERROR"]
+    exit_code = 1 if errors else 0
+    stats = {"processed": len(securities), "written": total_rows, "failed": errors}
+    return exit_code, stats
 
 
 def main(argv: list[str] | None = None) -> int:

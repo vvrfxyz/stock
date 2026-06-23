@@ -362,8 +362,9 @@ def run_scheduled_update(args):
         except SystemExit as exc:
             exit_code = exc.code or 1
             error_msg = f"exit={exc.code}"
-            failed_steps.append(f"{step.name}(exit={exc.code})")
-            logger.error("步骤 {} 失败（exit={}），继续执行后续步骤。", step.name, exc.code)
+            severity = "BLOCKING" if exc.code == 2 else "WARNING"
+            failed_steps.append(f"{step.name}(exit={exc.code},{severity})")
+            logger.error("步骤 {} 失败（exit={}, {}），继续执行后续步骤。", step.name, exc.code, severity)
         except Exception as exc:
             exit_code = 1
             error_msg = f"{type(exc).__name__}: {exc}"
@@ -382,8 +383,10 @@ def run_scheduled_update(args):
             pass
 
     if failed_steps:
+        has_blocking = any("BLOCKING" in s for s in failed_steps)
+        overall_exit = 2 if has_blocking else 1
         logger.error("scheduled_update 完成，但 {}/{} 个步骤失败: {}", len(failed_steps), len(steps), ", ".join(failed_steps))
-        raise SystemExit(1)
+        raise SystemExit(overall_exit)
     logger.success("scheduled_update 全部 {} 个步骤成功。", len(steps))
 
 

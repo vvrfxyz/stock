@@ -175,7 +175,7 @@ def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseMan
     securities = get_securities_to_process(db_manager, args, end_date)
     if not securities:
         logger.success("没有需要更新 shares 的证券。")
-        return 0
+        return 0, {"processed": 0, "written": 0, "failed": 0}
 
     outputs, results_counter = run_concurrently(
         securities,
@@ -239,10 +239,12 @@ def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseMan
     logger.info("  historical_floats 行数: {}", len(historical_float_rows))
     logger.info("  float_shares 匹配行数: {}", float_match_count)
     logger.info("----------------------")
-    exit_code = _get_exit_code(results_counter)
+    errors = results_counter["ERROR"] + results_counter["FATAL_ERROR"]
+    exit_code = 1 if errors else 0
     if exit_code != 0:
         logger.error("shares 更新存在失败 symbol，本轮退出码设为 {}，以便外层重跑该 chunk。", exit_code)
-    return exit_code
+    stats = {"processed": len(securities), "written": len(all_rows) + len(historical_float_rows), "failed": errors}
+    return exit_code, stats
 
 
 def main(argv: list[str] | None = None) -> int:
