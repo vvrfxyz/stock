@@ -147,6 +147,47 @@ class TestUpsertSecuritiesBySymbol:
         assert new_id > 100
 
 
+class TestSecurityIdentityChanges:
+    def test_rename_updates_symbol_and_writes_history(self, pg_db):
+        _insert_security(pg_db, 1, "fb", composite_figi="BBG000MM2P62", exchange="XNAS")
+
+        pg_db.rename_security(1, old_symbol="fb", new_symbol="meta", exchange="XNAS")
+
+        assert _scalar(pg_db, "SELECT symbol FROM securities WHERE id=1") == "meta"
+        assert _scalar(pg_db, "SELECT current_symbol FROM securities WHERE id=1") == "meta"
+        assert _scalar(pg_db, "SELECT count(*) FROM security_symbol_history WHERE security_id=1 AND symbol='fb'") == 1
+
+    def test_rename_is_idempotent_on_history(self, pg_db):
+        _insert_security(pg_db, 1, "fb", exchange="XNAS")
+
+        pg_db.rename_security(1, old_symbol="fb", new_symbol="meta", exchange="XNAS")
+        pg_db.rename_security(1, old_symbol="fb", new_symbol="meta", exchange="XNAS")
+
+        assert _scalar(pg_db, "SELECT count(*) FROM security_symbol_history WHERE security_id=1 AND symbol='fb'") == 1
+
+    def test_insert_identity_events(self, pg_db):
+        _insert_security(pg_db, 1, "meta")
+
+        count = pg_db.insert_identity_events([
+            {"security_id": 1, "event_type": "RENAME", "old_symbol": "fb", "new_symbol": "meta",
+             "resolution_source": "AUTO", "confidence": "HIGH"},
+            {"security_id": 1, "event_type": "NEW_LISTING", "new_symbol": "meta",
+             "resolution_source": "AUTO", "confidence": "HIGH"},
+        ])
+
+        assert count == 2
+        assert _scalar(pg_db, "SELECT count(*) FROM security_identity_events WHERE security_id=1") == 2
+        assert _scalar(pg_db, "SELECT event_type FROM security_identity_events WHERE old_symbol='fb'") == "RENAME"
+
+    def test_insert_identity_events_skips_invalid_rows(self, pg_db):
+        count = pg_db.insert_identity_events([
+            {"security_id": None, "event_type": "RENAME"},
+            {"security_id": 1, "event_type": None},
+            {},
+        ])
+        assert count == 0
+
+
 class TestSecurityTimestamps:
     def test_update_security_timestamps_batch(self, pg_db):
         _insert_security(pg_db, 1, "aapl")

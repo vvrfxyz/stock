@@ -8,9 +8,9 @@ from loguru import logger
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from data_models.models import Security
+from data_models.models import Security, SecurityIdentityEvent, SecuritySymbolHistory
 
-from .helpers import _group_rows_by_key_set
+from .helpers import _clean_for_model, _group_rows_by_key_set
 
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -131,7 +131,7 @@ class SecuritiesMixin:
     def upsert_securities_by_symbol(self, securities_data: list[dict], touch_info_timestamp: bool = False) -> int:
         """
         基于 symbol 的批量 UPSERT，适合全市场 reference/universe 同步。
-        默认不更新 info_last_updated_at，避免把“基础引用数据刷新”误判成“详情刷新”。
+        默认不更新 info_last_updated_at，避免把"基础引用数据刷新"误判成"详情刷新"。
         """
         if not securities_data:
             return 0
@@ -205,7 +205,7 @@ class SecuritiesMixin:
             self._lock_model_sequence_sync(conn, Security)
             self._sync_model_id_sequence(conn, Security)
             # 详情 payload 会剔除 None 字段，键集可能互不相同；多行 VALUES 必须按键集分组，
-            # 否则 SQLAlchemy 抛 CompileError。分组同时保留“只更新提供字段”的语义。
+            # 否则 SQLAlchemy 抛 CompileError。分组同时保留"只更新提供字段"的语义。
             for group in _group_rows_by_key_set(safe_rows):
                 stmt = pg_insert(Security).values(group)
                 update_keys = set(group[0].keys())
@@ -283,7 +283,7 @@ class SecuritiesMixin:
     def ensure_security_price_latest_date_at_least(self, security_ids: list[int], latest_date: date) -> int:
         """
         将 Security.price_data_latest_date 至少推进到指定日期。
-        适用于“覆盖更新已有价格行”后同步 metadata，避免 latest_date 落后于实际数据。
+        适用于"覆盖更新已有价格行"后同步 metadata，避免 latest_date 落后于实际数据。
         """
         if not security_ids:
             return 0
@@ -301,3 +301,63 @@ class SecuritiesMixin:
             result = conn.execute(stmt)
             conn.commit()
             return result.rowcount or 0
+
+    # ------------------------------------------------------------------ #
+    # 身份变更
+    # ------------------------------------------------------------------ #
+    def rename_security(
+        self,
+        security_id: int,
+        old_symbol: str,
+        new_symbol: str,
+        *,
+        exchange: str | None = None,
+        source: str = "MASSIVE",
+    ) -> None:
+        """改名：更新 symbol/current_symbol 并写 symbol history 行。
+
+        调用方需保证 new_symbol 不与其他活跃行冲突（resolver 已做前置检查）。
+        """
+        with self.engine.connect() as conn:
+            conn.execute(
+                update(Security)
+                .where(Security.id == security_id)
+                .values(symbol=new_symbol, current_symbol=new_symbol)
+            )
+            self._lock_model_sequence_sync(conn, SecuritySymbolHistory)
+            self._sync_model_id_sequence(conn, SecuritySymbolHistory)
+            history_row = _clean_for_model(SecuritySymbolHistory, {
+                "security_id": security_id,
+                "symbol": old_symbol,
+                "exchange": exchange,
+                "source": source,
+                "event_type": "ticker_change",
+                "start_date": date.today(),
+            })
+            stmt = pg_insert(SecuritySymbolHistory).values(history_row)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["security_id", "symbol", "source", "start_date"],
+                set_={"exchange": stmt.excluded.exchange, "event_type": stmt.excluded.event_type},
+            )
+            conn.execute(stmt)
+            conn.commit()
+        logger.info(
+            "证券 id={} 改名: {} -> {}",
+            security_id, old_symbol, new_symbol,
+        )
+
+    def insert_identity_events(self, events: list[dict]) -> int:
+        """批量写入身份变更事件（纯追加，不做 upsert）。"""
+        rows = [_clean_for_model(SecurityIdentityEvent, e) for e in events]
+        rows = [r for r in rows if r.get("security_id") and r.get("event_type")]
+        if not rows:
+            return 0
+        total = 0
+        with self.engine.connect() as conn:
+            self._lock_model_sequence_sync(conn, SecurityIdentityEvent)
+            self._sync_model_id_sequence(conn, SecurityIdentityEvent)
+            for group in _group_rows_by_key_set(rows):
+                result = conn.execute(pg_insert(SecurityIdentityEvent).values(group))
+                total += result.rowcount
+            conn.commit()
+        return total
