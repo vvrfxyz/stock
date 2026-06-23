@@ -140,15 +140,18 @@ def apply_merge(db_manager, plan: dict) -> int:
     with db_manager.engine.connect() as conn:
         for merge_id in plan["merge_ids"]:
             for table in TABLES_WITH_SECURITY_ID:
+                savepoint = conn.begin_nested()
                 try:
                     result = conn.execute(text(
                         f"UPDATE {table} SET security_id = :keep WHERE security_id = :old"
                     ), {"keep": keep_id, "old": merge_id})
                     rows_migrated += result.rowcount or 0
+                    savepoint.commit()
                 except Exception as exc:
-                    logger.opt(exception=exc).warning(
-                        "合并 {} -> {}: {} 表迁移失败（可能有唯一约束冲突）: {}",
-                        merge_id, keep_id, table, exc,
+                    savepoint.rollback()
+                    logger.warning(
+                        "合并 {} -> {}: {} 表迁移跳过（唯一约束冲突）: {}",
+                        merge_id, keep_id, table, type(exc).__name__,
                     )
             conn.execute(text(
                 "UPDATE securities SET is_active = false WHERE id = :old"
