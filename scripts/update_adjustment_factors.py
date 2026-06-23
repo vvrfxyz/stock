@@ -69,6 +69,18 @@ def create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--daily-start-date", type=str, help="refresh vendor daily bars 的开始日期。")
     parser.add_argument("--daily-end-date", type=str, help="refresh vendor daily bars 的结束日期。")
+    parser.add_argument(
+        "--fail-on-vendor-mismatch",
+        action="store_true",
+        help="如果存在 vendor mismatch，以非零退出码结束（用于周末全量重建严格模式）。",
+    )
+    parser.add_argument(
+        "--max-mismatch-rate",
+        type=float,
+        default=None,
+        help="允许的最大 vendor mismatch 比率 (0.0-1.0)，超过则非零退出。"
+             "例如 0.05 表示最多容忍 5%% 的证券出现 mismatch。",
+    )
     return parser
 
 
@@ -730,6 +742,30 @@ def main(argv: list[str] | None = None) -> int:
                         row["abs_diff"],
                     )
         logger.info("--------------------------")
+
+        # vendor mismatch 严格模式检查
+        if mismatch_examples:
+            mismatch_count = status_counter.get("SUCCESS_VENDOR_MISMATCH", 0)
+            total_with_vendor = mismatch_count + status_counter.get("SUCCESS_MATCHED_VENDOR", 0)
+
+            if args.fail_on_vendor_mismatch:
+                logger.error(
+                    "严格模式: 发现 {} 只证券存在 vendor mismatch，非零退出。",
+                    mismatch_count,
+                )
+                return 1
+
+            if args.max_mismatch_rate is not None and total_with_vendor > 0:
+                actual_rate = mismatch_count / total_with_vendor
+                if actual_rate > args.max_mismatch_rate:
+                    logger.error(
+                        "Vendor mismatch 比率 {:.2%} 超过阈值 {:.2%} ({}/{})，非零退出。",
+                        actual_rate,
+                        args.max_mismatch_rate,
+                        mismatch_count,
+                        total_with_vendor,
+                    )
+                    return 1
 
         return 0
     except Exception as e:

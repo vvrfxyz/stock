@@ -60,13 +60,15 @@ def load_price_long(
     params: dict = {"start": start, "end": end, "types": list(types)}
     if security_ids:
         params["security_ids"] = security_ids
-    chunks = pd.read_sql_query(
+    chunks = list(pd.read_sql_query(
         sql,
         engine,
         params=params,
         chunksize=500_000,
         parse_dates=["date"],
-    )
+    ))
+    if not chunks:
+        return pd.DataFrame(columns=["security_id", "date", "open", "close", "volume", "vwap"])
     df = pd.concat(chunks, ignore_index=True)
     df["security_id"] = df["security_id"].astype(np.int32)
     return df

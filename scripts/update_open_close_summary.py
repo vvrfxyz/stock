@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 
 from loguru import logger
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from tqdm import tqdm
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -92,7 +92,7 @@ def get_candidates_for_date(
     with db_manager.get_session() as session:
         query = session.query(DailyPrice.security_id).filter(DailyPrice.date == target_date)
         if not overwrite:
-            query = query.filter(DailyPrice.pre_market.is_(None), DailyPrice.after_hours.is_(None))
+            query = query.filter(or_(DailyPrice.pre_market.is_(None), DailyPrice.after_hours.is_(None)))
         rows = query.all()
 
     candidates: list[tuple[int, str]] = []

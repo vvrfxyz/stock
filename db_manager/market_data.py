@@ -12,7 +12,7 @@ from data_models.models import (
     ShortVolume,
 )
 
-from .helpers import _clean_for_model, _dedupe_rows_by_key, _normalize_batch_rows
+from .helpers import _clean_for_model, _dedupe_rows_by_key, _group_rows_by_key_set, _normalize_batch_rows
 
 
 class MarketDataMixin:
@@ -20,36 +20,40 @@ class MarketDataMixin:
         """
         批量插入或更新日线价格数据 (基于UPSERT)。
         此方法适用于 Massive aggregates / grouped daily 等批量价格写入。
+        按 key set 分组执行，避免混合键集批次把缺失字段覆盖成 NULL。
         """
         if not price_data:
             return 0
 
         price_data = _dedupe_rows_by_key(price_data, ['security_id', 'date'])
-        stmt = pg_insert(DailyPrice).values(price_data)
-        # 动态构建更新集
-        update_keys = set().union(*(row.keys() for row in price_data))
-        update_columns = {}
-        if 'open' in update_keys: update_columns['open'] = stmt.excluded.open
-        if 'high' in update_keys: update_columns['high'] = stmt.excluded.high
-        if 'low' in update_keys: update_columns['low'] = stmt.excluded.low
-        if 'close' in update_keys: update_columns['close'] = stmt.excluded.close
-        if 'volume' in update_keys: update_columns['volume'] = stmt.excluded.volume
-        if 'vwap' in update_keys: update_columns['vwap'] = stmt.excluded.vwap
-        if 'trade_count' in update_keys: update_columns['trade_count'] = stmt.excluded.trade_count
-        if 'otc' in update_keys: update_columns['otc'] = stmt.excluded.otc
-        if 'pre_market' in update_keys: update_columns['pre_market'] = stmt.excluded.pre_market
-        if 'after_hours' in update_keys: update_columns['after_hours'] = stmt.excluded.after_hours
-        if not update_columns:
-            stmt = stmt.on_conflict_do_nothing(index_elements=['security_id', 'date'])
-        else:
-            stmt = stmt.on_conflict_do_update(
-                index_elements=['security_id', 'date'],
-                set_=update_columns
-            )
-        with self.engine.connect() as conn:
-            result = conn.execute(stmt)
-            conn.commit()
-            return result.rowcount
+        total_rowcount = 0
+        for group in _group_rows_by_key_set(price_data):
+            stmt = pg_insert(DailyPrice).values(group)
+            # 动态构建更新集——只覆盖本组明确提供的字段
+            update_keys = set(group[0].keys())
+            update_columns = {}
+            if 'open' in update_keys: update_columns['open'] = stmt.excluded.open
+            if 'high' in update_keys: update_columns['high'] = stmt.excluded.high
+            if 'low' in update_keys: update_columns['low'] = stmt.excluded.low
+            if 'close' in update_keys: update_columns['close'] = stmt.excluded.close
+            if 'volume' in update_keys: update_columns['volume'] = stmt.excluded.volume
+            if 'vwap' in update_keys: update_columns['vwap'] = stmt.excluded.vwap
+            if 'trade_count' in update_keys: update_columns['trade_count'] = stmt.excluded.trade_count
+            if 'otc' in update_keys: update_columns['otc'] = stmt.excluded.otc
+            if 'pre_market' in update_keys: update_columns['pre_market'] = stmt.excluded.pre_market
+            if 'after_hours' in update_keys: update_columns['after_hours'] = stmt.excluded.after_hours
+            if not update_columns:
+                stmt = stmt.on_conflict_do_nothing(index_elements=['security_id', 'date'])
+            else:
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=['security_id', 'date'],
+                    set_=update_columns
+                )
+            with self.engine.connect() as conn:
+                result = conn.execute(stmt)
+                conn.commit()
+                total_rowcount += result.rowcount
+        return total_rowcount
 
     def get_security_price_max_date(self, security_id: int) -> date | None:
         """返回某个 security 在 daily_prices 中实际存在的最大交易日。"""

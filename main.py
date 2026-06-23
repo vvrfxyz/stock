@@ -642,6 +642,11 @@ def run_rebuild_massive_dataset(args):
             ],
         )
 
+    # 重建后必须刷新复权因子 cache，否则 raw facts 是新的但复权读取层过期
+    execute_script(update_adjustment_factors_main, ['--market', market, '--all'])
+    # 全量完整性检查
+    execute_script(check_data_integrity_main, ['--window-days', '730'])
+
 
 def run_migrate(args):
     logger.info("执行: 数据库迁移")

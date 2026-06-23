@@ -52,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     db_manager = None
+    source = None
     try:
         enforce_us_market(args.market)
         api_keys = get_massive_api_keys()
@@ -99,6 +100,8 @@ def main(argv: list[str] | None = None) -> int:
         logger.opt(exception=e).critical("sync_massive_universe 执行失败: {}", e)
         return 1
     finally:
+        if source:
+            source.close()
         if db_manager:
             db_manager.close()
         logger.info("耗时: {}", timedelta(seconds=time.monotonic() - start_time))
