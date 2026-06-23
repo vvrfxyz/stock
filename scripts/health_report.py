@@ -102,19 +102,20 @@ def report_identity_health(session) -> int:
     _section("身份健康")
     issues = 0
 
-    # 同 FIGI 多 id
+    # 同 FIGI 多个活跃 id（已合并的 inactive 旧行不算）
     row = session.execute(text("""
         SELECT count(*) FROM (
             SELECT composite_figi FROM securities
             WHERE composite_figi IS NOT NULL AND composite_figi <> ''
+              AND is_active
             GROUP BY composite_figi HAVING count(*) > 1
         ) t
     """)).scalar()
     if row > 0:
         issues += row
-        logger.warning("  [P0] 同 FIGI 多 security_id: {} 组", row)
+        logger.warning("  [P0] 同 FIGI 多个活跃 security_id: {} 组", row)
     else:
-        logger.info("  [P0] 同 FIGI 多 security_id: 0 (OK)")
+        logger.info("  [P0] 同 FIGI 多个活跃 security_id: 0 (OK)")
 
     # 同 CIK 多 id
     row = session.execute(text("""
