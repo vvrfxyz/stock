@@ -164,6 +164,29 @@ class SecuritySymbolHistory(Base):
     )
 
 
+class SecurityIdentityEvent(Base):
+    """证券身份变更事件——每次自动解析或人工修复都写一行，用于审计和回溯。"""
+    __tablename__ = 'security_identity_events'
+    id = Column(BigInteger, primary_key=True)
+    security_id = Column(BigInteger, ForeignKey('securities.id'), nullable=False, index=True)
+    event_type = Column(String(30), nullable=False, index=True,
+                        comment="RENAME / RECYCLE / MERGE / SPLIT_IDENTITY / QUARANTINE / NEW_LISTING / MANUAL")
+    old_symbol = Column(String(30), nullable=True)
+    new_symbol = Column(String(30), nullable=True)
+    related_security_id = Column(BigInteger, nullable=True, index=True,
+                                  comment="合并/拆分时涉及的另一个 security_id")
+    resolution_source = Column(String(30), nullable=False, server_default='AUTO',
+                                comment="AUTO / MANUAL / AUDIT")
+    confidence = Column(String(20), nullable=True, comment="HIGH / MEDIUM / LOW")
+    details = Column(Text, nullable=True, comment="JSON: FIGI/CIK 匹配细节等")
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+
+    security = relationship("Security")
+    __table_args__ = (
+        Index('ix_identity_event_type_created', 'event_type', 'created_at'),
+    )
+
+
 class CorporateAction(Base):
     __tablename__ = 'corporate_actions'
     id = Column(BigInteger, primary_key=True)
