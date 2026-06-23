@@ -31,6 +31,7 @@ Core architecture rules:
 - `alembic/versions/`: PostgreSQL migrations.
 - `research/`: 离线研究层（只读，绝不回写事实表）——`data.py` 批量复权面板加载（与 `utils/adjusted_prices` 同口径，有一致性测试锁定），`fundamentals.py` 基本面 PIT 归一化（`sec_fundamental_facts` -> TTM/时点指标 as-of 面板：重述感知 vintage 口径——as-of t 取 filed_date <= t 的最新已申报值，TTM 三分量锁同一 concept、任一分量重述即发新事件，营收同义概念按标准营收族优先级在事件流层 coalesce（含银行/保险的 RevenuesNetOfInterestExpense 等行业概念），270 天新鲜度门槛置 NaN），`backtest.py` 向量化回测引擎（t 日权重赚 t+1 收益，换手计成本），`strategies.py` 技术基线，`run_baselines.py` 入口。连库优先 `RESEARCH_DATABASE_URL`（指向 253 生产库）。
   - 回测数据边界：`computed_adjustment_factors` 只覆盖 ex_date >= 2024-05-14（Massive 免费档 730 天窗口决定的因子可信下限），更早的"复权价"未真正复权，面板不得早于该日；窗口内有 SPLIT 但无因子行的证券（因子构建只跑 is_active=True，退市股有缺口）须用 `securities_with_uncovered_events` 整体剔除。
+  - 因子库（`research/factors/`）：PIT 因子框架，详见 `docs/factors.md`。当前 4 个 builtin 因子——`size`（log 市值）、`earnings_yield`（盈利收益率）、`short_interest_ratio`（空头仓位占比）、`short_volume_ratio`（日做空成交占比）。新增因子只需在 `builtins/` 下写一个 `@dataclass(frozen=True)` 类 + `register()` 即可。评估用 `python -m research.evaluate --factors size --start 2024-05-14`。
 
 ## Current Tables
 

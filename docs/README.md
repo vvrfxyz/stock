@@ -4,6 +4,9 @@
 
 ## 当前有效文档
 
+- [因子库](./factors.md)
+  研究层因子框架架构、4 个内置因子目录（size / earnings_yield / short_interest_ratio / short_volume_ratio）、评估命令、新增因子指南、路线图。
+
 - [Architecture](./architecture.md)
   当前 PostgreSQL raw truth、Massive-only ingestion、复权 reference/cache。
 

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added (2026-06-23)
+
+- `short_volume_ratio` factor: daily FINRA short volume ratio (`short_volume / total_volume`) as a PIT builtin factor, complementing the semi-monthly `short_interest_ratio`. Uses T+1 visible delay and 10-day staleness. `research/short_volume.py` + `research/factors/builtins/short_volume.py` + 11 unit tests.
+
+### Added (2026-06-17)
+
+- `short_interest_ratio` factor: semi-monthly PIT short interest ratio (`short_interest / total_shares`) as the first non-fundamentals builtin factor. Uses `event_table_to_asof_panel` with 14-day visible delay and 30-day staleness. `research/short_interest.py` + `research/factors/builtins/short_interest.py` + 18 unit tests.
+
 ### Added (2026-06-15)
 
 - Risk-free reference layer for research metrics: `risk_free_rates` table (migration `a6b7c8d9e0f1`) + `update_risk_free_rates` FRED CSV sync + `utils/risk_free_rates.load_risk_free_daily_returns`. Sunday `scheduled_update` refreshes DTB3 for the last 30 days.
