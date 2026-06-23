@@ -38,6 +38,7 @@ from scripts.update_massive_short_data import main as update_massive_short_data_
 from scripts.update_massive_news import main as update_massive_news_main
 from scripts.update_adjustment_factors import main as update_adjustment_factors_main
 from scripts.update_open_close_summary import main as update_open_close_summary_main
+from scripts.check_data_integrity import main as check_data_integrity_main
 from scripts.cleanup_us_universe import main as cleanup_us_universe_main
 from scripts.migrate_database import main as migrate_main
 from utils.script_logging import setup_logging as configure_script_logging
@@ -173,6 +174,11 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
                 "--end-date",
                 end_trading_date.isoformat(),
             ],
+        ),
+        ScheduledStep(
+            "check_data_integrity",
+            check_data_integrity_main,
+            ["--limit", "5", "--window-days", "14"],
         ),
     ]
 

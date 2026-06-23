@@ -319,7 +319,7 @@ def check_unexplained_jumps(session, limit: int, window_start: date, threshold: 
     return 0  # 预警不计入失败退出码
 
 
-def main(argv: list[str] | None = None):
+def main(argv: list[str] | None = None) -> int:
     start_time = time.monotonic()
     setup_logging()
     args = create_parser().parse_args(argv)
@@ -342,14 +342,18 @@ def main(argv: list[str] | None = None):
             )
 
             if issues > 0:
-                logger.error(f"发现数据一致性问题（样例计数）: {issues}")
-                raise SystemExit(2)
-            logger.success("🎉 数据一致性检查通过。")
+                logger.error("发现数据一致性问题（样例计数）: {}", issues)
+                return 1
+            logger.success("数据一致性检查通过。")
+            return 0
+    except Exception as exc:
+        logger.opt(exception=exc).critical("check_data_integrity 执行失败: {}", exc)
+        return 1
     finally:
         if db_manager:
             db_manager.close()
-        logger.info(f"🏁 脚本执行完毕。总耗时: {timedelta(seconds=time.monotonic() - start_time)}")
+        logger.info("耗时: {}", timedelta(seconds=time.monotonic() - start_time))
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

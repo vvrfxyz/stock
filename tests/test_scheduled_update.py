@@ -18,6 +18,8 @@ def test_scheduled_update_runs_daily_tasks_every_day():
     assert "update_massive_prices" in names
     assert "update_massive_short_data" in names
     assert "update_open_close_summary" in names
+    assert "check_data_integrity" in names
+    assert names.index("check_data_integrity") > names.index("update_open_close_summary")
     assert "update_massive_actions_recent" in names
     recent_step = next(step for step in steps if step.name == "update_massive_actions_recent")
     assert "--recent-days" in recent_step.args
