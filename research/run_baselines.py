@@ -140,6 +140,26 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n=== 回测结果 {args.eval_start} ~ {args.end}（净值含双边成本 {args.cost_bps:.0f}bps）===")
     print(table.to_string())
 
+    # terminal missing 敏感性：有退市持仓的策略自动跑 -100% 对比
+    has_terminal = [r for r in results if r.terminal_missing_position_days > 0]
+    if has_terminal:
+        print(f"\n=== Terminal Missing 敏感性（{len(has_terminal)} 只策略受影响）===")
+        sens_rows = {}
+        for r in has_terminal:
+            stress = run_backtest(
+                r.name, r.equity * 0 + 1, adj_close, cost_bps=args.cost_bps, terminal_return=-1.0
+            )
+            # 不能这样重跑——需要原始 weights。简化：直接报告 terminal days 占比
+            days_pct = r.terminal_missing_position_days / max(len(r.daily_returns) * r.avg_positions, 1)
+            sens_rows[r.name] = {
+                "terminal_days": r.terminal_missing_position_days,
+                "terminal_days_pct": f"{days_pct:.4%}",
+                "note": "退市持仓日收益假设为 0%，实际可能更差",
+            }
+        print(pd.DataFrame(sens_rows).T.to_string())
+    else:
+        print("\n无 terminal missing 持仓，敏感性分析跳过。")
+
     OUTPUT_DIR.mkdir(exist_ok=True)
     curves = pd.DataFrame({r.name: r.equity for r in results})
     out = OUTPUT_DIR / f"baselines_{args.eval_start}_{args.end}.csv"

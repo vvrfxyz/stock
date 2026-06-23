@@ -244,7 +244,7 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
             ScheduledStep(
                 "update_adjustment_factors_full",
                 update_adjustment_factors_main,
-                ["--market", market, "--all"],
+                ["--market", market, "--all", "--fail-on-vendor-mismatch"],
             )
         )
         steps.append(

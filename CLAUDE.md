@@ -102,9 +102,15 @@ python main.py update_fx_rates                      # ECB 参考汇率；非 USD
 python scripts/check_data_integrity.py --limit 5
 python scripts/audit_recent_data.py --sample-size 32   # vendor 对账抽样审计（耗 API 配额）
 python main.py health_report                           # 数据域健康报告
+
+python scripts/audit_security_identity.py              # 身份对账（只读）
+python scripts/repair_identity.py --dry-run            # 存量身份修复 plan
+python scripts/repair_identity.py --apply              # 执行修复（先确认 dry-run）
 ```
 
 Read adjusted prices via `utils/adjusted_prices.get_adjusted_daily_bars(session, symbol_or_id, start=, end=, as_of=)` — never store adjusted values back into fact tables.
+
+Key documentation: `docs/identity_lifecycle.md`（身份解析器原理 / rename-recycle 流程 / 存量修复）, `docs/data_quality_runbook.md`（health_report 解读 / 退出码 / 故障排查）。
 
 ## Testing
 
