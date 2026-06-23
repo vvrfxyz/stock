@@ -161,8 +161,8 @@ def apply_merge(db_manager, plan: dict) -> int:
     db_manager.insert_identity_events([{
         "security_id": keep_id,
         "event_type": "MERGE",
-        "old_symbol": ", ".join(plan["merge_symbols"]),
-        "new_symbol": plan["keep_symbol"],
+        "old_symbol": ", ".join(plan["merge_symbols"])[:30],
+        "new_symbol": plan["keep_symbol"][:30],
         "related_security_id": plan["merge_ids"][0] if len(plan["merge_ids"]) == 1 else None,
         "resolution_source": "AUDIT",
         "confidence": "HIGH",
