@@ -4,7 +4,8 @@
 - point-in-time 取"as-of 时点最新已申报值"（Compustat PIT 同语义）：同一
   (security, concept, period) 的多次申报构成 vintage 序列（原始申报 + 重述/
   比较期重列），任意 as_of t 使用 filed_date <= t 的最新 vintage，
-  filed_date == t 当日记为可见。加载层只保留首报与数值发生变化的 vintage。
+  filed_date == t 当日的申报在 t+1 才记为可见（visible_delay_days=1，
+  避免 t 日收盘建仓吃到盘后才公开的财报跳空）。加载层只保留首报与数值发生变化的 vintage。
 - flow 指标构造 TTM：年度事实（约 12 个月 duration）直接作为 TTM；
   季度/半年/三季 YTD 事实用 TTM = YTD + 上一财年全年 - 去年同期 YTD，
   三个分量必须来自同一 concept（避免营收同义概念混算）。任一分量出现新
