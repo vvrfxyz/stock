@@ -187,6 +187,23 @@ class TestSecurityIdentityChanges:
         ])
         assert count == 0
 
+    def test_rename_rejects_symbol_already_active_on_another_security(self, pg_db):
+        _insert_security(pg_db, 1, "fb", composite_figi="BBG000MM2P62")
+        _insert_security(pg_db, 2, "meta", composite_figi="BBG000OTHER")
+
+        with pytest.raises(ValueError, match="new_symbol=meta.*占用"):
+            pg_db.rename_security(1, old_symbol="fb", new_symbol="meta")
+
+        # fb should remain unchanged
+        assert _scalar(pg_db, "SELECT symbol FROM securities WHERE id=1") == "fb"
+
+    def test_rename_allows_symbol_if_only_inactive_row_holds_it(self, pg_db):
+        _insert_security(pg_db, 1, "fb", composite_figi="BBG000MM2P62")
+        _insert_security(pg_db, 2, "meta", composite_figi="BBG000OTHER", is_active=False)
+
+        pg_db.rename_security(1, old_symbol="fb", new_symbol="meta")
+        assert _scalar(pg_db, "SELECT symbol FROM securities WHERE id=1") == "meta"
+
 
 class TestSecurityTimestamps:
     def test_update_security_timestamps_batch(self, pg_db):
