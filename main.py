@@ -39,6 +39,8 @@ from scripts.update_massive_news import main as update_massive_news_main
 from scripts.update_adjustment_factors import main as update_adjustment_factors_main
 from scripts.update_open_close_summary import main as update_open_close_summary_main
 from scripts.check_data_integrity import main as check_data_integrity_main
+from scripts.audit_security_identity import main as audit_security_identity_main
+from scripts.health_report import main as health_report_main
 from scripts.cleanup_us_universe import main as cleanup_us_universe_main
 from scripts.migrate_database import main as migrate_main
 from db_manager import DatabaseManager
@@ -300,6 +302,13 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
                     "--market", market,
                     "--since", (run_date - timedelta(days=14)).isoformat(),
                 ],
+            )
+        )
+        steps.append(
+            ScheduledStep(
+                "audit_security_identity",
+                audit_security_identity_main,
+                [],
             )
         )
     if _is_first_weekday_of_month(run_date, 1):
@@ -585,6 +594,12 @@ def run_sync_cusip_identifiers(args):
     logger.info("执行: 同步 FTD CUSIP 身份映射")
     cli_args = ['--market', args.market, '--months', str(args.months)]
     execute_script(sync_cusip_identifiers_main, cli_args)
+
+
+def run_health_report(args):
+    logger.info("执行: 数据域健康报告")
+    cli_args = ['--market', args.market, '--days', str(args.days)]
+    execute_script(health_report_main, cli_args)
 
 
 def run_cleanup_us_universe(args):
@@ -900,6 +915,11 @@ def main():
     p_rebuild_massive.add_argument('--market', type=str, default='US', help="当前仅支持 US。")
     p_rebuild_massive.add_argument('--with-open-close-summary', action='store_true', help="额外回填最近交易日盘前/盘后价格（较耗时）。")
     p_rebuild_massive.set_defaults(func=run_rebuild_massive_dataset)
+
+    p_health = subparsers.add_parser('health_report', help="数据域健康报告：freshness/coverage/pipeline/identity")
+    p_health.add_argument('--market', type=str, default='US', help="当前仅支持 US。")
+    p_health.add_argument('--days', type=int, default=7, help="回看天数。")
+    p_health.set_defaults(func=run_health_report)
 
     args = parser.parse_args()
     args.func(args)

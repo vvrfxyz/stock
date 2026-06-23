@@ -1,6 +1,5 @@
 """securities 表的 upsert 与各类 watermark 时间戳维护。"""
 import json
-import os
 import random
 from datetime import date, datetime, timezone
 
@@ -11,37 +10,6 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from data_models.models import Security, SecurityIdentityEvent, SecuritySymbolHistory
 
 from .helpers import _clean_for_model, _group_rows_by_key_set
-
-
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-# 身份冲突被跳过的行写到这里做持久 quarantine：只进 log 会随轮转丢失，
-# 而被跳过的往往是"正在交易但库里没有"的新公司，必须可事后人工对账重建。
-IDENTITY_CONFLICT_QUARANTINE = os.path.join(
-    _PROJECT_ROOT, "logs", "security_identity_conflicts.jsonl"
-)
-
-
-def _quarantine_identity_conflict(existing: dict, incoming: dict, field: str) -> None:
-    """把疑似 ticker 回收、被 upsert 跳过的行追加到持久 quarantine 文件。"""
-    try:
-        os.makedirs(os.path.dirname(IDENTITY_CONFLICT_QUARANTINE), exist_ok=True)
-        record = {
-            "detected_at": datetime.now(timezone.utc).isoformat(),
-            "symbol": incoming.get("symbol"),
-            "conflict_field": field,
-            "existing": {
-                "composite_figi": existing.get("composite_figi"),
-                "cik": existing.get("cik"),
-            },
-            "incoming": {
-                key: incoming.get(key)
-                for key in ("composite_figi", "cik", "name", "market", "type", "exchange")
-            },
-        }
-        with open(IDENTITY_CONFLICT_QUARANTINE, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception as exc:  # quarantine 失败不能阻断主写入
-        logger.opt(exception=exc).error("写入身份冲突 quarantine 文件失败: {}", exc)
 
 
 def _norm_identifier(value) -> str | None:
@@ -168,38 +136,63 @@ class SecuritiesMixin:
         with self.engine.connect() as conn:
             symbols = sorted({row["symbol"] for row in cleaned_rows})
             existing_rows = conn.execute(
-                select(Security.symbol, Security.composite_figi, Security.cik)
+                select(Security.id, Security.symbol, Security.composite_figi, Security.cik)
                 .where(Security.symbol.in_(symbols), Security.is_active.is_(True))
             ).mappings().all()
             existing_by_symbol = {row["symbol"]: dict(row) for row in existing_rows}
             safe_rows: list[dict] = []
             skipped_conflicts = 0
+            identity_events: list[dict] = []
             for row in cleaned_rows:
                 existing = existing_by_symbol.get(row["symbol"])
                 if existing:
                     conflict, field = _is_identity_conflict(existing, row)
                     if conflict:
                         skipped_conflicts += 1
-                        _quarantine_identity_conflict(existing, row, field)
+                        identity_events.append({
+                            "security_id": existing.get("id") or 0,
+                            "event_type": "QUARANTINE",
+                            "old_symbol": row["symbol"],
+                            "new_symbol": row["symbol"],
+                            "resolution_source": "AUTO",
+                            "confidence": "LOW",
+                            "details": json.dumps({
+                                "conflict_field": field,
+                                "existing": {k: existing.get(k) for k in ("composite_figi", "cik")},
+                                "incoming": {k: row.get(k) for k in ("composite_figi", "cik", "name", "market", "type", "exchange")},
+                            }, ensure_ascii=False),
+                        })
                         logger.error(
-                            "跳过 symbol={} 的 universe upsert：现有 {}={}，新值 {}={}，疑似 ticker 回收；"
-                            "已写入 quarantine {}，请人工拆分身份。",
+                            "跳过 symbol={} 的 universe upsert: 现有 {}={}, 新值 {}={}, 疑似 ticker 回收; "
+                            "已写入 identity_events, 请人工拆分身份。",
                             row["symbol"],
                             field,
                             existing.get(field),
                             field,
                             row.get(field),
-                            IDENTITY_CONFLICT_QUARANTINE,
                         )
                         continue
                 safe_rows.append(row)
             if skipped_conflicts:
                 logger.warning(
-                    "跳过 {} 条疑似 ticker 回收的 securities upsert（已 quarantine 至 {}）。",
+                    "跳过 {} 条疑似 ticker 回收的 securities upsert（已记录 identity event）。",
                     skipped_conflicts,
-                    IDENTITY_CONFLICT_QUARANTINE,
                 )
+            # 写冲突事件到 security_identity_events（失败不阻断主写入）
+            if identity_events:
+                try:
+                    valid_events = [e for e in identity_events if e.get("security_id")]
+                    if valid_events:
+                        self._lock_model_sequence_sync(conn, SecurityIdentityEvent)
+                        self._sync_model_id_sequence(conn, SecurityIdentityEvent)
+                        for grp in _group_rows_by_key_set(
+                            [_clean_for_model(SecurityIdentityEvent, e) for e in valid_events]
+                        ):
+                            conn.execute(pg_insert(SecurityIdentityEvent).values(grp))
+                except Exception as exc:
+                    logger.opt(exception=exc).warning("写入身份冲突 identity event 失败: {}", exc)
             if not safe_rows:
+                conn.commit()
                 return 0
 
             self._lock_model_sequence_sync(conn, Security)

@@ -95,7 +95,9 @@ class TestPricesRun:
         source.get_historical_data.return_value = self._frame()
         db.get_security_price_max_date.return_value = date(2026, 6, 10)
 
-        assert prices.run(prices.create_parser().parse_args([]), source, db) == 0
+        result = prices.run(prices.create_parser().parse_args([]), source, db)
+        exit_code = result[0] if isinstance(result, tuple) else result
+        assert exit_code == 0
 
         rows = db.upsert_daily_prices.call_args.args[0]
         assert rows[0]["security_id"] == 1
@@ -110,7 +112,9 @@ class TestPricesRun:
         source.get_historical_data.return_value = pd.DataFrame()
         db.get_security_price_max_date.return_value = END_DATE  # 库里其实已是最新
 
-        assert prices.run(prices.create_parser().parse_args([]), source, db) == 0
+        result = prices.run(prices.create_parser().parse_args([]), source, db)
+        exit_code = result[0] if isinstance(result, tuple) else result
+        assert exit_code == 0
         db.upsert_daily_prices.assert_not_called()
         # 落后的 metadata 被对齐
         db.update_security_price_latest_date.assert_called_once_with(1, END_DATE, is_full_run=False)

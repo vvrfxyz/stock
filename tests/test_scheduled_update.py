@@ -42,6 +42,7 @@ def test_scheduled_update_staggers_weekly_tasks():
     assert "update_sec_filings_recent" in sunday_names
     assert "update_insider_transactions_recent" in sunday_names
     assert "update_institutional_holdings_recent" in sunday_names
+    assert "audit_security_identity" in sunday_names
     assert "update_fx_rates" in sunday_names
     assert "update_risk_free_rates" in sunday_names
     assert "sync_cusip_identifiers" in sunday_names

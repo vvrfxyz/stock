@@ -152,15 +152,23 @@ class DatabaseManagerCore:
 
     def finish_task_run(
         self, task_run_id: int, *, exit_code: int, error_sample: str | None = None,
+        stats: dict | None = None,
     ) -> None:
-        """标记一个 task 执行结束。"""
+        """标记一个 task 执行结束。stats dict 会 JSON 序列化追加到 error_sample。"""
+        import json as _json
         now = datetime.now(timezone.utc)
         status = "SUCCESS" if exit_code == 0 else "FAILED"
+        note_parts = []
+        if error_sample:
+            note_parts.append(error_sample)
+        if stats:
+            note_parts.append(_json.dumps(stats, ensure_ascii=False))
+        note = " | ".join(note_parts) if note_parts else None
         with self.engine.connect() as conn:
             conn.execute(
                 update(PipelineTaskRun)
                 .where(PipelineTaskRun.id == task_run_id)
                 .values(ended_at=now, exit_code=exit_code, status=status,
-                        error_sample=error_sample[:500] if error_sample else None)
+                        error_sample=note[:500] if note else None)
             )
             conn.commit()

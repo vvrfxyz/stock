@@ -223,14 +223,17 @@ def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseMan
         results_counter[status] += 1
         total_rows += count
 
+    errors = results_counter["ERROR"] + results_counter["FATAL_ERROR"]
     logger.info("--- 任务执行统计 ---")
     logger.info("  成功: {}", results_counter["SUCCESS"])
     logger.info("  无新数据: {}", results_counter["SUCCESS_NO_NEW_DATA"])
     logger.info("  已是最新: {}", results_counter["SUCCESS_UP_TO_DATE"])
-    logger.info("  错误: {}", results_counter["ERROR"] + results_counter["FATAL_ERROR"])
+    logger.info("  错误: {}", errors)
     logger.info("  写入行数: {}", total_rows)
     logger.info("----------------------")
-    return 1 if results_counter["ERROR"] + results_counter["FATAL_ERROR"] else 0
+    exit_code = 1 if errors else 0
+    stats = {"processed": len(securities), "written": total_rows, "failed": errors}
+    return exit_code, stats
 
 
 def main(argv: list[str] | None = None) -> int:

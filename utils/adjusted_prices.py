@@ -39,16 +39,51 @@ class AdjustedBar:
 
 
 def resolve_security_id(session, symbol_or_id: str | int) -> int:
+    """按 symbol / current_symbol / 历史 symbol 解析到 security_id。
+
+    优先活跃行的 symbol 精确匹配，再查 current_symbol，最后查 symbol history。
+    """
     if isinstance(symbol_or_id, int):
         return symbol_or_id
+    sym = str(symbol_or_id).lower()
+    # 1) 活跃 symbol
     row = (
         session.query(Security.id)
-        .filter(func.lower(Security.symbol) == str(symbol_or_id).lower())
+        .filter(func.lower(Security.symbol) == sym, Security.is_active.is_(True))
         .one_or_none()
     )
-    if row is None:
-        raise LookupError(f"未找到 symbol: {symbol_or_id}")
-    return row[0]
+    if row is not None:
+        return row[0]
+    # 2) 活跃 current_symbol
+    row = (
+        session.query(Security.id)
+        .filter(func.lower(Security.current_symbol) == sym, Security.is_active.is_(True))
+        .one_or_none()
+    )
+    if row is not None:
+        return row[0]
+    # 3) 不限 active 的 symbol
+    row = (
+        session.query(Security.id)
+        .filter(func.lower(Security.symbol) == sym)
+        .order_by(Security.is_active.desc())
+        .first()
+    )
+    if row is not None:
+        return row[0]
+    # 4) symbol history（SQLite 测试环境可能缺此表）
+    try:
+        from data_models.models import SecuritySymbolHistory
+        row = (
+            session.query(SecuritySymbolHistory.security_id)
+            .filter(func.lower(SecuritySymbolHistory.symbol) == sym)
+            .first()
+        )
+        if row is not None:
+            return row[0]
+    except Exception:
+        pass
+    raise LookupError(f"未找到 symbol: {symbol_or_id}")
 
 
 def load_factor_events(

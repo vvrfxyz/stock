@@ -27,6 +27,7 @@ Core architecture rules:
 - `data_sources/massive_source.py`: Massive REST adapter.
 - `utils/massive_task.py`: Shared skeleton for `update_massive_*` scripts (standard parser, runtime setup/teardown, security selection, thread-pool runner).
 - `utils/massive_config.py`: Massive keys, supported types, history-window helpers.
+- `utils/security_identity.py`: Centralized `SecurityIdentityResolver` — FIGI→CIK→symbol→history priority chain for identity resolution; `sync_massive_universe` uses it for rename/recycle detection.
 - `utils/key_rate_limiter.py`: Per-key, process-shared Massive rate limiter.
 - `alembic/versions/`: PostgreSQL migrations.
 - `research/`: 离线研究层（只读，绝不回写事实表）——`data.py` 批量复权面板加载（与 `utils/adjusted_prices` 同口径，有一致性测试锁定），`fundamentals.py` 基本面 PIT 归一化（`sec_fundamental_facts` -> TTM/时点指标 as-of 面板：重述感知 vintage 口径——as-of t 取 filed_date <= t 的最新已申报值，TTM 三分量锁同一 concept、任一分量重述即发新事件，营收同义概念按标准营收族优先级在事件流层 coalesce（含银行/保险的 RevenuesNetOfInterestExpense 等行业概念），270 天新鲜度门槛置 NaN），`backtest.py` 向量化回测引擎（t 日权重赚 t+1 收益，换手计成本），`strategies.py` 技术基线，`run_baselines.py` 入口。连库优先 `RESEARCH_DATABASE_URL`（指向 253 生产库）。
@@ -56,6 +57,9 @@ Core architecture rules:
 - `fx_rates`: ECB daily EUR-based reference rates; USD cross rates are computed at read time via `utils/fx_rates.UsdFxConverter`.
 
 Financial ratios remain read-time computations — never store derived ratios back into fact tables. `sec_fundamental_facts` stores raw reported XBRL values only; do not revive `financial_reports` as a vague catch-all table.
+
+- `security_identity_events`: 身份变更审计事件（RENAME / RECYCLE / MERGE / QUARANTINE / NEW_LISTING）。
+- `pipeline_task_runs`: scheduled_update 每步执行记录（start/end/status/exit_code/stats）。
 
 ## Setup
 
@@ -97,6 +101,7 @@ python main.py update_fx_rates                      # ECB 参考汇率；非 USD
 
 python scripts/check_data_integrity.py --limit 5
 python scripts/audit_recent_data.py --sample-size 32   # vendor 对账抽样审计（耗 API 配额）
+python main.py health_report                           # 数据域健康报告
 ```
 
 Read adjusted prices via `utils/adjusted_prices.get_adjusted_daily_bars(session, symbol_or_id, start=, end=, as_of=)` — never store adjusted values back into fact tables.

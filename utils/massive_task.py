@@ -145,7 +145,13 @@ def run_massive_task(
     parser_factory: Callable[[], argparse.ArgumentParser],
     runner: Callable[[argparse.Namespace, MassiveSource, DatabaseManager], int | None],
 ) -> int:
-    """脚本 main(argv) 的统一外壳：解析参数、构建/释放运行时、兜底异常与耗时。"""
+    """脚本 main(argv) 的统一外壳：解析参数、构建/释放运行时、兜底异常与耗时。
+
+    runner 可以返回:
+    - int: 退出码
+    - (int, dict): 退出码 + 统计摘要（写入 pipeline_task_runs.error_sample 供 health_report 展示）
+    - None: 视为 0
+    """
     start_time = time.monotonic()
     setup_logging(task_name)
     args = parser_factory().parse_args(argv)
@@ -159,6 +165,10 @@ def run_massive_task(
         source = MassiveSource(rate_limiter=rate_limiter)
         db_manager = DatabaseManager()
         result = runner(args, source, db_manager)
+        if isinstance(result, tuple):
+            exit_code, stats = result
+            _try_record_stats(db_manager, task_name, exit_code, stats)
+            return exit_code
         return result if isinstance(result, int) else 0
     except Exception as e:
         logger.opt(exception=e).critical("{} 执行失败: {}", task_name, e)
@@ -169,3 +179,13 @@ def run_massive_task(
         if db_manager:
             db_manager.close()
         logger.info("耗时: {}", timedelta(seconds=time.monotonic() - start_time))
+
+
+def _try_record_stats(db_manager: DatabaseManager, task_name: str, exit_code: int, stats: dict) -> None:
+    """尝试把统计写入 pipeline_task_runs；失败不阻断脚本。"""
+    try:
+        run_id = f"self_{task_name}_{int(time.time())}"
+        task_run_id = db_manager.start_task_run(run_id, task_name)
+        db_manager.finish_task_run(task_run_id, exit_code=exit_code, stats=stats)
+    except Exception:
+        pass
