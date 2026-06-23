@@ -54,7 +54,7 @@ def report_table_freshness(session) -> int:
         ("sec_filings", "SELECT count(*) as n, max(filing_date) as latest FROM sec_filings"),
         ("sec_fundamental_facts", "SELECT count(*) as n, max(filed_date) as latest FROM sec_fundamental_facts"),
         ("insider_transactions", "SELECT count(*) as n, max(transaction_date) as latest FROM insider_transactions"),
-        ("institutional_holdings", "SELECT count(*) as n, max(report_date) as latest FROM institutional_holdings"),
+        ("institutional_holdings", "SELECT count(*) as n, max(period) as latest FROM institutional_holdings"),
         ("news_articles", "SELECT count(*) as n, max(published_utc) as latest FROM news_articles"),
         ("fx_rates", "SELECT count(*) as n, max(rate_date) as latest FROM fx_rates"),
         ("security_symbol_history", "SELECT count(*) as n, max(start_date) as latest FROM security_symbol_history"),
@@ -69,7 +69,9 @@ def report_table_freshness(session) -> int:
                 issues += 1
             logger.info("  {:40s}  rows={:>10,}  latest={}", table_name, n, latest or "NULL")
         except Exception as exc:
+            session.rollback()
             logger.warning("  {:40s}  ERROR: {}", table_name, exc)
+            issues += 1
             issues += 1
     return issues
 
@@ -282,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
                     elif name == "staleness":
                         p2_total += result
                 except Exception as exc:
+                    session.rollback()
                     logger.opt(exception=exc).warning("报告 section {} 执行失败，跳过: {}", name, exc)
 
         _section("汇总（按严重度分层）")
