@@ -167,7 +167,7 @@ def run_massive_task(
         result = runner(args, source, db_manager)
         if isinstance(result, tuple):
             exit_code, stats = result
-            _try_record_stats(db_manager, task_name, exit_code, stats)
+            logger.info("任务统计: {}", stats)
             return exit_code
         return result if isinstance(result, int) else 0
     except Exception as e:
@@ -179,13 +179,3 @@ def run_massive_task(
         if db_manager:
             db_manager.close()
         logger.info("耗时: {}", timedelta(seconds=time.monotonic() - start_time))
-
-
-def _try_record_stats(db_manager: DatabaseManager, task_name: str, exit_code: int, stats: dict) -> None:
-    """尝试把统计写入 pipeline_task_runs；失败不阻断脚本。"""
-    try:
-        run_id = f"self_{task_name}_{int(time.time())}"
-        task_run_id = db_manager.start_task_run(run_id, task_name)
-        db_manager.finish_task_run(task_run_id, exit_code=exit_code, stats=stats)
-    except Exception:
-        pass

@@ -309,9 +309,19 @@ class SecuritiesMixin:
     ) -> None:
         """改名：更新 symbol/current_symbol 并写 symbol history 行。
 
-        调用方需保证 new_symbol 不与其他活跃行冲突（resolver 已做前置检查）。
+        如果 new_symbol 已被另一个活跃行占用，抛出 ValueError 而非违反唯一索引。
         """
         with self.engine.connect() as conn:
+            # 防御：new_symbol 不得已被其他活跃行占用
+            conflict = conn.execute(
+                select(Security.id)
+                .where(Security.symbol == new_symbol, Security.is_active.is_(True),
+                       Security.id != security_id)
+            ).scalar()
+            if conflict is not None:
+                raise ValueError(
+                    f"rename_security 失败: new_symbol={new_symbol} 已被 security_id={conflict} 占用"
+                )
             conn.execute(
                 update(Security)
                 .where(Security.id == security_id)

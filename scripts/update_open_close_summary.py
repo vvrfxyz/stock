@@ -119,17 +119,15 @@ def process_security_date(
         if pre_market is None and after_hours is None:
             return symbol, "SKIP_NO_SESSION_DATA", None
 
-        return (
-            symbol,
-            "SUCCESS",
-            {
-                "security_id": security_id,
-                "date": target_date,
-                "otc": payload.get("otc"),
-                "pre_market": pre_market,
-                "after_hours": after_hours,
-            },
-        )
+        row = {"security_id": security_id, "date": target_date}
+        if payload.get("otc") is not None:
+            row["otc"] = payload["otc"]
+        if pre_market is not None:
+            row["pre_market"] = pre_market
+        if after_hours is not None:
+            row["after_hours"] = after_hours
+
+        return (symbol, "SUCCESS", row)
     except Exception as exc:
         logger.opt(exception=exc).error("[{} {}] 更新盘前盘后失败: {}", symbol, target_date, exc)
         return symbol, "ERROR", None

@@ -118,8 +118,10 @@ def main(argv: list[str] | None = None) -> int:
                     "incoming_cik": row.get("cik"),
                 }, ensure_ascii=False),
             })
-            # 改名后加入 normal 队列，让后续 upsert 更新其余字段（name/exchange 等）
-            normal_rows.append(row)
+            # 改名后用 upsert_security_info (以 id 为键) 更新其余元数据，
+            # 绕过 upsert_securities_by_symbol 的内层 FIGI/CIK 冲突检测。
+            row_with_id = {**row, "id": result.security_id}
+            db_manager.upsert_security_info(row_with_id)
 
         if rename_rows:
             logger.info("检测到 {} 只证券改名，已自动更新 symbol。", len(rename_rows))

@@ -1,8 +1,7 @@
 import unittest
-from collections import Counter
 from datetime import date
 
-from scripts.update_massive_shares import _attach_float_fields, _extract_total_shares, _get_exit_code
+from scripts.update_massive_shares import _attach_float_fields, _extract_total_shares
 
 
 class MassiveSharesTests(unittest.TestCase):
@@ -19,15 +18,6 @@ class MassiveSharesTests(unittest.TestCase):
             "weighted_shares_outstanding": 333752708,
         }
         self.assertEqual(_extract_total_shares(overview), 333752708)
-
-    def test_exit_code_is_nonzero_when_any_symbol_failed(self):
-        self.assertEqual(_get_exit_code(Counter({"SUCCESS": 99, "ERROR": 1})), 1)
-
-    def test_exit_code_is_nonzero_when_any_task_failed_fatally(self):
-        self.assertEqual(_get_exit_code(Counter({"SUCCESS": 99, "FATAL_ERROR": 1})), 1)
-
-    def test_exit_code_is_zero_when_all_symbols_succeeded_or_have_no_data(self):
-        self.assertEqual(_get_exit_code(Counter({"SUCCESS": 99, "SUCCESS_NO_DATA": 1})), 0)
 
 
 class AttachFloatFieldsTests(unittest.TestCase):

@@ -159,12 +159,6 @@ def _attach_float_fields(
     return matched
 
 
-def _get_exit_code(results_counter: Counter) -> int:
-    if results_counter["ERROR"] > 0 or results_counter["FATAL_ERROR"] > 0:
-        return 1
-    return 0
-
-
 def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseManager) -> int:
     end_date = get_last_completed_trading_date(args.market)
     history_floor = get_massive_history_floor(end_date)

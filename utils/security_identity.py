@@ -83,6 +83,7 @@ class SecurityIdentityResolver:
     """
 
     def __init__(self, session) -> None:
+        self._by_id: dict[int, _SecurityRow] = {}
         self._by_figi: dict[str, _SecurityRow] = {}
         self._by_cik: dict[str, list[_SecurityRow]] = {}
         self._by_symbol: dict[str, _SecurityRow] = {}
@@ -108,6 +109,7 @@ class SecurityIdentityResolver:
         for r in session.query(*cols).all():
             row = _SecurityRow(*r)
             rows_by_id[row.id] = row
+            self._by_id[row.id] = row
 
             figi = _norm_figi(row.composite_figi)
             if figi is not None:
@@ -156,6 +158,12 @@ class SecurityIdentityResolver:
     ) -> "SecurityIdentityResolver":
         """测试用：跳过数据库加载，直接注入索引。"""
         obj = object.__new__(cls)
+        # 从 by_symbol_all 构建 by_id
+        by_id: dict[int, _SecurityRow] = {}
+        for rows in by_symbol_all.values():
+            for row in rows:
+                by_id[row.id] = row
+        obj._by_id = by_id
         obj._by_figi = by_figi
         obj._by_cik = by_cik
         obj._by_symbol = by_symbol
@@ -380,11 +388,5 @@ class SecurityIdentityResolver:
 
     def _existing_symbol(self, security_id: int) -> str | None:
         """从已加载索引里反查 security_id 当前的 symbol。"""
-        for row in self._by_symbol.values():
-            if row.id == security_id:
-                return row.symbol
-        for rows in self._by_symbol_all.values():
-            for row in rows:
-                if row.id == security_id:
-                    return row.symbol
-        return None
+        row = self._by_id.get(security_id)
+        return row.symbol if row else None
