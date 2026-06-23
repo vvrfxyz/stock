@@ -13,6 +13,9 @@ from research.market_cap import load_market_cap_panel
 @dataclass(frozen=True)
 class EarningsYieldFactor:
     name: ClassVar[str] = "earnings_yield"
+    lookback_days: ClassVar[int] = 0
+    lag_days: ClassVar[int] = 1
+    pit_guarantee: ClassVar[bool] = True
 
     def compute(self, ctx: FactorContext) -> pd.DataFrame:
         ids = ctx.security_universe.tolist()

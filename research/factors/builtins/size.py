@@ -12,6 +12,9 @@ from research.market_cap import load_log_market_cap_panel
 @dataclass(frozen=True)
 class SizeFactor:
     name: ClassVar[str] = "size"
+    lookback_days: ClassVar[int] = 0
+    lag_days: ClassVar[int] = 1
+    pit_guarantee: ClassVar[bool] = True
 
     def compute(self, ctx: FactorContext) -> pd.DataFrame:
         log_mcap = load_log_market_cap_panel(

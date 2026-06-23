@@ -22,7 +22,7 @@ from pathlib import Path
 import pandas as pd
 from dotenv import load_dotenv
 
-from research.backtest import BacktestResult, eligibility_mask, run_backtest
+from research.backtest import BacktestResult, run_backtest
 from research.data import (
     apply_adjustment,
     load_adjusted_panel,
@@ -33,6 +33,7 @@ from research.data import (
     to_wide,
 )
 from research.strategies import momentum_12_1, short_term_reversal, sma_trend
+from research.universe import build_universe_mask
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 FACTOR_TRUST_FLOOR = date(2024, 5, 14)
@@ -85,12 +86,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"剔除 {len(drop)} 只有未覆盖拆股事件的证券（因子缺口）")
     print(f"面板: {adj_close.shape[0]} 个交易日 × {adj_close.shape[1]} 只证券")
 
-    eligible = eligibility_mask(
-        panel["close"],
-        panel["dollar_volume"],
+    universe = build_universe_mask(
+        engine,
+        start=args.start,
+        end=args.end,
+        adj_close=adj_close,
+        close=panel["close"],
+        dollar_volume=panel["dollar_volume"],
         min_price=args.min_price,
         min_median_dollar_volume=args.min_dollar_volume,
     )
+    eligible = universe["eligible"]
+    print(f"Universe hash: {universe['universe_hash']}")
     print(f"平均可交易标的数: {eligible.sum(axis=1).mean():.0f}")
 
     results = [

@@ -12,6 +12,9 @@ from research.short_interest import load_short_interest_ratio_panel
 @dataclass(frozen=True)
 class ShortInterestFactor:
     name: ClassVar[str] = "short_interest_ratio"
+    lookback_days: ClassVar[int] = 0
+    lag_days: ClassVar[int] = 1
+    pit_guarantee: ClassVar[bool] = True
 
     def compute(self, ctx: FactorContext) -> pd.DataFrame:
         panel = load_short_interest_ratio_panel(

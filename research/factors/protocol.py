@@ -19,9 +19,12 @@ class FactorContext:
 
 @runtime_checkable
 class Factor(Protocol):
-    """因子契约: name + compute。"""
+    """因子契约: name + compute + metadata。"""
 
     name: ClassVar[str]
+    lookback_days: ClassVar[int]
+    lag_days: ClassVar[int]
+    pit_guarantee: ClassVar[bool]
 
     def compute(self, ctx: FactorContext) -> pd.DataFrame:
         """返回 index=ctx.dates, columns=ctx.security_universe 的 float64 宽表。"""

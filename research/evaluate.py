@@ -644,6 +644,8 @@ def run_evaluation(
     ctx_end = min(pd.Timestamp(end), pd.Timestamp(effective_as_of))
     ctx_dates = adj_close.index[(adj_close.index >= pd.Timestamp(start)) & (adj_close.index <= ctx_end)]
     universe = pd.Index(adj_close.columns, dtype="int64")
+    from research.universe import universe_hash_from_ids
+    u_hash = universe_hash_from_ids(universe.tolist(), start, end)
     factor_obj = get(factor) if isinstance(factor, str) else factor
     factor_params = _factor_params_snapshot(factor_obj)
     ctx = FactorContext(engine=engine, dates=ctx_dates, security_universe=universe, as_of=pd.Timestamp(effective_as_of))
@@ -681,6 +683,11 @@ def run_evaluation(
         "extra_drop_ids": sorted(int(x) for x in (extra_drop_ids or [])),
         "factor_name": factor_obj.name,
         "factor_params": factor_params,
+        "universe_hash": u_hash,
+        "universe_size": len(universe),
+        "factor_lookback_days": getattr(factor_obj, "lookback_days", None),
+        "factor_lag_days": getattr(factor_obj, "lag_days", None),
+        "factor_pit_guarantee": getattr(factor_obj, "pit_guarantee", None),
         "run_id": run_id,
         "note": note,
     }
