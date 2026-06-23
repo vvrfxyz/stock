@@ -591,3 +591,22 @@ class RiskFreeRate(Base):
     series_id = Column(String(30), primary_key=True)
     rate_pct = Column(Numeric(12, 6), nullable=False)
     fetched_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class PipelineTaskRun(Base):
+    """每次脚本执行的运行记录——用于调度可观测性和失败诊断。"""
+    __tablename__ = 'pipeline_task_runs'
+    id = Column(BigInteger, primary_key=True)
+    run_id = Column(String(64), nullable=False, index=True,
+                    comment="同一 scheduled_update 批次的所有 step 共享同一个 run_id")
+    task_name = Column(String(100), nullable=False, index=True)
+    started_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    ended_at = Column(TIMESTAMP(timezone=True), nullable=True)
+    exit_code = Column(Integer, nullable=True)
+    status = Column(String(20), nullable=False, server_default='RUNNING',
+                    comment="RUNNING / SUCCESS / FAILED / ERROR")
+    error_sample = Column(Text, nullable=True, comment="失败时的简短错误信息")
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+    __table_args__ = (
+        Index('ix_task_run_run_id_task', 'run_id', 'task_name'),
+    )

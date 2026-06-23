@@ -171,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("--- SEC fundamentals 同步统计 ---")
         logger.info("  CIK 处理: {}（失败 {}）", processed, failed)
         logger.info("  事实行写入/更新: {}", total_rows)
-        return 1 if failed and failed == processed else 0
+        return 1 if failed else 0
     except Exception as e:
         logger.opt(exception=e).critical("update_sec_fundamentals 执行失败: {}", e)
         return 1

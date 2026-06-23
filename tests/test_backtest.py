@@ -213,6 +213,58 @@ class TestTerminalMissing:
 
 
 # ============================================================
+# 5b. terminal_return 退市收益政策
+# ============================================================
+
+class TestTerminalReturn:
+
+    def test_terminal_return_injects_loss_on_delist(self):
+        """terminal_return=-1.0 时，退市当日为永久缺失持仓注入 -100% 收益。"""
+        dates = ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"]
+        prices = _panel({1: [100.0, 110.0, None, None]}, dates)
+        # held = weights.shift(1): t=2 held=w[1]=1（退市当日仍持有）
+        weights = _panel({1: [1.0, 1.0, 0.0, 0.0]}, dates)
+
+        result = run_backtest("test", weights, prices, cost_bps=0.0, terminal_return=-1.0)
+
+        # t=1: 正常收益 (110-100)/100 = 0.10
+        assert abs(result.daily_returns.iloc[1] - 0.10) < 1e-9
+        # t=2: 价格首次永久缺失，held=1 -> 注入 -1.0 * 1 = -1.0
+        assert abs(result.daily_returns.iloc[2] - (-1.0)) < 1e-9
+        # t=3: 仍缺失但非"第一天"，不重复注入
+        assert result.daily_returns.iloc[3] == 0.0
+        # equity 反映总损失：(1+0)(1.10)(1-1.0)(1+0) = 0
+        assert abs(result.equity.iloc[-1]) < 1e-9
+
+    def test_terminal_return_none_preserves_current_behavior(self):
+        """terminal_return=None（默认）保持旧口径：永久缺失持仓静默赚 0%。"""
+        dates = ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"]
+        prices = _panel({1: [100.0, 110.0, None, None]}, dates)
+        weights = _panel({1: [1.0, 1.0, 0.0, 0.0]}, dates)
+
+        default = run_backtest("default", weights, prices, cost_bps=0.0)
+        explicit_none = run_backtest("none", weights, prices, cost_bps=0.0, terminal_return=None)
+
+        # 退市日收益为 0（旧口径）
+        assert default.daily_returns.iloc[2] == 0.0
+        assert default.daily_returns.iloc[3] == 0.0
+        pd.testing.assert_series_equal(
+            default.daily_returns, explicit_none.daily_returns, check_names=False
+        )
+
+    def test_terminal_return_only_when_held(self):
+        """退市时未持仓（held=0）则不注入收益。"""
+        dates = ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"]
+        prices = _panel({1: [100.0, 110.0, None, None]}, dates)
+        # t=2 held=w[1]=0：退市前已清仓
+        weights = _panel({1: [1.0, 0.0, 0.0, 0.0]}, dates)
+
+        result = run_backtest("test", weights, prices, cost_bps=0.0, terminal_return=-1.0)
+        assert result.daily_returns.iloc[2] == 0.0
+        assert result.daily_returns.iloc[3] == 0.0
+
+
+# ============================================================
 # 6. equity 曲线一致性
 # ============================================================
 

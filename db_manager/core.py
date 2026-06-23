@@ -1,11 +1,15 @@
 """引擎/会话生命周期与底层批量写入基础设施。"""
 import os
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from loguru import logger
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session, sessionmaker
+
+from data_models.models import PipelineTaskRun
 
 from .helpers import _build_upsert_statement, _dedupe_rows_by_key
 
@@ -126,3 +130,37 @@ class DatabaseManagerCore:
             session.bulk_update_mappings(model, mappings)
             session.commit()
         return len(mappings)
+
+    # ------------------------------------------------------------------ #
+    # pipeline_task_runs 运行记录
+    # ------------------------------------------------------------------ #
+    def start_task_run(self, run_id: str, task_name: str) -> int:
+        """记录一个 task 开始执行，返回 task_run.id。"""
+        now = datetime.now(timezone.utc)
+        with self.engine.connect() as conn:
+            self._lock_model_sequence_sync(conn, PipelineTaskRun)
+            self._sync_model_id_sequence(conn, PipelineTaskRun)
+            result = conn.execute(
+                pg_insert(PipelineTaskRun).values(
+                    run_id=run_id, task_name=task_name,
+                    started_at=now, status="RUNNING",
+                ).returning(PipelineTaskRun.id)
+            )
+            task_run_id = result.scalar_one()
+            conn.commit()
+        return task_run_id
+
+    def finish_task_run(
+        self, task_run_id: int, *, exit_code: int, error_sample: str | None = None,
+    ) -> None:
+        """标记一个 task 执行结束。"""
+        now = datetime.now(timezone.utc)
+        status = "SUCCESS" if exit_code == 0 else "FAILED"
+        with self.engine.connect() as conn:
+            conn.execute(
+                update(PipelineTaskRun)
+                .where(PipelineTaskRun.id == task_run_id)
+                .values(ended_at=now, exit_code=exit_code, status=status,
+                        error_sample=error_sample[:500] if error_sample else None)
+            )
+            conn.commit()

@@ -41,6 +41,7 @@ from scripts.update_open_close_summary import main as update_open_close_summary_
 from scripts.check_data_integrity import main as check_data_integrity_main
 from scripts.cleanup_us_universe import main as cleanup_us_universe_main
 from scripts.migrate_database import main as migrate_main
+from db_manager import DatabaseManager
 from utils.script_logging import setup_logging as configure_script_logging
 from utils.trading_calendar import get_last_completed_trading_date, shift_trading_date
 
@@ -327,17 +328,49 @@ def run_scheduled_update(args):
 
     steps = build_scheduled_update_steps(run_date, market)
     logger.info("计划执行 {} 个任务: {}", len(steps), ", ".join(step.name for step in steps))
+
+    # 运行记录：尝试写 pipeline_task_runs，失败不阻断调度
+    run_id = f"{run_date.isoformat()}_{market}_{int(time.time())}"
+    db_for_tracking = None
+    try:
+        db_for_tracking = DatabaseManager()
+    except Exception:
+        logger.warning("无法连接数据库记录 task runs，继续执行调度。")
+
     failed_steps: list[str] = []
     for index, step in enumerate(steps, start=1):
         logger.info("--- [{}/{}] {} ---", index, len(steps), step.name)
+        task_run_id = None
+        if db_for_tracking:
+            try:
+                task_run_id = db_for_tracking.start_task_run(run_id, step.name)
+            except Exception:
+                pass
+        exit_code = 0
+        error_msg = None
         try:
             execute_script(step.main_func, step.args)
         except SystemExit as exc:
+            exit_code = exc.code or 1
+            error_msg = f"exit={exc.code}"
             failed_steps.append(f"{step.name}(exit={exc.code})")
             logger.error("步骤 {} 失败（exit={}），继续执行后续步骤。", step.name, exc.code)
         except Exception as exc:
+            exit_code = 1
+            error_msg = f"{type(exc).__name__}: {exc}"
             failed_steps.append(f"{step.name}({type(exc).__name__})")
             logger.opt(exception=exc).error("步骤 {} 发生未捕获异常，继续执行后续步骤: {}", step.name, exc)
+        if db_for_tracking and task_run_id:
+            try:
+                db_for_tracking.finish_task_run(task_run_id, exit_code=exit_code, error_sample=error_msg)
+            except Exception:
+                pass
+
+    if db_for_tracking:
+        try:
+            db_for_tracking.close()
+        except Exception:
+            pass
 
     if failed_steps:
         logger.error("scheduled_update 完成，但 {}/{} 个步骤失败: {}", len(failed_steps), len(steps), ", ".join(failed_steps))

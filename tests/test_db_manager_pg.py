@@ -717,3 +717,34 @@ class TestMapUnlinkedHoldings:
                        h="c" * 64) == 2
         # 幂等：再跑无行可回填
         assert pg_db.map_unlinked_holdings_to_securities() == 0
+
+
+# ---------------------------------------------------------------------------
+# pipeline task runs
+# ---------------------------------------------------------------------------
+
+class TestPipelineTaskRuns:
+    def test_start_and_finish_success(self, pg_db):
+        task_id = pg_db.start_task_run("run-001", "update_massive_prices")
+        assert task_id > 0
+        assert _scalar(pg_db, "SELECT status FROM pipeline_task_runs WHERE id = :id", id=task_id) == "RUNNING"
+
+        pg_db.finish_task_run(task_id, exit_code=0)
+        assert _scalar(pg_db, "SELECT status FROM pipeline_task_runs WHERE id = :id", id=task_id) == "SUCCESS"
+        assert _scalar(pg_db, "SELECT exit_code FROM pipeline_task_runs WHERE id = :id", id=task_id) == 0
+        assert _scalar(pg_db, "SELECT ended_at IS NOT NULL FROM pipeline_task_runs WHERE id = :id", id=task_id) is True
+
+    def test_start_and_finish_failure(self, pg_db):
+        task_id = pg_db.start_task_run("run-002", "sync_massive_universe")
+        pg_db.finish_task_run(task_id, exit_code=1, error_sample="exit=1")
+
+        assert _scalar(pg_db, "SELECT status FROM pipeline_task_runs WHERE id = :id", id=task_id) == "FAILED"
+        assert _scalar(pg_db, "SELECT error_sample FROM pipeline_task_runs WHERE id = :id", id=task_id) == "exit=1"
+
+    def test_multiple_tasks_same_run(self, pg_db):
+        id1 = pg_db.start_task_run("run-003", "step_a")
+        id2 = pg_db.start_task_run("run-003", "step_b")
+        pg_db.finish_task_run(id1, exit_code=0)
+        pg_db.finish_task_run(id2, exit_code=1, error_sample="timeout")
+
+        assert _scalar(pg_db, "SELECT count(*) FROM pipeline_task_runs WHERE run_id = 'run-003'") == 2

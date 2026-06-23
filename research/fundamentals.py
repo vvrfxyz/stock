@@ -163,10 +163,15 @@ def load_fundamental_facts(
     sql = text(
         f"""
         select security_id, concept, unit, is_instant,
-               period_start, period_end, filed_date, value
+               period_start, period_end, filed_date, accepted_at, value
         from (
             select f.security_id, f.concept, f.unit, f.is_instant,
                    f.period_start, f.period_end, f.filed_date,
+                   (
+                       select max(sf.accepted_at)
+                       from sec_filings sf
+                       where sf.accession_number = f.accession_number
+                   ) as accepted_at,
                    f.value::float8 as value,
                    lag(f.value::float8) over (
                        partition by f.security_id, f.concept, f.unit,
@@ -198,10 +203,22 @@ def load_fundamental_facts(
         engine,
         params=params,
         chunksize=500_000,
-        parse_dates=["period_start", "period_end", "filed_date"],
+        parse_dates=["period_start", "period_end", "filed_date", "accepted_at"],
     )
     df = pd.concat(list(chunks), ignore_index=True)
     df = _to_ns(df, ("period_start", "period_end", "filed_date"))
+    # PIT 可见日取 filed_date 与 accepted_at::date 的较晚者：EDGAR 收盘后受理的申报
+    # 当日不可见，filed_date 才是申报日历日，accepted_at 是真正落库时点。把较晚者并回
+    # filed_date，下游 _vintage_events / _derived_ttm_events 自动沿用，无需各自改。
+    if "accepted_at" in df.columns:
+        accepted = pd.to_datetime(df["accepted_at"], utc=True)
+        # 取美东自然日：SEC accepted_at 是 ET 的落库时刻，按 ET 折算成可见日历日。
+        accepted_date = accepted.dt.tz_convert("America/New_York").dt.tz_localize(None).dt.normalize()
+        df["filed_date"] = df["filed_date"].where(
+            accepted_date.isna() | (accepted_date <= df["filed_date"]),
+            accepted_date,
+        )
+        df = df.drop(columns=["accepted_at"])
     # concept 与 unit 必须按 spec 配对（金额概念不会有 shares 单位，反之亦然；此处兜底）
     df = df.merge(lookup, on=["concept", "unit"], how="inner")
     df["security_id"] = df["security_id"].astype(np.int64)

@@ -5,7 +5,8 @@
   它赚取 t+1 日的收益（内部用 weights.shift(1) 对齐，调用方不要自己 shift）。
 - 成本按换手 × cost_bps 双边计：turnover_t = sum(|w_t - w_{t-1}|)。
 - 收益用价格列自身 ffill 后 pct_change，停牌/缺口复牌的跳空收益会在复牌日计入；
-  若持仓后价格永久缺失，引擎在指标中报告 terminal_missing_position_days。
+  若持仓后价格永久缺失，引擎在指标中报告 terminal_missing_position_days；
+  terminal_return 可为这些退市持仓注入一个收益假设（默认 None=保持旧口径不注入）。
 
 这是研究原型，不建模盘中滑点、做空费率、权重漂移再平衡。
 """
@@ -89,12 +90,22 @@ def run_backtest(
     *,
     cost_bps: float = 10.0,
     hold_through_gaps: bool = True,
+    terminal_return: float | None = None,
 ) -> BacktestResult:
     returns = _returns_with_gap_recovery(adj_close)
     weights = weights.reindex(index=returns.index, columns=returns.columns).fillna(0.0)
 
     held = weights.shift(1).fillna(0.0)
     terminal_missing_position_days = _terminal_missing_position_days(held, adj_close)
+    # 退市/终止收益政策：持仓后价格永久缺失时，默认 _returns_with_gap_recovery 给 NaN，
+    # fillna(0.0) 后等于静默赚 0%。terminal_return 让调用方为"退市当日"注入一个收益假设
+    # （如 -1.0=-100%）。只在永久缺失的第一天（退市事件日）注入一次，避免重复相乘炸掉数学。
+    if terminal_return is not None and terminal_missing_position_days > 0:
+        ever_future_price = adj_close.notna()[::-1].cummax()[::-1]
+        terminal_mask = held.gt(0) & adj_close.isna() & ~ever_future_price
+        first_terminal = terminal_mask & ~terminal_mask.shift(1, fill_value=False)
+        returns = returns.copy()
+        returns[first_terminal] = terminal_return
     # 停牌期冻结持仓，避免复牌跨缺口收益被清零的权重吞掉（默认开启；可关以复现旧口径）。
     effective_held = _hold_through_price_gaps(held, adj_close) if hold_through_gaps else held
     gross = (effective_held * returns.fillna(0.0)).sum(axis=1)
