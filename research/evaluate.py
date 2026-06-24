@@ -18,8 +18,14 @@ from sqlalchemy.engine import Engine
 
 from research.backtest import eligibility_mask, hold_between_rebalances, run_backtest
 from research.data import FACTOR_TRUST_FLOOR, load_adjusted_panel, research_engine, securities_with_uncovered_events
+from research.factors.builtins import days_to_cover as _days_to_cover  # noqa: F401
+from research.factors.builtins import delta_institutional_ownership as _delta_inst_own  # noqa: F401
 from research.factors.builtins import earnings_yield as _earnings_yield  # noqa: F401
+from research.factors.builtins import insider_net_buy as _insider_net_buy  # noqa: F401
+from research.factors.builtins import institutional_breadth as _institutional_breadth  # noqa: F401
+from research.factors.builtins import ownership_concentration as _ownership_concentration  # noqa: F401
 from research.factors.builtins import short_interest as _short_interest  # noqa: F401
+from research.factors.builtins import short_volume as _short_volume  # noqa: F401
 from research.factors.builtins import size as _size  # noqa: F401
 from research.factors.protocol import Factor, FactorContext, get, list_factors
 from utils.risk_free_rates import DEFAULT_SERIES_ID as DEFAULT_RISK_FREE_SERIES, load_risk_free_daily_returns
