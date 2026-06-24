@@ -58,7 +58,11 @@ def _parse_date(value: Any) -> date | None:
     if not value:
         return None
     try:
-        return date.fromisoformat(str(value)[:10])
+        d = date.fromisoformat(str(value)[:10])
+        # 2-digit year XML values (e.g. "15-06-19") parse as year 15
+        if d.year < 1900:
+            return None
+        return d
     except ValueError:
         return None
 

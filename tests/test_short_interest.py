@@ -248,13 +248,15 @@ def test_compute_empty_dates():
     assert panel.columns.dtype == np.dtype("int64")
 
 
-def test_compute_multiple_si_same_security_orders_by_visible_date():
+def test_compute_picks_latest_si_event_before_date():
     events = _si_events(
         (1, "2026-01-31", "2026-01-31", 200),
         (1, "2026-01-15", "2026-01-15", 100),
     )
     shares = _shares_events((1, "2026-01-01", "2025-12-31", 1_000))
 
-    panel = _compute(events, shares, ["2026-01-30"])
+    panel = _compute(events, shares, ["2026-01-20", "2026-01-30", "2026-02-01"])
 
+    assert panel.loc["2026-01-20", 1] == 0.10
     assert panel.loc["2026-01-30", 1] == 0.10
+    assert panel.loc["2026-02-01", 1] == 0.20

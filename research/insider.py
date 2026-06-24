@@ -57,6 +57,7 @@ def load_insider_events(
           and transaction_shares is not null
           and transaction_shares > 0
           and transaction_acquired_disposed in ('A', 'D')
+          and transaction_date >= '1990-01-01'
           and (cast(:security_ids as bigint[]) is null
                or security_id = any(cast(:security_ids as bigint[])))
         order by security_id, filing_date, transaction_date

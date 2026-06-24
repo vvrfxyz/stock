@@ -2,10 +2,20 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import research.factors.builtins.short_interest as short_interest_builtin
+from research.factors import protocol as _proto
 from research.factors.builtins.short_interest import ShortInterestFactor
 from research.factors.protocol import FactorContext
+
+
+@pytest.fixture(autouse=True)
+def _isolate_registry():
+    saved = dict(_proto._REGISTRY)
+    yield
+    _proto._REGISTRY.clear()
+    _proto._REGISTRY.update(saved)
 
 
 def test_short_interest_factor_returns_panel_shape(monkeypatch):
@@ -49,5 +59,8 @@ def test_short_interest_factor_does_not_pass_as_of_to_loader(monkeypatch):
 
     ShortInterestFactor().compute(ctx)
 
-    assert calls == [{"dates": dates, "security_ids": [10]}]
+    assert len(calls) == 1
+    assert set(calls[0].keys()) == {"dates", "security_ids"}
     assert "as_of" not in calls[0]
+    pd.testing.assert_index_equal(calls[0]["dates"], dates)
+    assert calls[0]["security_ids"] == [10]
