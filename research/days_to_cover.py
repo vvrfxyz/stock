@@ -44,7 +44,9 @@ def _load_volume_wide(
         order by security_id, date
         """
     )
-    params: dict[str, object] = {"start": dates[0].date(), "end": dates[-1].date()}
+    # 向前多拉 30 个自然日以填满 rolling(20) 的 warmup 窗口
+    buffer_start = dates[0].date() - pd.Timedelta(days=30)
+    params: dict[str, object] = {"start": buffer_start, "end": dates[-1].date()}
     if security_ids is not None:
         params["security_ids"] = security_ids
     vol = pd.read_sql_query(sql, engine, params=params, parse_dates=["date"])

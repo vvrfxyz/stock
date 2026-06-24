@@ -151,7 +151,9 @@ def load_insider_net_buy_panel(
     upper = upper_df.set_index("pos")["cum_shares"].reindex(grid["pos"]).to_numpy()
     lower = lower_df.set_index("pos")["cum_shares"].reindex(grid["pos"]).to_numpy()
 
-    net = np.nan_to_num(upper, nan=0.0) - np.nan_to_num(lower, nan=0.0)
+    # upper/lower 都是 NaN 表示该证券无任何 insider event——应保持 NaN 而非填 0
+    has_data = ~(np.isnan(upper) & np.isnan(lower))
+    net = np.where(has_data, np.nan_to_num(upper, nan=0.0) - np.nan_to_num(lower, nan=0.0), np.nan)
     out = grid.assign(net=net)
     panel = out.pivot_table(index="date", columns="security_id", values="net", aggfunc="last")
-    return panel.reindex(index=dates, columns=universe).fillna(0.0).astype(np.float64)
+    return panel.reindex(index=dates, columns=universe).astype(np.float64)

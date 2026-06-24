@@ -56,8 +56,10 @@ def load_institutional_aggregates(
         return _empty_agg()
     sql = text(
         """
-        with rows as (
-            select security_id, period, filing_date, filer_cik,
+        with deduped as (
+            -- 同一 (security_id, period, filer_cik) 若有多条（原件+修正件），取最晚 filing_date 的行
+            select distinct on (security_id, period, filer_cik)
+                   security_id, period, filing_date, filer_cik,
                    market_value::float8 as market_value,
                    shares_or_principal_amount::float8 as shares
             from institutional_holdings
@@ -66,17 +68,28 @@ def load_institutional_aggregates(
               and filing_date is not null
               and shares_or_principal_type = 'SH'
               and put_call is null
+              and market_value is not null
               and (cast(:security_ids as bigint[]) is null
                    or security_id = any(cast(:security_ids as bigint[])))
+            order by security_id, period, filer_cik, filing_date desc, id desc
+        ),
+        per_filer as (
+            -- 同一 filer 对同一证券同一季度的多行（如不同 share class）先求和
+            select security_id, period, filer_cik,
+                   max(filing_date) as filing_date,
+                   sum(market_value) as filer_value,
+                   sum(shares) as filer_shares
+            from deduped
+            group by security_id, period, filer_cik
         )
         select security_id,
                period,
                max(filing_date) as visible_date,
                count(distinct filer_cik) as n_holders,
-               sum(market_value) as total_value,
-               sum(shares) as total_shares,
-               sum(power(market_value, 2)) as sum_sq_value
-        from rows
+               sum(filer_value) as total_value,
+               sum(filer_shares) as total_shares,
+               sum(power(filer_value, 2)) as sum_sq_value
+        from per_filer
         group by security_id, period
         order by security_id, period
         """
