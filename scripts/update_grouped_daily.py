@@ -76,11 +76,23 @@ def process_date(
             return date_str, "SUCCESS_NO_API_DATA", 0
 
         updates: dict[int, dict] = {}
+        seen_tickers: dict[int, str] = {}
         for agg in daily_aggs:
-            symbol = (agg.get("T") or "").lower()
+            raw_ticker = agg.get("T") or ""
+            symbol = raw_ticker.lower()
             security_id = symbol_to_id_map.get(symbol)
             if security_id is None or security_id not in existing_security_ids:
                 continue
+
+            if security_id in seen_tickers:
+                prev = seen_tickers[security_id]
+                if raw_ticker != prev:
+                    logger.warning(
+                        "[{}] ticker 碰撞: {} 与 {} 同映射 security_id={}，保留首条 {}",
+                        date_str, raw_ticker, prev, security_id, prev,
+                    )
+                continue
+            seen_tickers[security_id] = raw_ticker
 
             volume = normalize_volume_value(agg.get("v"))
             trade_count = agg.get("n")
