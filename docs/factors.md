@@ -13,11 +13,19 @@ research/
 │       ├── size.py
 │       ├── earnings_yield.py
 │       ├── short_interest.py
-│       └── short_volume.py
+│       ├── short_volume.py
+│       ├── days_to_cover.py
+│       ├── institutional_breadth.py
+│       ├── delta_institutional_ownership.py
+│       ├── ownership_concentration.py
+│       └── insider_net_buy.py
 ├── evaluate.py              # 因子评估引擎（rank-IC / Newey-West t / 分位回报 / Sharpe）
 ├── _trials_store.py         # 评估结果持久化（trials.parquet）
 ├── short_interest.py        # PIT short_interest_ratio 数据加载
 ├── short_volume.py          # PIT short_volume_ratio 数据加载
+├── days_to_cover.py         # PIT days_to_cover 数据加载（SI / 20日均量）
+├── institutional.py         # PIT 13F 机构持仓聚合（breadth / delta IO / HHI 共用加载器）
+├── insider.py               # PIT 内部人交易加载（90 天滚动窗口净买入）
 ├── fundamentals.py          # PIT 基本面面板（TTM / 时点指标）
 ├── market_cap.py            # PIT 市值面板（close × total_shares）
 ├── data.py                  # 复权价格面板 + 因子事件加载
@@ -61,6 +69,11 @@ class Factor(Protocol):
 | `earnings_yield` | `EarningsYieldFactor` | `sec_fundamental_facts` (NetIncomeLoss TTM) / 市值 | 季频 PIT | 1 | 270 | 盈利收益率（E/P）。值越大 = 更"便宜" |
 | `short_interest_ratio` | `ShortInterestFactor` | `short_interests` / `historical_shares.total_shares` | 半月频 | 14 | 30 | 空头仓位占总股本比率。FINRA 半月报，BD+8 后公布 |
 | `short_volume_ratio` | `ShortVolumeFactor` | `short_volumes.short_volume` / `total_volume` | 日频 | 1 | 10 | 每日做空成交量占总成交量比率。FINRA T+1 公布 |
+| `days_to_cover` | `DaysToCoverFactor` | `short_interests` / `daily_prices` avg volume | 半月频(SI) x 日频(vol) | 1 | 60 | 空头天数覆盖。short_interest / 20日均成交量。值越大 = 需要越多天平仓 |
+| `institutional_breadth` | `InstitutionalBreadthFactor` | `institutional_holdings` (13F) | 季频 | 0 | 200 | 持有该股的 13F filer 数量。机构持仓广度（共识度） |
+| `delta_institutional_ownership` | `DeltaInstitutionalOwnershipFactor` | `institutional_holdings` delta | 季频 | 0 | 200 | 季度环比机构持股变动率。(本季-上季)/上季。聪明钱流向信号 |
+| `ownership_concentration` | `OwnershipConcentrationFactor` | `institutional_holdings` HHI | 季频 | 0 | 200 | 持仓集中度 HHI。按 market_value 占比的赫芬达尔指数。值越大 = 越集中 |
+| `insider_net_buy` | `InsiderNetBuyFactor` | `insider_transactions` (Form 3/4/5) | 事件驱动 | 1 | ∞ (窗口制) | 90 天内部人净买入股数。只取 P/S 交易。正 = 净买入，负 = 净卖出 |
 
 注：`earnings_yield` 的 delay 由 `fundamentals.py` 内部 `filed_date` 决定（SEC 申报日即可见日），这里 1 天是默认保守缓冲。
 
@@ -70,6 +83,17 @@ class Factor(Protocol):
 - **earnings_yield**：公司赚钱能力值不值当前股价？过去四个季度净利润总和（TTM）/ 市值。高 = 便宜，低 = 贵。严格按 SEC 申报日做 PIT 防偷看。
 - **short_interest_ratio**：空头仓位有多拥挤？FINRA 每半月公布一次各股的融券余额，除以总股本得到比率。高 = 空头共识看跌（但也可能引发轧空）。
 - **short_volume_ratio**：今天成交里多少是做空？FINRA 每日汇总各交易所的做空成交量和总成交量。跟 `short_interest_ratio` 互补：一个看"存量仓位"，一个看"增量流量"。
+- **days_to_cover**：空头要多少天才能全部买回来？用空头仓位除以平均每天成交量。值越大说明空头越"拥挤"，一旦要平仓压力越大（经典轧空指标）。
+- **institutional_breadth**：多少家机构持有这只股？从 13F 季报数。持仓机构越多 = 被大资金关注度越高；突然增加可能是"发现价值"信号。
+- **delta_institutional_ownership**：机构持股量季度环比变了多少？(本季总持股 - 上季) / 上季。正 = 机构在加仓，负 = 在减仓。是经典的"聪明钱"信号。
+- **ownership_concentration**：机构持仓有多集中？用赫芬达尔指数 (HHI) 衡量：如果只有一家机构持有 = HHI=1（极端集中），几百家均匀持有 → HHI 接近 0。高集中度 = 少数大户定价，波动风险更高。
+- **insider_net_buy**：过去 90 天公司内部人（高管/董事/大股东）净买入了多少股？只看真金白银的公开市场买卖（P/S），不算期权行权等。内部人最了解公司——他们买，可能是好信号。
+
+### 实现备注
+
+**institutional.py 共用加载器架构**：`institutional_breadth`、`delta_institutional_ownership`、`ownership_concentration` 三个因子共享 `research/institutional.py` 中的 `load_institutional_aggregates()` 函数。该函数一次 SQL 查询完成 13F 持仓的聚合计算（filer 计数 / 总持股量 / HHI），返回一个 dict 包含 4 个面板（breadth / total_shares / delta_io / hhi），各 builtin 因子只取自己需要的那个面板。避免三个因子各跑一遍相同的重查询。
+
+**insider_net_buy 滚动窗口机制**：`insider_net_buy` 不使用通用的 `event_table_to_asof_panel`（该工具是"最新事件值前填充"语义），而是用 cumsum + merge_asof 实现 90 天滚动窗口净买入。每笔 P/S 交易先按 security_id 做 cumulative sum，再用 `merge_asof` 将 90 天前的 cumsum 对齐到当前日期，两者相减即为窗口内净买入股数。`max_staleness_days` 设为无穷大（窗口内无交易 = 净买入为 0，而非 NaN）。
 
 ## 评估因子
 
@@ -177,14 +201,10 @@ python -m research.evaluate --factors your_factor_name --start 2024-05-14
 
 ## 路线图
 
-近期候选（按数据就绪度排序）：
-
-| 因子 | 数据源 | 形态 | 状态 |
-|---|---|---|---|
-| `days_to_cover` | short_interests / avg daily volume | 半月频 | 待做 |
-| `institutional_breadth` | institutional_holdings (13F) | 季频 | 数据就绪 |
-| `delta_institutional_ownership` | institutional_holdings delta IO | 季频 | 数据就绪 |
-| `ownership_concentration` | institutional_holdings HHI | 季频 | 数据就绪 |
+已完成（第二批，2026-06）：
+- `days_to_cover` — 空头天数覆盖
+- `institutional_breadth` / `delta_institutional_ownership` / `ownership_concentration` — 13F 三因子（共用 `institutional.py` 加载器）
+- `insider_net_buy` — 内部人净买入（90 天滚动窗口）
 
 远期方向：
 - PIT 指数成分（iShares ETF 持仓 / EDGAR N-PORT）
