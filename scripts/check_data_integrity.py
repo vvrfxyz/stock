@@ -333,10 +333,10 @@ def main(argv: list[str] | None = None) -> int:
             issues += check_price_latest_date_consistency(session, limit=args.limit)
             issues += check_symbol_normalization(session, limit=args.limit)
             issues += check_ohlc_validity(session, limit=args.limit, window_start=window_start)
-            issues += check_calendar_gaps(
+            check_calendar_gaps(
                 session, limit=args.limit, window_start=window_start, min_sessions=args.gap_min_sessions
             )
-            issues += check_split_jump_consistency(session, limit=args.limit, window_start=window_start)
+            check_split_jump_consistency(session, limit=args.limit, window_start=window_start)
             check_unexplained_jumps(
                 session, limit=args.limit, window_start=window_start, threshold=args.jump_threshold
             )
