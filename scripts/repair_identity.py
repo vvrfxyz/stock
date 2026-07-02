@@ -43,14 +43,18 @@ def create_parser() -> argparse.ArgumentParser:
                         help="执行修复并写入 identity events。")
     parser.add_argument("--limit", type=int, default=50,
                         help="最多处理的问题组数（默认 50）。")
+    parser.add_argument("--override-figi", default="",
+                        help="逗号分隔的 FIGI 白名单：对这些组跳过 CIK 安全门。\n"
+                             "仅用于已人工甄别的组（如 ETF 壳转用途导致 CIK 不一致/缺失）。")
     return parser
 
 
-def find_split_identities(session, limit: int) -> list[dict]:
+def find_split_identities(session, limit: int, override_figis: set[str] | None = None) -> list[dict]:
     """找出同一 composite_figi 落在多个 security_id 的分裂身份。
 
     排除 'UNKNOWN' 之类的占位字面量——约 90 只退市股共享该假 FIGI，
-    若进入 plan 会把互不相干的公司合并成一只（灾难级）。"""
+    若进入 plan 会把互不相干的公司合并成一只（灾难级）。
+    override_figis 中的组跳过 CIK 安全门（须人工甄别后显式传入）。"""
     sql = text("""
         SELECT composite_figi,
                array_agg(id ORDER BY id) AS security_ids,
@@ -79,8 +83,9 @@ def find_split_identities(session, limit: int) -> list[dict]:
         # 即真·同身份改名/分裂）才自动合并。不同 CIK 共用 FIGI（vendor 错数据
         # 或 ETF 壳转用途）与无 CIK（ETF）的组交人工甄别——2026-07-02 复核中
         # powr/fill 等 DIFF-CIK 组合并会把两只不同基金的历史搅在一起。
+        # 人工甄别通过的组经 --override-figi 显式放行。
         ciks = set(row.ciks)
-        if len(ciks) != 1 or "" in ciks:
+        if (len(ciks) != 1 or "" in ciks) and row.composite_figi not in (override_figis or set()):
             skipped += 1
             logger.warning(
                 "跳过 figi={} 组（CIK 不一致或缺失，需人工甄别）: symbols={} ciks={}",
@@ -237,7 +242,11 @@ def main(argv: list[str] | None = None) -> int:
         db_manager = DatabaseManager()
 
         with db_manager.get_session() as session:
-            plans = find_split_identities(session, limit=args.limit)
+            plans = find_split_identities(
+                session,
+                limit=args.limit,
+                override_figis={f.strip() for f in args.override_figi.split(",") if f.strip()},
+            )
 
         if not plans:
             logger.success("未发现需要修复的身份分裂。")

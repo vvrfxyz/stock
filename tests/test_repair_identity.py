@@ -182,3 +182,29 @@ def test_find_split_identities_cik_gate_and_placeholder_figi(pg_db):
     assert plans[0]["figi"] == "BBG000000001"
     assert plans[0]["keep_id"] == 1
     assert plans[0]["merge_ids"] == [2]
+
+
+@pytest.mark.integration
+def test_override_figi_bypasses_cik_gate_for_vetted_groups(pg_db):
+    """--override-figi 只放行显式传入的组；其余照常被 CIK 门拦下。"""
+    from scripts.repair_identity import find_split_identities
+
+    with pg_db.get_session() as s:
+        common = dict(market="US", type="ETF", full_refresh_interval=30)
+        # ETF 壳转用途：无 CIK，默认被拦；人工甄别后经白名单放行
+        s.add(Security(id=1, symbol="magc", current_symbol="magc", is_active=True,
+                       composite_figi="BBG000000010", cik=None, **common))
+        s.add(Security(id=2, symbol="drag", current_symbol="drag", is_active=False,
+                       composite_figi="BBG000000010", cik=None, **common))
+        # 未放行的另一组：保持被拦
+        s.add(Security(id=3, symbol="etfa", current_symbol="etfa", is_active=True,
+                       composite_figi="BBG000000011", cik=None, **common))
+        s.add(Security(id=4, symbol="etfb", current_symbol="etfb", is_active=False,
+                       composite_figi="BBG000000011", cik=None, **common))
+        s.commit()
+
+        assert find_split_identities(s, limit=50) == []
+        plans = find_split_identities(s, limit=50, override_figis={"BBG000000010"})
+    assert len(plans) == 1
+    assert plans[0]["figi"] == "BBG000000010"
+    assert plans[0]["keep_id"] == 1
