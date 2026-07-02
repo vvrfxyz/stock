@@ -288,6 +288,26 @@ class SecurityIdentifier(Base):
     )
 
 
+class OpenFigiCusipLookup(Base):
+    """OpenFIGI CUSIP->FIGI 查询缓存（含负缓存）。
+
+    每个 CUSIP 一行：MATCHED 存映射结果；NOT_FOUND / AMBIGUOUS 是负缓存，
+    避免对已知无解的 CUSIP 反复消耗 OpenFIGI 配额。
+    queried_at 记录最近一次实际查询时间——重查时必须显式刷新，不依赖 onupdate。"""
+    __tablename__ = 'openfigi_cusip_lookups'
+    cusip = Column(String(9), primary_key=True)
+    status = Column(String(20), nullable=False, comment="MATCHED / NOT_FOUND / AMBIGUOUS")
+    composite_figi = Column(String(20), nullable=True, index=True)
+    share_class_figi = Column(String(20), nullable=True)
+    ticker = Column(String(20), nullable=True)
+    name = Column(String(255), nullable=True)
+    security_type = Column(String(60), nullable=True)
+    market_sector = Column(String(30), nullable=True)
+    exch_code = Column(String(10), nullable=True)
+    queried_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False,
+                        comment="最近一次实际查询 OpenFIGI 的时间；重查须显式刷新")
+
+
 class SecFiling(Base):
     __tablename__ = 'sec_filings'
     id = Column(BigInteger, primary_key=True)

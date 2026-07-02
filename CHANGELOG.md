@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added (2026-07-02)
+
+- OpenFIGI CUSIP fallback mapping: `sync_openfigi_identifiers` maps 13F CUSIPs left unlinked by the SEC-FTD bridge through the OpenFIGI v3 mapping API (`data_sources/openfigi_source.py`, anonymous or keyed via optional `OPENFIGI_API_KEY`), caching every verdict in the new `openfigi_cusip_lookups` table (migration `e0f1a2b3c4d5`) — MATCHED rows are never re-queried, NOT_FOUND/AMBIGUOUS negative-cache rows refresh after `--refresh-days` (default 90). MATCHED FIGIs resolve to `securities` by composite FIGI (share-class FIGI fallback, active-first, ambiguity-skipped), write `security_identifiers` (source `OPENFIGI`, insert-missing-only) and backfill `institutional_holdings.security_id`. Sunday `scheduled_update` runs it between `sync_cusip_identifiers` and the 13F incremental, without `--limit` — the cache makes weekly API cost strictly decreasing.
+
 ### Fixed (2026-07-02)
 
 - Deep-review fix batch (16 code packages + docs; full report at `docs/audits/2026-07-02-deep-review.md`):

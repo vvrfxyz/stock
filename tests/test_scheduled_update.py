@@ -70,10 +70,22 @@ def test_scheduled_update_staggers_weekly_tasks():
     assert "update_fx_rates" in sunday_names
     assert "update_risk_free_rates" in sunday_names
     assert "sync_cusip_identifiers" in sunday_names
-    # CUSIP 映射先于 13F 写入，新持仓行才能在写入时拿到 security_id
+    assert "sync_openfigi_identifiers" in sunday_names
+    assert "sync_openfigi_identifiers" not in saturday_names
+    # CUSIP 映射先于 13F 写入，新持仓行才能在写入时拿到 security_id；
+    # OpenFIGI 兜底跟在 FTD 桥之后（只查 FTD 仍未覆盖的 CUSIP）、13F 写入之前
     assert sunday_names.index("sync_cusip_identifiers") < sunday_names.index(
+        "sync_openfigi_identifiers"
+    )
+    assert sunday_names.index("sync_openfigi_identifiers") < sunday_names.index(
         "update_institutional_holdings_recent"
     )
+    # 兜底步骤不带 --limit：靠缓存表（MATCHED 永不重查）保证周度成本递减
+    openfigi_step = next(
+        step for step in build_scheduled_update_steps(date(2026, 5, 17), market="US")
+        if step.name == "sync_openfigi_identifiers"
+    )
+    assert "--limit" not in openfigi_step.args
     assert "sync_sec_identifiers" not in saturday_names
     assert "update_insider_transactions_recent" not in saturday_names
     sec_step = next(

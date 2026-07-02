@@ -8,6 +8,7 @@ from data_models.models import (
     InstitutionalHolding,
     NewsArticle,
     NewsArticleInsight,
+    OpenFigiCusipLookup,
     RiskFreeRate,
     SecFiling,
     SecFundamentalFact,
@@ -290,6 +291,51 @@ class ReferenceDataMixin:
             result = conn.execute(sql)
             conn.commit()
             return result.rowcount
+
+    def upsert_openfigi_lookups(self, rows: list[dict]) -> int:
+        """写 OpenFIGI CUSIP 查询缓存（含 NOT_FOUND/AMBIGUOUS 负缓存）。
+
+        每行是该 CUSIP 最近一次查询的完整快照：冲突时全列覆盖并显式刷新
+        queried_at=now()（server_default 只管首插，重查负缓存必须推进 TTL 时钟）。
+        缺失字段按 None 归一化后参与覆盖——状态迁移（如 MATCHED -> NOT_FOUND）
+        不得残留旧 figi 字段。"""
+        data_columns = (
+            "status", "composite_figi", "share_class_figi", "ticker",
+            "name", "security_type", "market_sector", "exch_code",
+        )
+        cleaned = [_clean_for_model(OpenFigiCusipLookup, row) for row in rows]
+        cleaned = [
+            row for row in cleaned
+            # cusip 是 String(9) 主键：超长值让整条语句报错，防御性剔除
+            if row.get("cusip") and len(row["cusip"]) <= 9 and row.get("status")
+        ]
+        if not cleaned:
+            return 0
+
+        cleaned = _dedupe_rows_by_key(cleaned, ["cusip"])
+        # 全列归一化（缺失补 None），键集恒定，无需 _group_rows_by_key_set
+        cleaned = [
+            {"cusip": row["cusip"], **{column: row.get(column) for column in data_columns}}
+            for row in cleaned
+        ]
+
+        written = 0
+        with self.engine.connect() as conn:
+            for start in range(0, len(cleaned), 5000):
+                chunk = cleaned[start:start + 5000]
+                stmt = pg_insert(OpenFigiCusipLookup).values(chunk)
+                update_columns = {
+                    column: getattr(stmt.excluded, column) for column in data_columns
+                }
+                update_columns["queried_at"] = func.now()
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["cusip"],
+                    set_=update_columns,
+                )
+                result = conn.execute(stmt)
+                written += result.rowcount
+            conn.commit()
+        return written
 
     def upsert_fx_rates(self, rows_data: list[dict]) -> int:
         """写 ECB 参考汇率。复合主键无序列；冲突时刷新 rate（来源重发布修正）。"""

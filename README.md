@@ -80,7 +80,7 @@ python scripts/migrate_database.py
 
 - 每天：`sync_massive_universe`、`update_massive_prices`、`update_massive_short_data`、`update_massive_actions --recent-days 14`、`update_adjustment_factors --changed-since 3`、当日 `update_open_close_summary --all`、`check_data_integrity --window-days 14`。
 - 每周六：`update_massive_shares --all`、`update_grouped_daily_recent`（5 日窗口）、`update_open_close_summary` 5 日窗口补漏。
-- 每周日：`update_fx_rates`、`update_risk_free_rates`（DTB3）、`update_massive_actions --all --force`、`update_adjustment_factors --all --fail-on-vendor-mismatch`（全量重建）、`sync_sec_identifiers`、`update_sec_filings --since 14d`、`update_sec_fundamentals --since 14d`、`update_insider_transactions --since 21d`、`sync_cusip_identifiers --months 2`、`update_institutional_holdings --since 14d`、`audit_security_identity`。
+- 每周日：`update_fx_rates`、`update_risk_free_rates`（DTB3）、`update_massive_actions --all --force`、`update_adjustment_factors --all --fail-on-vendor-mismatch`（全量重建）、`sync_sec_identifiers`、`update_sec_filings --since 14d`、`update_sec_fundamentals --since 14d`、`update_insider_transactions --since 21d`、`sync_cusip_identifiers --months 2`、`sync_openfigi_identifiers`（OpenFIGI 兜底补链 FTD 未覆盖的 13F CUSIP，缓存表保证周度成本递减）、`update_institutional_holdings --since 14d`、`audit_security_identity`。
 - 每月第一个周二：`update_massive_events --all --force`。
 - 每月第一个周三：`update_massive_details --all --force`。
 

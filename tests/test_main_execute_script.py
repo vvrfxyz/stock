@@ -146,3 +146,27 @@ def test_update_adjustment_factors_cli_defaults_omit_new_flags(monkeypatch):
     assert "--changed-since" not in argv
     assert "--fail-on-vendor-mismatch" not in argv
     assert "--max-mismatch-rate" not in argv
+
+
+def test_sync_openfigi_identifiers_cli_forwards_args(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        main_module, "execute_script",
+        lambda main_func, args_list: captured.update(argv=args_list),
+    )
+
+    args = main_module.build_parser().parse_args([
+        "sync_openfigi_identifiers", "--limit", "100", "--refresh-days", "30",
+    ])
+    args.func(args)
+
+    argv = captured["argv"]
+    assert argv[argv.index("--limit") + 1] == "100"
+    assert argv[argv.index("--refresh-days") + 1] == "30"
+
+    # 转发出的 argv 必须能被子脚本自己的 parser 原样接收
+    from scripts.sync_openfigi_identifiers import create_parser as openfigi_parser
+
+    forwarded = openfigi_parser().parse_args(argv)
+    assert forwarded.limit == 100
+    assert forwarded.refresh_days == 30

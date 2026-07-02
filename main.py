@@ -32,6 +32,7 @@ from scripts.update_institutional_holdings import main as update_institutional_h
 from scripts.update_fx_rates import main as update_fx_rates_main
 from scripts.update_risk_free_rates import main as update_risk_free_rates_main
 from scripts.sync_cusip_identifiers import main as sync_cusip_identifiers_main
+from scripts.sync_openfigi_identifiers import main as sync_openfigi_identifiers_main
 from scripts.update_massive_shares import main as update_massive_shares_main
 from scripts.update_massive_events import main as update_massive_events_main
 from scripts.update_massive_short_data import main as update_massive_short_data_main
@@ -302,6 +303,15 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
                 "sync_cusip_identifiers",
                 sync_cusip_identifiers_main,
                 ["--market", market, "--months", "2"],
+            )
+        )
+        # OpenFIGI 兜底跟在 FTD 桥之后：只查 FTD 仍未覆盖的 CUSIP；
+        # 缓存表（MATCHED 永不重查）保证周度 API 成本递减，故不带 --limit。
+        steps.append(
+            ScheduledStep(
+                "sync_openfigi_identifiers",
+                sync_openfigi_identifiers_main,
+                [],
             )
         )
         steps.append(
@@ -616,6 +626,12 @@ def run_sync_cusip_identifiers(args):
     execute_script(sync_cusip_identifiers_main, cli_args)
 
 
+def run_sync_openfigi_identifiers(args):
+    logger.info("执行: 用 OpenFIGI 补链 13F 未映射 CUSIP")
+    cli_args = ['--limit', str(args.limit), '--refresh-days', str(args.refresh_days)]
+    execute_script(sync_openfigi_identifiers_main, cli_args)
+
+
 def run_health_report(args):
     logger.info("执行: 数据域健康报告")
     cli_args = ['--market', args.market, '--days', str(args.days)]
@@ -821,6 +837,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_cusip.add_argument('--market', type=str, default='US', help="当前仅支持 US。")
     p_cusip.add_argument('--months', type=int, default=3, help="回看的 FTD 月数；初次回填建议 12。")
     p_cusip.set_defaults(func=run_sync_cusip_identifiers)
+
+    p_openfigi = subparsers.add_parser(
+        'sync_openfigi_identifiers',
+        help="用 OpenFIGI 补链 13F 未映射 CUSIP（可选 OPENFIGI_API_KEY 环境变量提速）",
+    )
+    p_openfigi.add_argument('--limit', type=int, default=0,
+                            help="限制本次实际调 OpenFIGI 查询的 CUSIP 数量（0=不限）。")
+    p_openfigi.add_argument('--refresh-days', type=int, default=90,
+                            help="NOT_FOUND/AMBIGUOUS 负缓存的重查间隔天数；MATCHED 永不重查。")
+    p_openfigi.set_defaults(func=run_sync_openfigi_identifiers)
 
     p_massive_details = subparsers.add_parser('update_massive_details', help="单独更新股票的详细信息 (来自 Massive)")
     p_massive_details.add_argument('symbols', nargs='*', help="要更新的股票代码列表。")
