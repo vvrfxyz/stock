@@ -518,3 +518,28 @@ class TestOpenFigiSyncIntegration:
         assert stats["identifiers_inserted"] == 1  # OPENFIGI 行照写（供 audit 对账）
         assert stats["holdings_backfilled"] == 0   # 但跨源歧义拦住回填
         assert self._holding_security_id(pg_db, "H1") is None
+
+
+@pytest.mark.integration
+def test_upsert_clamps_overlong_diagnostic_fields(pg_db):
+    """债券/期权 CUSIP 的 ticker 超 varchar(20)（如 'AAPL 3.35 02/09/27 CALL'）：
+    必须截断入库而不是让整批报 StringDataRightTruncation——2026-07-02 生产首跑实故。"""
+    written = pg_db.upsert_openfigi_lookups([{
+        "cusip": "037833AK6",
+        "status": "MATCHED",
+        "composite_figi": "BBG00GBVBK51",
+        "ticker": "AAPL 3.35 02/09/27 CORP BOND",
+        "name": "X" * 300,
+        "security_type": "Y" * 80,
+        "exch_code": "Z" * 15,
+    }])
+    assert written == 1
+    from sqlalchemy import text
+    with pg_db.engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT ticker, length(name) AS ln, length(security_type) AS lt, exch_code "
+            "FROM openfigi_cusip_lookups WHERE cusip = '037833AK6'"
+        )).fetchone()
+    assert row.ticker == "AAPL 3.35 02/09/27 C"  # 截到 20
+    assert row.ln == 255 and row.lt == 60
+    assert row.exch_code == "Z" * 10

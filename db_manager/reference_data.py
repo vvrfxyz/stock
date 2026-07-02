@@ -313,9 +313,19 @@ class ReferenceDataMixin:
             return 0
 
         cleaned = _dedupe_rows_by_key(cleaned, ["cusip"])
-        # 全列归一化（缺失补 None），键集恒定，无需 _group_rows_by_key_set
+        # 全列归一化（缺失补 None），键集恒定，无需 _group_rows_by_key_set；
+        # 字符串按模型列长截断——债券/期权 CUSIP 的 ticker 形如 "AAPL 3.35 02/09/27"
+        # 会超过 varchar(20)。这些是诊断字段，截断无害，且不能让整批写入报错。
+        max_lens = {
+            column: OpenFigiCusipLookup.__table__.columns[column].type.length
+            for column in data_columns
+        }
+        def _clamp(column, value):
+            if isinstance(value, str) and max_lens.get(column):
+                return value[: max_lens[column]]
+            return value
         cleaned = [
-            {"cusip": row["cusip"], **{column: row.get(column) for column in data_columns}}
+            {"cusip": row["cusip"], **{column: _clamp(column, row.get(column)) for column in data_columns}}
             for row in cleaned
         ]
 
