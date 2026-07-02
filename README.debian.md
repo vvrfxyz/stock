@@ -14,13 +14,14 @@
 （`Asia/Shanghai`，本机 UTC 时间 `02:00`）启动一次
 `python main.py scheduled_update --market US`。
 
-`scheduled_update` 内部负责把不同频率的任务错峰：
+`scheduled_update` 内部负责把不同频率的任务错峰（权威实现见 `main.py` 的
+`build_scheduled_update_steps()`，逐条命令参数见根 `README.md` 的「常用命令」小节）：
 
 | 频率 | 时间 | 任务 |
 | --- | --- | --- |
-| 每天 | 每次 timer 触发 | `sync_massive_universe`、`update_massive_prices` 增量、`update_massive_short_data` 增量、`update_massive_actions --recent-days 14`、`update_adjustment_factors --all`、最近 5 个已完成交易日的 `update_open_close_summary --all` |
-| 每周 | 周六 | `update_massive_shares --all`、最近 5 个交易日 grouped daily |
-| 每周 | 周日 | `update_fx_rates`、`update_massive_actions --all --force`、SEC identifiers/filings/fundamentals/insider 增量、CUSIP/13F 增量 |
+| 每天 | 每次 timer 触发 | `sync_massive_universe`、`update_massive_prices` 增量、`update_massive_short_data` 增量、`update_massive_actions --recent-days 14`、`update_adjustment_factors --changed-since 3` 增量、当日 `update_open_close_summary --all`、`check_data_integrity --window-days 14` |
+| 每周 | 周六 | `update_massive_shares --all`、最近 5 个交易日 grouped daily、`update_open_close_summary` 5 日窗口补漏 |
+| 每周 | 周日 | `update_fx_rates`、`update_risk_free_rates`（DTB3）、`update_massive_actions --all --force`、`update_adjustment_factors --all --fail-on-vendor-mismatch` 全量重建、SEC identifiers/filings/fundamentals/insider 增量、CUSIP/13F 增量、`audit_security_identity` |
 | 每月 | 第一个周二 | `update_massive_events --all --force` |
 | 每月 | 第一个周三 | `update_massive_details --all --force` |
 | 按需 | 手动执行 | `update_massive_news`、各类 `--force` / `--full-refresh` 全量重建 |

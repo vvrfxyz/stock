@@ -110,8 +110,10 @@ python main.py rebuild_massive_dataset --market US
 4. `update_massive_prices --full-refresh`
 5. `update_grouped_daily`（最近 5 个交易日）
 6. `update_massive_shares --all --full-refresh`
+7. `update_adjustment_factors --all`（重建后刷新复权因子 cache，避免读取层过期）
+8. `check_data_integrity --window-days 730`
 
-复权因子 cache/reference 不在默认重建链路里强制执行，可以按需运行：
+vendor 复权因子 reference 的刷新仍可按需单独运行：
 
 ```bash
 python main.py update_adjustment_factors AAPL
@@ -134,17 +136,12 @@ python main.py rebuild_massive_dataset --market US --with-open-close-summary
 python main.py scheduled_update --market US
 ```
 
-默认步骤：
+默认步骤按每天 / 每周六 / 每周日 / 每月错峰执行。**权威 step list 以根 `README.md` 的「常用命令」小节和 `main.py` 的 `build_scheduled_update_steps()` 为准**，此处只概括口径：
 
-| 频率 | 任务 | 说明 |
-| --- | --- | --- |
-| 每天 | `update_massive_prices` | 按 `price_data_latest_date` 自动补齐缺失日线。 |
-| 每天 | `update_massive_short_data` | 按库中实际最大 short interest / short volume 日期增量补齐。 |
-| 每天 | `update_open_close_summary --all` | 补最近已完成交易日的全量 `pre_market` / `after_hours`。 |
-| 每周六 | `update_massive_shares --all` | 更新 shares / float。 |
-| 每周日 | `update_massive_actions --all --force` | 刷新分红拆股。 |
-| 每月第一个周二 | `update_massive_events --all --force` | 刷新 ticker events / symbol history。 |
-| 每月第一个周三 | `update_massive_details --all --force` | 刷新股票基本信息。 |
+- 每天跑增量：universe 同步、缺失日线、short data、近 14 天 corporate actions、复权因子增量、当日盘前/盘后、完整性检查。
+- 每周六：shares / float 与最近 5 个交易日 grouped daily、盘前/盘后 5 日补漏。
+- 每周日：分红拆股全量 + 复权因子全量重建、ECB 汇率、FRED 利率、SEC identifiers/filings/fundamentals/insider/CUSIP/13F 增量、身份审计。
+- 每月第一个周二 / 周三：ticker events / 证券详情全量刷新。
 
 全量脚本仍保留：`update_massive_short_data --force`、`update_massive_prices --full-refresh`
 和其他单项命令的 `--force` 都可以手动执行。默认日更不使用这些全量参数，避免在已有数据后再次拉完整 2 年窗口。
@@ -177,7 +174,7 @@ python main.py update_massive_news TSLA --force --lookback-days 7
 python main.py update_adjustment_factors AAPL
 ```
 
-`news` 和 `adjustment_factors` 暂不进入默认 cron。前者属于策略特征层，后者属于对账/cache 层，建议在具体策略或回测批次需要时单独运行。
+`news` 暂不进入默认 cron，属于策略特征层，建议在具体策略或回测批次需要时单独运行。`adjustment_factors` 已进入默认调度（每天 `--changed-since 3` 增量 + 每周日 `--all` 全量重建），这里的单项命令只用于按证券调试或对账。
 
 ## 计算口径
 

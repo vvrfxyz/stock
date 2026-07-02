@@ -27,7 +27,7 @@ research/
 ├── institutional.py         # PIT 13F 机构持仓聚合（breadth / delta IO / HHI 共用加载器）
 ├── insider.py               # PIT 内部人交易加载（90 天滚动窗口净买入）
 ├── fundamentals.py          # PIT 基本面面板（TTM / 时点指标）
-├── market_cap.py            # PIT 市值面板（close × total_shares）
+├── market_cap.py            # PIT 市值面板（close × total_shares，SPLIT 事件滚动校正股本）
 ├── data.py                  # 复权价格面板 + 因子事件加载
 ├── backtest.py              # 向量化回测引擎
 ├── strategies.py            # 技术基线策略（动量 / 反转 / 趋势）
@@ -69,13 +69,13 @@ class Factor(Protocol):
 | `earnings_yield` | `EarningsYieldFactor` | `sec_fundamental_facts` (NetIncomeLoss TTM) / 市值 | 季频 PIT | 1 | 270 | 盈利收益率（E/P）。值越大 = 更"便宜" |
 | `short_interest_ratio` | `ShortInterestFactor` | `short_interests` / `historical_shares.total_shares` | 半月频 | 14 | 30 | 空头仓位占总股本比率。FINRA 半月报，BD+8 后公布 |
 | `short_volume_ratio` | `ShortVolumeFactor` | `short_volumes.short_volume` / `total_volume` | 日频 | 1 | 10 | 每日做空成交量占总成交量比率。FINRA T+1 公布 |
-| `days_to_cover` | `DaysToCoverFactor` | `short_interests` / `daily_prices` avg volume | 半月频(SI) x 日频(vol) | 1 | 60 | 空头天数覆盖。short_interest / 20日均成交量。值越大 = 需要越多天平仓 |
+| `days_to_cover` | `DaysToCoverFactor` | `short_interests` / `daily_prices` avg volume | 半月频(SI) x 日频(vol) | 14 | 60 | 空头天数覆盖。short_interest / 20日均成交量。值越大 = 需要越多天平仓 |
 | `institutional_breadth` | `InstitutionalBreadthFactor` | `institutional_holdings` (13F) | 季频 | 0 | 200 | 持有该股的 13F filer 数量。机构持仓广度（共识度） |
 | `delta_institutional_ownership` | `DeltaInstitutionalOwnershipFactor` | `institutional_holdings` delta | 季频 | 0 | 200 | 季度环比机构持股变动率。(本季-上季)/上季。聪明钱流向信号 |
 | `ownership_concentration` | `OwnershipConcentrationFactor` | `institutional_holdings` HHI | 季频 | 0 | 200 | 持仓集中度 HHI。按 market_value 占比的赫芬达尔指数。值越大 = 越集中 |
 | `insider_net_buy` | `InsiderNetBuyFactor` | `insider_transactions` (Form 3/4/5) | 事件驱动 | 1 | ∞ (窗口制) | 90 天内部人净买入股数。只取 P/S 交易。正 = 净买入，负 = 净卖出 |
 
-注：`earnings_yield` 的 delay 由 `fundamentals.py` 内部 `filed_date` 决定（SEC 申报日即可见日），这里 1 天是默认保守缓冲。
+注：`earnings_yield` 的 delay 由 `fundamentals.py` 内部 `filed_date` 决定（SEC 申报日即可见日），这里 1 天是默认保守缓冲。`short_interest_ratio` 与 `days_to_cover` 的 loader 默认延迟共用 `research/short_interest.py` 的 `SHORT_INTEREST_VISIBLE_DELAY_DAYS = 14`（FINRA 半月报 BD+8 公布，取 14 个自然日兜底）；`days_to_cover` builtin 的 `lag_days` 元数据也绑定该常量（`short_interest` builtin 的 `lag_days` 仍硬编码为 1，与其 loader 实际延迟不符，待修）。
 
 ### 因子逻辑白话解释
 
@@ -91,9 +91,11 @@ class Factor(Protocol):
 
 ### 实现备注
 
-**institutional.py 共用加载器架构**：`institutional_breadth`、`delta_institutional_ownership`、`ownership_concentration` 三个因子共享 `research/institutional.py` 中的 `load_institutional_aggregates()` 函数。该函数一次 SQL 查询完成 13F 持仓的聚合计算（filer 计数 / 总持股量 / HHI），返回一个 dict 包含 4 个面板（breadth / total_shares / delta_io / hhi），各 builtin 因子只取自己需要的那个面板。避免三个因子各跑一遍相同的重查询。
+**institutional.py 共用加载器架构**：`institutional_breadth`、`delta_institutional_ownership`、`ownership_concentration` 三个因子共享 `research/institutional.py` 中的 `load_institutional_aggregates()`。该函数一次 SQL 完成 13F 聚合，返回一张长表事件流（每证券 × 季度一行，含 `n_holders` / `total_value` / `total_shares` / `hhi`），PIT 口径为：只按原件（13F-HR）计可见性、排除修正件（13F-HR/A）；同一 filer 同期多份原件取 filing_date 最新的 accession，并对该 accession 内同证券的全部拆行求和；加载后施加 period 单调守卫，迟到申报的旧季度事件丢弃。其上 `load_institutional_holdings_panel()` 返回 4 个 PIT 宽表的 dict（`n_holders` / `total_value` / `total_shares` / `hhi`），`load_delta_institutional_ownership_panel()` 单独在事件层算好季度环比再做 as-of。注意：没有跨因子缓存——每个 builtin 的 `compute` 各自执行一次该 SQL（评估三个 13F 因子时同一重查询会跑 3 次）。
 
-**insider_net_buy 滚动窗口机制**：`insider_net_buy` 不使用通用的 `event_table_to_asof_panel`（该工具是"最新事件值前填充"语义），而是用 cumsum + merge_asof 实现 90 天滚动窗口净买入。每笔 P/S 交易先按 security_id 做 cumulative sum，再用 `merge_asof` 将 90 天前的 cumsum 对齐到当前日期，两者相减即为窗口内净买入股数。`max_staleness_days` 设为无穷大（窗口内无交易 = 净买入为 0，而非 NaN）。
+**market_cap.py 拆股滚动校正**：PIT 市值 = raw close × as-of 股本快照。拆股 ex 日价格立即跳变、股本快照要等下一次 filing 才更新，期间市值会恰错一个拆股比；`compute_market_cap_panel` 因此用 `corporate_actions` 的 SPLIT 事件把股本从快照锚点日（visible_date）滚动到观测日（(锚点日, t] 区间内 split_to/split_from 累乘），`load_market_cap_panel` 自动加载并传入拆股事件，`size` / `earnings_yield` 经由该 loader 自动获得校正。
+
+**insider_net_buy 滚动窗口机制**：`insider_net_buy` 不使用通用的 `event_table_to_asof_panel`（该工具是"最新事件值前填充"语义），而是用 cumsum + merge_asof 实现 90 天滚动窗口净买入。每笔 P/S 交易先按 security_id 做 cumulative sum，再用 `merge_asof` 将 90 天前的 cumsum 对齐到当前日期，两者相减即为窗口内净买入股数。`max_staleness_days` 设为无穷大（窗口内无交易 = 净买入为 0，而非 NaN）。加载 SQL 强制 `security_type='NON_DERIVATIVE'` 且 `record_type='TRANSACTION'`（期权/权证与持仓快照行不参与），并按 accession 内交易字段组去重——解析层按 reporting owner 复制的联合申报副本只计一次。
 
 ## 评估因子
 

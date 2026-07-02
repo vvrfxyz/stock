@@ -64,12 +64,15 @@ python scripts/repair_identity.py --apply
 
 ## 身份事件表 (security_identity_events)
 
+事件类型全集以 `data_models/models.py` 的 `event_type` 列注释为准：
+
 | event_type | 含义 |
 |-----------|------|
 | RENAME | 同一身份，symbol 变了 |
 | RECYCLE | 同一 symbol，不同身份（被新公司复用）|
 | QUARANTINE | 冲突无法自动解决，跳过并记录 |
 | MERGE | 人工/审计合并分裂身份 |
+| SPLIT_IDENTITY | 一个身份被拆分为多个（schema 预留，当前无自动写入方）|
 | NEW_LISTING | 新上市 |
 | MANUAL | 人工修正 |
 

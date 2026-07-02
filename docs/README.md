@@ -5,13 +5,22 @@
 ## 当前有效文档
 
 - [因子库](./factors.md)
-  研究层因子框架架构、4 个内置因子目录（size / earnings_yield / short_interest_ratio / short_volume_ratio）、评估命令、新增因子指南、路线图。
+  研究层因子框架架构、9 个内置因子目录（size / earnings_yield / short_interest_ratio / short_volume_ratio / days_to_cover / institutional_breadth / delta_institutional_ownership / ownership_concentration / insider_net_buy）、评估命令、新增因子指南、路线图。
 
 - [Architecture](./architecture.md)
   当前 PostgreSQL raw truth、Massive-only ingestion、复权 reference/cache。
 
+- [证券身份生命周期](./identity_lifecycle.md)
+  身份解析器（SecurityIdentityResolver）原理、rename/recycle 处理流程、存量身份修复工具。
+
+- [数据质量 runbook](./data_quality_runbook.md)
+  `health_report` 解读、退出码约定、常见故障排查。
+
 - [Massive-only 重建与每日运行](./massive_rebuild_and_daily_run.md)
   当前推荐命令、默认 `update` 链路、全量重建方式、单项维护入口。
+
+- [生产部署操作手册](./deployment.md)
+  253 生产机的 SSH 直推同步流程、迁移与同步后固定动作、运行状态检查。
 
 - [Debian 部署与 systemd timer](../README.debian.md)
   每天 UTC+8 10:00 的生产定时、手动触发和日志检查命令。
@@ -38,5 +47,5 @@
 - `computed_adjustment_factors` 是内部可重建 cache，不是 truth。
 - `historical_shares` / `historical_floats` 是换手率计算的点时输入。
 - `exchanges` 保存交易所/MIC 参考数据；`trading_calendars` 保存逐交易所逐日期 session，不能用 `exchanges` 取代。
-- `sec_filings` 是 SEC filing index foundation；`insider_transactions` 和 `institutional_holdings` 分别承载 Form 4/13-F 明细。
-- 金融报表和 ratios 当前不抓取。
+- `sec_filings` 是 SEC filing index foundation；`insider_transactions` 和 `institutional_holdings` 分别承载 Form 3/4/5 / 13-F 明细。
+- `sec_fundamental_facts` 保存 SEC XBRL 原始申报值（`filed_date` 是点时可见边界）；财务比率是读取层计算，不写回事实表。

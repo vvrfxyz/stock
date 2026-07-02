@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Fixed (2026-07-02)
+
+- Deep-review fix batch (16 code packages + docs; full report at `docs/audits/2026-07-02-deep-review.md`):
+  - PIT correctness in the factor loading layer: `days_to_cover` visible delay unified with `short_interest_ratio` via a shared `SHORT_INTEREST_VISIBLE_DELAY_DAYS = 14` constant (was 1 — look-ahead leak); 13F aggregation rewritten to accession-level dedup with originals-only visibility (13F-HR/A excluded) and a period-monotonic guard; `insider_net_buy` now enforces `NON_DERIVATIVE`/`TRANSACTION` filters and accession-level multi-owner dedup in SQL; market-cap panel rolls the shares snapshot forward across SPLIT events (fixes the split-window ~10x median distortion feeding `size`/`earnings_yield`), and `update_massive_shares` force-refreshes snapshots stale relative to a recent split. Historical trials for the affected factors need to be re-run.
+  - Identity: CIK-branch resolver now checks FIGI conflicts before declaring a rename (no more identity hijack); history-symbol resolution picks candidates by interval semantics with an ambiguous fallback; `rename_security` closes/open symbol-history intervals; FTD CUSIP bridge gains PIT semantics (is_active filter, unstable-symbol skip, `start_date` lower bound) plus a reverse audit and `scripts/repair_cusip_links.py`; rename chains in `sync_massive_universe` are topologically ordered with per-row failure isolation.
+  - Grouped daily: symbol→id map restricted to active securities with ambiguity rejection; historical dates outside a 10-session window revert to update-only (no inserts under current-symbol attribution); no watermark stamping for NULL `price_data_latest_date` securities; `--end-date` clamped to the last completed session.
+  - SEC EDGAR: rate-limited 403s on the daily form index are retried with backoff instead of being swallowed as "no filings"; 13F submissions with a broken primary doc backfill period/form/CIK from the SGML header and are rejected (retried later) rather than written with NULL period.
+  - Evaluation/backtest: removed the dead terminal-sensitivity `run_backtest` call that crashed under pandas 3; `_pit_regression` now counts presence mismatches (value appears/disappears) as violations; IC uses the eligibility-filtered cross-section; trial IDs include an engine-code fingerprint; trials store writes are pid-suffixed and file-locked.
+  - Observability/security: health_report only thresholds 13F quarters past the filing deadline, skips malformed periods, and flags >12h RUNNING zombies; loguru sinks set `diagnose=False`; API-key masking shared via `utils/secret_masking.py` and applied across the retry/exception chain (`raise ... from None`); `backup_postgres.sh` no longer exposes the DSN via argv or exports the whole `.env`.
+  - CLI: unsupported markets exit 2; `update_adjustment_factors` subcommand forwards `--changed-since`/`--fail-on-vendor-mismatch`/`--max-mismatch-rate`; per-step stats now reach `pipeline_task_runs`; `--changed-since` also picks up dividends whose `ex_date` just became effective.
+  - Docs brought back in line with the code (this batch): AGENTS.md build/test commands and pytest guidance, scheduled_update step tables deduplicated to the root README authority, factor counts/loader descriptions, identity event-type listing, test paths/counts.
+
+### Fixed (2026-06-30)
+
+- 13F historical coverage postmortem follow-ups: quarterly backfill via `update_institutional_holdings --quarter` completed for the historical window, and `research/factors/asof.py` resolves same-day visibility ties deterministically by the newest staleness anchor (the old "largest factor value wins" dedup was a correctness bug). See `docs/audits/2026-06-30-13f-factor-coverage-postmortem.md`.
+
+### Fixed (2026-06-29)
+
+- Demoted trading-day-gap and split-jump integrity checks from blocking to warning: suspended/illiquid tickers and normal split-day volatility were forcing `check_data_integrity` to exit 2 every day, masking real problems.
+- Prevented case-insensitive ticker collisions in `update_grouped_daily` from attributing bars to the wrong security.
+
+### Added (2026-06-24)
+
+- Second factor batch — 5 new PIT builtin factors: `days_to_cover` (short interest / 20-day avg volume), `institutional_breadth` / `delta_institutional_ownership` / `ownership_concentration` (13F aggregates via the shared `research/institutional.py` loader), and `insider_net_buy` (90-day rolling net purchase from Form 3/4/5). `docs/factors.md` documents the catalog.
+
+### Added (2026-06-23, post short_volume_ratio)
+
+- `SecurityIdentityResolver` (`utils/security_identity.py`): FIGI→CIK→symbol→history priority chain for identity resolution; `sync_massive_universe` uses it for rename/recycle detection, with `security_identity_events` as the audit trail (migration `b7c8d9e0f1a2`).
+- Identity repair tooling: `scripts/audit_security_identity.py` (read-only reconciliation, exit 2 = migration-blocking) and `scripts/repair_identity.py --dry-run/--apply` (merges split identities, writes MERGE events). See `docs/identity_lifecycle.md`.
+- `pipeline_task_runs` table: per-step execution records (start/end/status/exit_code) for every `scheduled_update` run.
+- `health_report` command: per-domain data health summary with unified exit codes (0/1/2). See `docs/data_quality_runbook.md`.
+- `check_data_integrity` wired into the daily `scheduled_update` chain.
+
 ### Added (2026-06-23)
 
 - `short_volume_ratio` factor: daily FINRA short volume ratio (`short_volume / total_volume`) as a PIT builtin factor, complementing the semi-monthly `short_interest_ratio`. Uses T+1 visible delay and 10-day staleness. `research/short_volume.py` + `research/factors/builtins/short_volume.py` + 11 unit tests.

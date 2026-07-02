@@ -55,10 +55,11 @@ Core architecture rules:
 - `insider_transactions`: Form 3/4/5 ownership transaction rows (one row per entry × reporting owner; layer by `transaction_code` before building features).
 - `institutional_holdings`: 13-F holdings rows (filer-CIK anchored, discovered via EDGAR form index — not `sec_filings`; `security_id` mapped via SEC fails-to-deliver CUSIP identifiers (`sync_cusip_identifiers`), NULL where unmapped; `value` stored as reported — thousands of USD before 2023-01, USD after).
 - `fx_rates`: ECB daily EUR-based reference rates; USD cross rates are computed at read time via `utils/fx_rates.UsdFxConverter`.
+- `risk_free_rates`: FRED risk-free reference rates (DTB3 stored as annual discount-basis percent); research metrics read them via `utils/risk_free_rates.load_risk_free_daily_returns`.
 
 Financial ratios remain read-time computations — never store derived ratios back into fact tables. `sec_fundamental_facts` stores raw reported XBRL values only; do not revive `financial_reports` as a vague catch-all table.
 
-- `security_identity_events`: 身份变更审计事件（RENAME / RECYCLE / MERGE / QUARANTINE / NEW_LISTING）。
+- `security_identity_events`: 身份变更审计事件（RENAME / RECYCLE / MERGE / SPLIT_IDENTITY / QUARANTINE / NEW_LISTING / MANUAL，与 `data_models/models.py` 的 event_type 注释一致）。
 - `pipeline_task_runs`: scheduled_update 每步执行记录（start/end/status/exit_code/stats）。
 
 ## Setup
@@ -98,6 +99,7 @@ python main.py update_sec_fundamentals aapl         # XBRL 基本面；--all --s
 python main.py update_insider_transactions aapl     # Form 3/4/5 明细；--all 处理全部待解析 filing
 python main.py update_institutional_holdings --since 2026-06-01   # 13F 持仓；--quarter 2026Q1 季度回填
 python main.py update_fx_rates                      # ECB 参考汇率；非 USD 分红折算依赖
+python main.py update_risk_free_rates               # FRED DTB3 无风险利率；评估层超额收益依赖
 
 python scripts/check_data_integrity.py --limit 5
 python scripts/audit_recent_data.py --sample-size 32   # vendor 对账抽样审计（耗 API 配额）

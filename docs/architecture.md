@@ -130,12 +130,7 @@ SEC 底层 schema 一次打好，包括 filing index、identifier mapping、Form
 python main.py scheduled_update --market US
 ```
 
-`scheduled_update` 顺序执行：
-1. 每天：日线、short data、最近 14 天 corporate actions、最近已完成交易日的盘前/盘后。
-2. 每周六：shares / float、最近 5 个交易日 grouped daily 重刷。
-3. 每周日：分红 / 拆股全量、ECB 汇率增量、SEC identifiers、SEC filings 增量、SEC fundamentals 增量、Form 3/4/5 insider 解析增量、FTD CUSIP 映射、13F 持仓增量。
-4. 每月第一个周二：ticker events / symbol history。
-5. 每月第一个周三：证券详情。
+`scheduled_update` 顺序执行每日增量（universe 同步、日线、short data、近期 corporate actions、复权因子增量、盘前/盘后、完整性检查），并把 shares/grouped daily、SEC 全家桶/汇率/利率/身份审计、events/details 按周六/周日/每月错峰。**权威 step list 以根 `README.md` 的「常用命令」小节和 `main.py` 的 `build_scheduled_update_steps()` 为准**，此处不再重复维护。
 
 日更路径只跑增量；各单项采集脚本的 `--force` / `--full-refresh` 保留为手动全量回补入口。
 
@@ -164,7 +159,7 @@ python main.py update_adjustment_factors AAPL
 - 技术指标：从 raw/canonical bar 在计算层生成；如需缓存，必须明确标注为 cache，而不是事实表。
   Massive 提供 SMA/EMA/MACD/RSI endpoint，但项目不把这些数值写入事实表。后续可以写一个校验小工具：同一 ticker/date/window/series_type 下，用本地 raw/canonical bars 手动计算指标，并和 Massive 返回值对账，用于发现复权口径、窗口边界或数据缺口问题。
 - 成交额：如果供应商没有原始返回，不通过 `volume * vwap` 写回事实表。
-- 财报/ratios：当前不抓取，也不纳入默认 schema 使用路径。
+- 财报/ratios：`sec_fundamental_facts` 保存 SEC XBRL 原始申报值（`utils/sec_concepts.py` 白名单，`filed_date` 是点时可见边界）；财务比率仍是读取层计算，不写回事实表，也不恢复模糊的 `financial_reports` 表。
 
 ## 数据一致性与故障恢复
 

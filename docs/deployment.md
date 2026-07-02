@@ -79,7 +79,7 @@ ssh home-debian "tail -50 /home/wenruifeng/projects/stock/logs/cron_daily_run.lo
 
 ## 已知环境差异
 
-- 远端 venv 没有 pytest；测试只在本地跑（67 个用例）。
+- 远端 venv 没有 pytest；测试只在本地跑（600+ 用例，2026-07 时点 634 个）。
 - 远端 git 首次以 root 操作需要 `safe.directory` 配置（`/home/wenruifeng/projects/stock` 和 `.../.git` 两条）。
 - docker-compose 端口默认绑定 `0.0.0.0`，`.env` 可用 `POSTGRES_BIND` 收紧为 `127.0.0.1`。
 

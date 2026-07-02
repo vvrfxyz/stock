@@ -80,11 +80,13 @@ python scripts/migrate_database.py
 
 - 每天：`sync_massive_universe`、`update_massive_prices`、`update_massive_short_data`、`update_massive_actions --recent-days 14`、`update_adjustment_factors --changed-since 3`、当日 `update_open_close_summary --all`、`check_data_integrity --window-days 14`。
 - 每周六：`update_massive_shares --all`、`update_grouped_daily_recent`（5 日窗口）、`update_open_close_summary` 5 日窗口补漏。
-- 每周日：`update_fx_rates`、`update_risk_free_rates`（DTB3）、`update_massive_actions --all --force`、`update_adjustment_factors --all`（全量重建）、`sync_sec_identifiers`、`update_sec_filings --since 14d`、`update_sec_fundamentals --since 14d`、`update_insider_transactions --since 21d`、`sync_cusip_identifiers --months 2`、`update_institutional_holdings --since 14d`。
+- 每周日：`update_fx_rates`、`update_risk_free_rates`（DTB3）、`update_massive_actions --all --force`、`update_adjustment_factors --all --fail-on-vendor-mismatch`（全量重建）、`sync_sec_identifiers`、`update_sec_filings --since 14d`、`update_sec_fundamentals --since 14d`、`update_insider_transactions --since 21d`、`sync_cusip_identifiers --months 2`、`update_institutional_holdings --since 14d`、`audit_security_identity`。
 - 每月第一个周二：`update_massive_events --all --force`。
 - 每月第一个周三：`update_massive_details --all --force`。
 
-完整 step list 可通过测试 `tests/test_script_runs.py::test_scheduled_update_steps_*` 锁定。
+权威实现是 `main.py` 的 `build_scheduled_update_steps()`；完整 step list 由测试
+`tests/test_scheduled_update.py::test_scheduled_update_runs_daily_tasks_every_day` /
+`test_scheduled_update_staggers_weekly_tasks` / `test_scheduled_update_staggers_monthly_tasks` 锁定。
 
 Debian 部署使用 systemd timer，每天 UTC+8 `10:00` 运行
 `scripts/run_daily_cron.sh`，实际执行同一个 `scheduled_update` 入口。安装和排障命令见
