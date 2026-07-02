@@ -2,8 +2,11 @@
 institutional builtin factors: institutional_breadth, ownership_concentration,
 delta_institutional_ownership.
 
-All tests run without a database connection by monkeypatching
-``load_institutional_aggregates``.
+All tests run without a database connection: panel tests monkeypatch
+``load_institutional_aggregates``; aggregate-level tests (period monotonic
+guard, HHI) monkeypatch ``pd.read_sql_query``. The aggregation SQL itself
+(accession-level dedup, original-only visibility) is locked by the PostgreSQL
+integration tests in tests/test_institutional_pg.py.
 """
 from __future__ import annotations
 
@@ -72,15 +75,43 @@ def _patch_agg(monkeypatch, *rows):
         if security_ids is not None and len(security_ids) == 0:
             # Replicate the real early-return for empty list
             from research.institutional import _empty_agg
-            empty = _empty_agg()
-            empty["hhi"] = pd.Series(dtype=np.float64)
-            return empty
+            return _empty_agg()
         return agg.copy()
 
     monkeypatch.setattr(institutional, "load_institutional_aggregates", fake_load)
 
 
+def _sql_result(*rows) -> pd.DataFrame:
+    """Build a DataFrame shaped like the raw SQL result of load_institutional_aggregates.
+
+    Each row: (security_id, period, visible_date, n_holders, total_value,
+    total_shares, sum_sq_value) — SQL emits rows ordered by (security_id, period).
+    """
+    df = pd.DataFrame(
+        rows,
+        columns=["security_id", "period", "visible_date",
+                 "n_holders", "total_value", "total_shares", "sum_sq_value"],
+    )
+    for col in ("visible_date", "period"):
+        df[col] = pd.to_datetime(df[col])
+    return df
+
+
+def _patch_sql(monkeypatch, *rows):
+    """Monkeypatch pd.read_sql_query so load_institutional_aggregates runs for real."""
+    result = _sql_result(*rows)
+
+    def fake_read_sql_query(sql, engine, *, params=None, parse_dates=None):
+        return result.copy()
+
+    monkeypatch.setattr(institutional.pd, "read_sql_query", fake_read_sql_query)
+
+
 _DUMMY_ENGINE = object()
+
+
+def _ns_index(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    return pd.DatetimeIndex(index).astype("datetime64[ns]")
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +143,7 @@ class TestHoldingsPanelBasic:
         for key in panels:
             assert panels[key].shape == (2, 2), f"panel {key} shape mismatch"
             assert panels[key].columns.tolist() == [1, 2]
-            pd.testing.assert_index_equal(panels[key].index, dates)
+            pd.testing.assert_index_equal(panels[key].index, _ns_index(dates))
 
         # At 2025-12-01: Q3 visible (visible_date 2025-11-15 <= 2025-12-01)
         assert panels["n_holders"].loc["2025-12-01", 1] == 50.0
@@ -191,7 +222,7 @@ class TestHoldingsPanelEmptyAgg:
 
         for key in ("n_holders", "total_value", "total_shares", "hhi"):
             panel = panels[key]
-            pd.testing.assert_index_equal(panel.index, dates)
+            pd.testing.assert_index_equal(panel.index, _ns_index(dates))
             assert panel.columns.tolist() == [1, 2]
             assert panel.dtypes.tolist() == [np.float64, np.float64]
             assert panel.isna().all().all()
@@ -327,7 +358,7 @@ class TestDeltaEmpty:
             _DUMMY_ENGINE, dates=dates, security_ids=[1, 2],
         )
 
-        pd.testing.assert_index_equal(panel.index, dates)
+        pd.testing.assert_index_equal(panel.index, _ns_index(dates))
         assert panel.columns.tolist() == [1, 2]
         assert panel.dtypes.tolist() == [np.float64, np.float64]
         assert panel.isna().all().all()
@@ -351,6 +382,119 @@ class TestDeltaSecurityIdsFilter:
         assert panel.columns.tolist() == [1, 999]
         assert abs(panel.loc["2026-06-01", 1] - 0.2) < 1e-10
         assert panel[999].isna().all()
+
+
+# ---------------------------------------------------------------------------
+# Aggregate loader tests (real load_institutional_aggregates, mocked SQL result)
+# ---------------------------------------------------------------------------
+
+class TestAggregatesPeriodMonotonicGuard:
+    """A late filing for an old period must not roll the as-of series backwards."""
+
+    def test_late_old_period_event_dropped(self, monkeypatch):
+        _patch_sql(
+            monkeypatch,
+            # Q3 filed late (2026-03-01) — visible AFTER Q4's visible_date
+            (1, "2025-09-30", "2026-03-01", 10, 100_000.0, 1_000.0, 1_000_000.0),
+            (1, "2025-12-31", "2026-02-15", 12, 120_000.0, 1_200.0, 1_440_000.0),
+        )
+
+        agg = institutional.load_institutional_aggregates(object())
+
+        # Only the Q4 event survives: the late Q3 event would make merge_asof
+        # fall back to stale Q3 values after 2026-03-01
+        assert agg["period"].tolist() == [pd.Timestamp("2025-12-31")]
+        assert agg["n_holders"].tolist() == [12.0]
+
+    def test_in_order_events_untouched(self, monkeypatch):
+        _patch_sql(
+            monkeypatch,
+            (1, "2025-09-30", "2025-11-15", 10, 100_000.0, 1_000.0, 1_000_000.0),
+            (1, "2025-12-31", "2026-02-15", 12, 120_000.0, 1_200.0, 1_440_000.0),
+        )
+
+        agg = institutional.load_institutional_aggregates(object())
+
+        assert agg["period"].tolist() == [
+            pd.Timestamp("2025-09-30"), pd.Timestamp("2025-12-31"),
+        ]
+
+    def test_guard_is_per_security(self, monkeypatch):
+        _patch_sql(
+            monkeypatch,
+            # sec 1: normal ordering
+            (1, "2025-12-31", "2026-02-15", 12, 120_000.0, 1_200.0, 1_440_000.0),
+            # sec 2: only an old-period event — must NOT be dropped by sec 1's newer period
+            (2, "2025-09-30", "2026-03-01", 5, 50_000.0, 500.0, 250_000.0),
+        )
+
+        agg = institutional.load_institutional_aggregates(object())
+
+        assert set(agg["security_id"]) == {1, 2}
+
+
+class TestAggregatesHhi:
+    """HHI = sum(filer_value^2) / total_value^2, NaN when total_value <= 0."""
+
+    def test_hhi_from_sum_sq(self, monkeypatch):
+        # two equal filers of 500k each: hhi = 2*500k^2 / 1M^2 = 0.5
+        _patch_sql(
+            monkeypatch,
+            (1, "2025-12-31", "2026-02-15", 2, 1_000_000.0, 1_000.0, 2 * 500_000.0 ** 2),
+        )
+
+        agg = institutional.load_institutional_aggregates(object())
+
+        assert abs(agg["hhi"].iloc[0] - 0.5) < 1e-12
+
+    def test_hhi_nan_on_zero_total_value(self, monkeypatch):
+        _patch_sql(
+            monkeypatch,
+            (1, "2025-12-31", "2026-02-15", 1, 0.0, 1_000.0, 0.0),
+        )
+
+        agg = institutional.load_institutional_aggregates(object())
+
+        assert np.isnan(agg["hhi"].iloc[0])
+
+
+class TestDeltaPriorBaseAfterGuard:
+    """Delta prior-quarter base must come from an event visible no later than the
+    current quarter's event — guaranteed by the monotonic guard."""
+
+    def test_late_old_quarter_does_not_corrupt_delta(self, monkeypatch):
+        _patch_sql(
+            monkeypatch,
+            # Q2 base
+            (1, "2025-06-30", "2025-08-15", 10, 100_000.0, 1_000.0, 1_000_000.0),
+            # Q3 filed extremely late — dropped by the guard
+            (1, "2025-09-30", "2026-03-01", 10, 100_000.0, 9_999.0, 1_000_000.0),
+            # Q4
+            (1, "2025-12-31", "2026-02-15", 12, 120_000.0, 1_200.0, 1_440_000.0),
+        )
+
+        dates = pd.DatetimeIndex(pd.to_datetime(["2026-03-15"]))
+        panel = load_delta_institutional_ownership_panel(
+            object(), dates=dates, security_ids=[1],
+        )
+
+        # Prior base is Q2's 1000 shares (visible 2025-08-15 <= Q4's 2026-02-15),
+        # not the dropped late-Q3 9999: (1200 - 1000) / 1000 = 0.2
+        assert abs(panel.loc["2026-03-15", 1] - 0.2) < 1e-10
+
+    def test_prior_visible_no_later_than_current(self, monkeypatch):
+        _patch_sql(
+            monkeypatch,
+            (1, "2025-09-30", "2025-11-15", 10, 100_000.0, 1_000.0, 1_000_000.0),
+            (1, "2025-12-31", "2026-02-15", 12, 120_000.0, 1_500.0, 1_440_000.0),
+        )
+
+        agg = institutional.load_institutional_aggregates(object())
+
+        # After the guard, visible_date is non-decreasing within each security,
+        # so every prior-quarter base was already visible at the current event
+        by_sec = agg.sort_values(["security_id", "period"])
+        assert by_sec.groupby("security_id")["visible_date"].is_monotonic_increasing.all()
 
 
 # ---------------------------------------------------------------------------

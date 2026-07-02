@@ -131,6 +131,41 @@ def test_visible_delay_pushes_visibility(monkeypatch):
     assert abs(panel.loc["2026-01-16", 1] - 2.0) < 1e-9
 
 
+def test_default_visible_delay_matches_short_interest_ratio(monkeypatch):
+    """默认延迟走 FINRA BD+8 兜底：结算日后第 14 个自然日才可见。"""
+    si_rows = [(1, "2026-01-15", "2026-01-15", 100)]
+    vol_dates = pd.date_range("2025-12-15", "2026-01-30", freq="D").strftime("%Y-%m-%d").tolist()
+    vol_data = {1: [50.0] * len(vol_dates)}
+    _patch(monkeypatch, si_rows, vol_dates, vol_data)
+
+    panel = load_days_to_cover_panel(
+        _DUMMY,
+        dates=pd.to_datetime(["2026-01-28", "2026-01-29"]),
+        security_ids=[1],
+    )
+
+    assert np.isnan(panel.loc["2026-01-28", 1])
+    assert abs(panel.loc["2026-01-29", 1] - 2.0) < 1e-9
+
+
+def test_visible_delay_constant_shared_across_si_factors():
+    """days_to_cover 与 short_interest_ratio 共用同一可见延迟常量，防止再次分叉。"""
+    import inspect
+
+    from research.short_interest import (
+        SHORT_INTEREST_VISIBLE_DELAY_DAYS,
+        load_short_interest_ratio_panel,
+    )
+
+    dtc_default = inspect.signature(load_days_to_cover_panel).parameters["visible_delay_days"].default
+    si_default = inspect.signature(load_short_interest_ratio_panel).parameters["visible_delay_days"].default
+
+    assert SHORT_INTEREST_VISIBLE_DELAY_DAYS == 14
+    assert dtc_default == SHORT_INTEREST_VISIBLE_DELAY_DAYS
+    assert si_default == SHORT_INTEREST_VISIBLE_DELAY_DAYS
+    assert DaysToCoverFactor.lag_days == SHORT_INTEREST_VISIBLE_DELAY_DAYS
+
+
 def test_staleness_truncates(monkeypatch):
     """SI event, si_max_staleness_days=10, should go NaN after 10 days from visible_date."""
     si_rows = [(1, "2026-01-15", "2026-01-15", 100)]
@@ -339,5 +374,5 @@ def test_builtin_factor_registered():
     assert isinstance(factor, DaysToCoverFactor)
     assert factor.name == "days_to_cover"
     assert factor.lookback_days == 20
-    assert factor.lag_days == 1
+    assert factor.lag_days == 14
     assert factor.pit_guarantee is True

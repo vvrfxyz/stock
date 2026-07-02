@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -155,6 +157,53 @@ def test_trial_id_is_content_addressed(tmp_path):
     second = _result().to_trial_rows()[0]["trial_id"]
 
     assert first == second
+
+
+def test_trial_id_includes_engine_code_fingerprint(monkeypatch):
+    import research.evaluate as ev
+
+    result = _result()
+    monkeypatch.setattr(ev, "_engine_code_fingerprint", lambda: "engine-a")
+    first = result._trial_id_value()
+    monkeypatch.setattr(ev, "_engine_code_fingerprint", lambda: "engine-b")
+    second = result._trial_id_value()
+
+    assert first != second
+
+
+def test_write_tmp_name_is_process_unique_and_lock_created(tmp_path, monkeypatch):
+    path = tmp_path / "trials.parquet"
+    seen: list[Path] = []
+    real_write = pq.write_table
+
+    def record(table, dest, *args, **kwargs):
+        seen.append(Path(dest))
+        return real_write(table, dest, *args, **kwargs)
+
+    monkeypatch.setattr(pq, "write_table", record)
+    append_trial(_result(), path)
+
+    assert seen == [tmp_path / f".trials.parquet.{os.getpid()}.tmp"]
+    assert (tmp_path / "trials.parquet.lock").exists()
+
+
+def test_append_trial_serializes_via_flock(tmp_path, monkeypatch):
+    import fcntl
+
+    import research._trials_store as store
+
+    path = tmp_path / "trials.parquet"
+    ops: list[int] = []
+    real_flock = fcntl.flock
+
+    def record(fd, op):
+        ops.append(op)
+        return real_flock(fd, op)
+
+    monkeypatch.setattr(store.fcntl, "flock", record)
+    append_trial(_result(), path)
+
+    assert ops == [fcntl.LOCK_EX, fcntl.LOCK_UN]
 
 
 def test_params_hash_excludes_note(tmp_path):

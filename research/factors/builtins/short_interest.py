@@ -6,14 +6,17 @@ from typing import ClassVar
 import pandas as pd
 
 from research.factors.protocol import FactorContext, register
-from research.short_interest import load_short_interest_ratio_panel
+from research.short_interest import (
+    SHORT_INTEREST_VISIBLE_DELAY_DAYS,
+    load_short_interest_ratio_panel,
+)
 
 
 @dataclass(frozen=True)
 class ShortInterestFactor:
     name: ClassVar[str] = "short_interest_ratio"
     lookback_days: ClassVar[int] = 0
-    lag_days: ClassVar[int] = 1
+    lag_days: ClassVar[int] = SHORT_INTEREST_VISIBLE_DELAY_DAYS
     pit_guarantee: ClassVar[bool] = True
 
     def compute(self, ctx: FactorContext) -> pd.DataFrame:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import subprocess
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 import pandas as pd
 from loguru import logger
@@ -60,9 +62,14 @@ METRIC_NAMES: frozenset[str] = frozenset(
         "coverage_factor_mean",
         "coverage_factor_p05",
         "coverage_fwd_given_factor_p05",
+        "coverage_factor_count_p05",
+        "coverage_factor_count_median",
+        "coverage_factor_count_max",
+        "coverage_days_below_min_coverage",
         "n_universe_mean",
         "n_universe_min",
         "pit_regression_max_abs_diff",
+        "pit_presence_violations",
         "factor_freshness_gap_days",
         "unexpected_coverage_jump_days",
         "flag_horizon_skipped",
@@ -169,7 +176,7 @@ def _write_frame(df: pd.DataFrame, path: Path) -> None:
         rows.append(clean)
     pa, pq = _pyarrow()
     table = pa.Table.from_pylist(rows, schema=_arrow_schema())
-    tmp = path.with_name(f".{path.name}.tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         pq.write_table(table, tmp)
         os.replace(tmp, path)
@@ -181,6 +188,19 @@ def _write_frame(df: pd.DataFrame, path: Path) -> None:
         raise
 
 
+@contextmanager
+def _exclusive_lock(path: Path) -> Iterator[None]:
+    """.lock 旁文件上的 fcntl 排他锁，串行化并发 append 的 read→concat→replace。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 def append_trial(result: "EvaluationResult", path: Path) -> str:
     rows = result.to_trial_rows()
     if not rows:
@@ -190,15 +210,16 @@ def append_trial(result: "EvaluationResult", path: Path) -> str:
     unknown = set(new["metric"].dropna()) - METRIC_NAMES
     if unknown:
         raise ValueError(f"unknown trial metrics: {sorted(unknown)}")
-    old = _read_frame(path)
-    if not old.empty and trial_id in set(old["trial_id"].astype(str)):
-        logger.info("trial_id={} already exists in {}, skipping", trial_id, path)
-        object.__setattr__(result, "trial_id", trial_id)
-        return trial_id
-    combined = pd.concat([old, new.reindex(columns=_schema_columns())], ignore_index=True)
-    if len(combined) > 100_000:
-        logger.warning("{} has {} rows; consider manual archive", path, len(combined))
-    _write_frame(combined, path)
+    with _exclusive_lock(path):
+        old = _read_frame(path)
+        if not old.empty and trial_id in set(old["trial_id"].astype(str)):
+            logger.info("trial_id={} already exists in {}, skipping", trial_id, path)
+            object.__setattr__(result, "trial_id", trial_id)
+            return trial_id
+        combined = pd.concat([old, new.reindex(columns=_schema_columns())], ignore_index=True)
+        if len(combined) > 100_000:
+            logger.warning("{} has {} rows; consider manual archive", path, len(combined))
+        _write_frame(combined, path)
     object.__setattr__(result, "trial_id", trial_id)
     created = pd.to_datetime(rows[0]["created_at"], utc=True)
     object.__setattr__(result, "created_at", created)

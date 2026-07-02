@@ -8,6 +8,13 @@
 PIT 口径：13F 截止日（period）后约 45 天才申报，故用 filing_date 作可见日，
 period 作 staleness anchor。只取 shares_or_principal_type='SH' 的多头股票仓位
 （排除期权 put_call、本金类 PRN）。
+
+可见性只按原件（13F-HR）计算：修正件（13F-HR/A）可能迟到数月，若参与
+visible_date 会把整季聚合推迟到修正日——旧季度遮蔽新季度、且在 staleness
+门槛下整季永不可见。同一 filer 同期多份原件取 filing_date 最新的 accession，
+对该 accession 内同证券的全部拆行（不同 discretion / voting authority）求和。
+加载后按可见序做 period 单调守卫，迟到申报的旧季度事件直接丢弃
+（同 research/fundamentals.py 事件流的守卫口径）。
 """
 from __future__ import annotations
 
@@ -17,9 +24,6 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from research.factors.asof import event_table_to_asof_panel
-
-_AGG_COLUMNS = ["security_id", "visible_date", "period", "n_holders", "total_value", "total_shares"]
-_ROW_COLUMNS = ["security_id", "visible_date", "period", "filer_cik", "market_value"]
 
 
 def _to_ns(df: pd.DataFrame, cols: tuple[str, ...]) -> pd.DataFrame:
@@ -37,8 +41,16 @@ def _empty_agg() -> pd.DataFrame:
             "n_holders": pd.Series(dtype=np.float64),
             "total_value": pd.Series(dtype=np.float64),
             "total_shares": pd.Series(dtype=np.float64),
+            "hhi": pd.Series(dtype=np.float64),
         }
     )
+
+
+def _drop_period_regressions(agg: pd.DataFrame) -> pd.DataFrame:
+    """可见序内 period 必须单调不减：迟到申报的旧季度事件会让 as-of 面板回退，丢弃。"""
+    agg = agg.sort_values(["security_id", "visible_date", "period"])
+    running_max = agg.groupby("security_id")["period"].cummax()
+    return agg[agg["period"] >= running_max].reset_index(drop=True)
 
 
 def load_institutional_aggregates(
@@ -48,18 +60,18 @@ def load_institutional_aggregates(
 ) -> pd.DataFrame:
     """按 (security_id, period) 聚合 13F 持仓，附带该季度的 filing_date 可见日。
 
-    可见日取该 (security_id, period) 内最晚的 filing_date：保证截面里所有
-    filer 都已申报后才让该季度的聚合值可见，避免用到未来才到的申报行。
-    HHI 在事件层一并算好。
+    只聚合原件（form_type 不含 '/A'；NULL 视同原件——写入层总会从 form index
+    回填 form_type，NULL 仅是防御性容错）。同一 (filer_cik, period) 多份原件
+    取 filing_date 最新的 accession，并对该 accession 内同证券多行求和。
+    visible_date = 该 (security_id, period) 所含原件 accession 的 max(filing_date)。
+    HHI 在事件层一并算好；返回前做 period 单调守卫。
     """
     if security_ids is not None and not security_ids:
         return _empty_agg()
     sql = text(
         """
-        with deduped as (
-            -- 同一 (security_id, period, filer_cik) 若有多条（原件+修正件），取最晚 filing_date 的行
-            select distinct on (security_id, period, filer_cik)
-                   security_id, period, filing_date, filer_cik,
+        with filtered as (
+            select security_id, period, filing_date, filer_cik, accession_number,
                    market_value::float8 as market_value,
                    shares_or_principal_amount::float8 as shares
             from institutional_holdings
@@ -69,18 +81,26 @@ def load_institutional_aggregates(
               and shares_or_principal_type = 'SH'
               and put_call is null
               and market_value is not null
+              and (form_type is null or form_type not like '%/A%')
               and (cast(:security_ids as bigint[]) is null
                    or security_id = any(cast(:security_ids as bigint[])))
-            order by security_id, period, filer_cik, filing_date desc, id desc
+        ),
+        chosen as (
+            -- 同一 (filer_cik, period) 多份原件时选定唯一 accession（filing_date 最新）
+            select distinct on (filer_cik, period)
+                   filer_cik, period, accession_number, filing_date
+            from filtered
+            order by filer_cik, period, filing_date desc, accession_number desc
         ),
         per_filer as (
-            -- 同一 filer 对同一证券同一季度的多行（如不同 share class）先求和
-            select security_id, period, filer_cik,
-                   max(filing_date) as filing_date,
-                   sum(market_value) as filer_value,
-                   sum(shares) as filer_shares
-            from deduped
-            group by security_id, period, filer_cik
+            -- 选定 accession 内同证券多行（不同 discretion / voting authority 拆行）求和
+            select f.security_id, f.period, f.filer_cik,
+                   c.filing_date,
+                   sum(f.market_value) as filer_value,
+                   sum(f.shares) as filer_shares
+            from filtered f
+            join chosen c using (filer_cik, period, accession_number)
+            group by f.security_id, f.period, f.filer_cik, c.filing_date
         )
         select security_id,
                period,
@@ -101,16 +121,14 @@ def load_institutional_aggregates(
         parse_dates=["visible_date", "period"],
     )
     if agg.empty:
-        empty = _empty_agg()
-        empty["hhi"] = pd.Series(dtype=np.float64)
-        return empty
+        return _empty_agg()
     agg = _to_ns(agg, ("visible_date", "period"))
     agg["security_id"] = agg["security_id"].astype(np.int64)
     for col in ("n_holders", "total_value", "total_shares", "sum_sq_value"):
         agg[col] = agg[col].astype(np.float64)
     with np.errstate(divide="ignore", invalid="ignore"):
         agg["hhi"] = agg["sum_sq_value"] / agg["total_value"].where(agg["total_value"] > 0) ** 2
-    return agg
+    return _drop_period_regressions(agg)
 
 
 def load_institutional_holdings_panel(
@@ -169,7 +187,8 @@ def load_delta_institutional_ownership_panel(
     """季度环比机构持股变动率：(本季 total_shares - 上季) / 上季。
 
     在事件层先按 period 排出每证券的上一季持股，算好比率再做 as-of，
-    保证某日看到的是"截至该日最新已申报季度的环比"。
+    保证某日看到的是"截至该日最新已申报季度的环比"。聚合层的 period
+    单调守卫保证上季基数的 visible_date 不晚于本季事件——基数不含未来值。
     """
     dates = pd.DatetimeIndex(pd.to_datetime(list(dates))).astype("datetime64[ns]")
     requested_security_ids = None

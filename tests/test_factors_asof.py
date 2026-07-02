@@ -156,16 +156,28 @@ def test_dates_order_and_duplicates_preserved():
 def test_multiple_events_same_security_same_effective_visible_date_anchor_max_wins():
     dates = pd.DatetimeIndex(pd.to_datetime(["2026-01-05"]))
     events = _events(
-        (1, "2026-01-05", "2026-01-01", 10.0),
-        (1, "2026-01-05", "2026-01-03", 20.0),
+        (1, "2026-01-05", "2026-01-01", 20.0),
+        (1, "2026-01-05", "2026-01-03", 10.0),
         (2, "2026-01-05", "2026-01-02", 30.0),
         (2, "2026-01-05", "2026-01-02", 40.0),
     )
 
     panel = event_table_to_asof_panel(events, dates=dates, value_column="value")
 
-    assert panel.loc["2026-01-05", 1] == 20.0
+    assert panel.loc["2026-01-05", 1] == 10.0
     assert panel.loc["2026-01-05", 2] == 40.0
+
+
+def test_multiple_events_same_visible_date_keeps_latest_anchor_not_largest_value():
+    dates = pd.DatetimeIndex(pd.to_datetime(["2026-05-15"]))
+    events = _events(
+        (1, "2026-05-15", "2025-12-31", 500.0),
+        (1, "2026-05-15", "2026-03-31", 100.0),
+    )
+
+    panel = event_table_to_asof_panel(events, dates=dates, value_column="value")
+
+    assert panel.loc["2026-05-15", 1] == 100.0
 
 
 def test_nan_values_in_events_filtered():

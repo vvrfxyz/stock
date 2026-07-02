@@ -10,6 +10,7 @@ from research.market_cap import (
     compute_market_cap_panel,
     load_market_cap_panel,
     load_shares_events,
+    load_split_events,
 )
 
 
@@ -17,6 +18,12 @@ def _events(*rows) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=["security_id", "visible_date", "period_end_date", "total_shares"])
     for col in ("visible_date", "period_end_date"):
         df[col] = pd.to_datetime(df[col])
+    return df
+
+
+def _splits(*rows) -> pd.DataFrame:
+    df = pd.DataFrame(rows, columns=["security_id", "ex_date", "split_from", "split_to"])
+    df["ex_date"] = pd.to_datetime(df["ex_date"])
     return df
 
 
@@ -74,6 +81,29 @@ def _insert_price(pg_db, security_id, date, close):
                 """
             ),
             {"security_id": security_id, "date": date, "close": close},
+        )
+        conn.commit()
+
+
+def _insert_split(pg_db, security_id, ex_date, split_from, split_to, source="MASSIVE", source_event_id=None):
+    with pg_db.engine.connect() as conn:
+        conn.execute(
+            text(
+                """
+                insert into corporate_actions
+                    (security_id, action_type, ex_date, split_from, split_to, source, source_event_id)
+                values
+                    (:security_id, 'SPLIT', :ex_date, :split_from, :split_to, :source, :source_event_id)
+                """
+            ),
+            {
+                "security_id": security_id,
+                "ex_date": ex_date,
+                "split_from": split_from,
+                "split_to": split_to,
+                "source": source,
+                "source_event_id": source_event_id or f"split:{security_id}:{ex_date}:{source}",
+            },
         )
         conn.commit()
 
@@ -154,6 +184,126 @@ def test_nan_total_shares_event_is_missing():
     assert panel.loc["2026-06-15", 1] == 10_000_000.0
 
 
+def test_forward_split_between_snapshots_keeps_market_cap_continuous():
+    # 10:1 正拆股：ex 日 raw close /10、快照股本要等下一次 filing 才 ×10。
+    # 无校正时 (ex, 下一快照) 窗口市值恰错 10 倍；校正后应连续。
+    dates = pd.DatetimeIndex(pd.to_datetime(["2025-06-09", "2025-06-10", "2025-06-30", "2025-07-01"]))
+    events = _events(
+        (1, "2025-03-31", "2025-03-31", 1_000_000),
+        (1, "2025-07-01", "2025-06-30", 10_000_000),
+    )
+    prices = _prices(dates, {1: [100.0, 10.0, 10.0, 10.0]})
+    splits = _splits((1, "2025-06-10", 1.0, 10.0))
+
+    panel = compute_market_cap_panel(events, prices, dates, 400, 0, splits=splits)
+
+    assert panel.loc["2025-06-09", 1] == 100_000_000.0
+    assert panel.loc["2025-06-10", 1] == pytest.approx(100_000_000.0)
+    assert panel.loc["2025-06-30", 1] == pytest.approx(100_000_000.0)
+    # 新快照生效后乘数回到 1，不得重复放大
+    assert panel.loc["2025-07-01", 1] == pytest.approx(100_000_000.0)
+    # ex 日前后相对跳变在阈值内（原 bug 是 10x 跳变）
+    jump = panel[1].pct_change().abs().max()
+    assert jump < 0.01
+
+
+def test_reverse_split_between_snapshots_keeps_market_cap_continuous():
+    # 1:50 反拆股（DBGI 场景）：ex 日 raw close ×50，无校正时市值虚增 50 倍。
+    dates = pd.DatetimeIndex(pd.to_datetime(["2025-06-09", "2025-06-10", "2025-06-30"]))
+    events = _events((1, "2025-03-31", "2025-03-31", 50_000_000))
+    prices = _prices(dates, {1: [1.0, 50.0, 50.0]})
+    splits = _splits((1, "2025-06-10", 50.0, 1.0))
+
+    panel = compute_market_cap_panel(events, prices, dates, 400, 0, splits=splits)
+
+    assert panel.loc["2025-06-09", 1] == 50_000_000.0
+    assert panel.loc["2025-06-10", 1] == pytest.approx(50_000_000.0)
+    assert panel.loc["2025-06-30", 1] == pytest.approx(50_000_000.0)
+
+
+def test_split_on_or_before_anchor_date_is_not_double_counted():
+    # ex_date <= 快照 visible 锚点日的拆股已含在快照股本里，乘数区间是半开 (anchor, t]。
+    dates = pd.DatetimeIndex(pd.to_datetime(["2025-06-11", "2025-06-30"]))
+    events = _events((1, "2025-06-10", "2025-06-10", 10_000_000))
+    prices = _prices(dates, {1: [10.0, 10.0]})
+    splits = _splits((1, "2025-06-10", 1.0, 10.0))
+
+    panel = compute_market_cap_panel(events, prices, dates, 400, 0, splits=splits)
+
+    assert panel.loc["2025-06-11", 1] == 100_000_000.0
+    assert panel.loc["2025-06-30", 1] == 100_000_000.0
+
+
+def test_multiple_splits_in_window_compound():
+    dates = pd.DatetimeIndex(pd.to_datetime(["2025-06-09", "2025-06-10", "2025-06-20"]))
+    events = _events((1, "2025-03-31", "2025-03-31", 1_000_000))
+    prices = _prices(dates, {1: [100.0, 50.0, 25.0]})
+    splits = _splits(
+        (1, "2025-06-10", 1.0, 2.0),
+        (1, "2025-06-20", 1.0, 2.0),
+    )
+
+    panel = compute_market_cap_panel(events, prices, dates, 400, 0, splits=splits)
+
+    assert panel.loc["2025-06-09", 1] == 100_000_000.0
+    assert panel.loc["2025-06-10", 1] == pytest.approx(100_000_000.0)
+    assert panel.loc["2025-06-20", 1] == pytest.approx(100_000_000.0)
+
+
+def test_split_correction_only_touches_affected_security():
+    dates = pd.DatetimeIndex(pd.to_datetime(["2025-06-09", "2025-06-10"]))
+    events = _events(
+        (1, "2025-03-31", "2025-03-31", 1_000_000),
+        (2, "2025-03-31", "2025-03-31", 3_000_000),
+    )
+    prices = _prices(dates, {1: [100.0, 10.0], 2: [20.0, 21.0]})
+    splits = _splits((1, "2025-06-10", 1.0, 10.0))
+
+    panel = compute_market_cap_panel(events, prices, dates, 400, 0, splits=splits)
+
+    assert panel.loc["2025-06-10", 1] == pytest.approx(100_000_000.0)
+    assert panel.loc["2025-06-09", 2] == 60_000_000.0
+    assert panel.loc["2025-06-10", 2] == 63_000_000.0
+
+
+def test_no_splits_behaves_identically_to_legacy():
+    # 回归锁：无 SPLIT / 不传 splits / 空 splits 三者结果逐格一致。
+    dates = pd.DatetimeIndex(pd.to_datetime(["2025-12-31", "2026-06-09", "2026-06-10", "2026-06-15"]))
+    events = _events(
+        (1, "2025-01-15", "2024-12-31", 1_000_000),
+        (1, "2026-06-10", "2026-03-31", 2_000_000),
+        (2, "2025-01-15", "2024-12-31", 5_000_000),
+    )
+    prices = _prices(dates, {1: [10.0, 11.0, 12.0, 13.0], 2: [1.0, np.nan, 2.0, 3.0]})
+
+    legacy = compute_market_cap_panel(events, prices, dates, 600, 0)
+    with_none = compute_market_cap_panel(events, prices, dates, 600, 0, splits=None)
+    with_empty = compute_market_cap_panel(
+        events, prices, dates, 600, 0,
+        splits=pd.DataFrame(columns=["security_id", "ex_date", "split_from", "split_to"]),
+    )
+    unrelated = compute_market_cap_panel(
+        events, prices, dates, 600, 0,
+        splits=_splits((999, "2026-06-10", 1.0, 10.0)),
+    )
+
+    pd.testing.assert_frame_equal(with_none, legacy)
+    pd.testing.assert_frame_equal(with_empty, legacy)
+    pd.testing.assert_frame_equal(unrelated, legacy)
+
+
+def test_split_correction_respects_staleness_nan():
+    # 快照过期转 NaN 的格子，拆股校正不得凭空造出数值。
+    dates = pd.DatetimeIndex(pd.to_datetime(["2025-03-15"]))
+    events = _events((1, "2024-01-01", "2023-12-31", 1_000_000))
+    prices = _prices(dates, {1: [4.0]})
+    splits = _splits((1, "2025-01-10", 1.0, 10.0))
+
+    panel = compute_market_cap_panel(events, prices, dates, 400, 0, splits=splits)
+
+    assert np.isnan(panel.loc["2025-03-15", 1])
+
+
 @pytest.mark.integration
 def test_load_shares_events_against_real_schema(pg_db):
     _insert_security(pg_db, 1, "aapl")
@@ -198,3 +348,42 @@ def test_load_market_cap_panel_against_real_schema(pg_db):
     assert panel.loc["2025-01-04", 1] == 11_000_000.0
     assert panel.loc["2025-01-05", 1] == 24_000_000.0
     assert panel.loc["2025-01-06", 1] == 26_000_000.0
+
+
+@pytest.mark.integration
+def test_load_split_events_against_real_schema(pg_db):
+    _insert_security(pg_db, 1, "aapl")
+    _insert_split(pg_db, 1, "2025-06-10", 1, 10)
+    # 同一拆股的合成 ID 替身：经济键相同，distinct 后只剩一行
+    _insert_split(pg_db, 1, "2025-06-10", 1, 10, source_event_id="massive-split:dupe")
+    _insert_split(pg_db, 1, "2025-08-01", 50, 1)
+
+    splits = load_split_events(pg_db.engine)
+
+    assert list(splits.columns) == ["security_id", "ex_date", "split_from", "split_to"]
+    assert len(splits) == 2
+    assert splits["security_id"].dtype == np.int64
+    assert str(splits["ex_date"].dtype) == "datetime64[ns]"
+    assert splits["ex_date"].tolist() == [pd.Timestamp("2025-06-10"), pd.Timestamp("2025-08-01")]
+    assert splits["split_from"].tolist() == [1.0, 50.0]
+    assert splits["split_to"].tolist() == [10.0, 1.0]
+
+
+@pytest.mark.integration
+def test_load_market_cap_panel_applies_split_correction(pg_db):
+    _insert_security(pg_db, 1, "dbgi")
+    _insert_share(pg_db, 1, "2025-03-31", "2025-03-31", 50_000_000)
+    _insert_split(pg_db, 1, "2025-06-10", 50, 1)
+    for date, close in (
+        ("2025-06-09", 1.0),
+        ("2025-06-10", 50.0),
+        ("2025-06-30", 50.0),
+    ):
+        _insert_price(pg_db, 1, date, close)
+    dates = pd.DatetimeIndex(pd.to_datetime(["2025-06-09", "2025-06-10", "2025-06-30"]))
+
+    panel = load_market_cap_panel(pg_db.engine, dates=dates)
+
+    assert panel.loc["2025-06-09", 1] == 50_000_000.0
+    assert panel.loc["2025-06-10", 1] == pytest.approx(50_000_000.0)
+    assert panel.loc["2025-06-30", 1] == pytest.approx(50_000_000.0)

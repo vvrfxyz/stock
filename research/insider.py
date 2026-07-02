@@ -1,9 +1,13 @@
 """研究层 PIT insider_net_buy 面板（insider_transactions）。
 
 insider_net_buy = 过去 90 天内部人净买入股数。
-只取开放市场买卖（transaction_code in ('P','S')），
+只取普通股开放市场买卖（security_type='NON_DERIVATIVE'、record_type='TRANSACTION'、
+transaction_code in ('P','S')——衍生品表的期权/权证行按"股数"混入会把买 put 计成看多），
 按 transaction_acquired_disposed 定方向（'A'=买入为正，'D'=卖出为负），
 以 filing_date 作可见日（Form 4 申报后才可见），交易日聚合后取 90 日滚动和。
+
+解析层对联合申报按 reporting owner 复制行（一笔交易 × N 个 owner），
+读取层按 (accession, entry 字段组) 去重取 min(id) 行，同一条交易只计一次。
 """
 from __future__ import annotations
 
@@ -37,7 +41,11 @@ def load_insider_events(
     *,
     security_ids: list[int] | None = None,
 ) -> pd.DataFrame:
-    """加载 insider_transactions 的签名股数事件流。"""
+    """加载 insider_transactions 的签名股数事件流。
+
+    只取普通股开放市场交易行；同一 accession 内按 entry 字段组去重
+    （联合申报的多 owner 副本只保留 min(id) 一行）。
+    """
     if security_ids is not None and not security_ids:
         return _empty_events()
     sql = text(
@@ -49,18 +57,33 @@ def load_insider_events(
                     then transaction_shares::float8
                     else -transaction_shares::float8
                end as signed_shares
-        from insider_transactions
-        where security_id is not null
-          and filing_date is not null
-          and transaction_date is not null
-          and transaction_code in ('P', 'S')
-          and transaction_shares is not null
-          and transaction_shares > 0
-          and transaction_acquired_disposed in ('A', 'D')
-          and transaction_date >= '1990-01-01'
-          and (cast(:security_ids as bigint[]) is null
-               or security_id = any(cast(:security_ids as bigint[])))
-        order by security_id, filing_date, transaction_date
+        from (
+            select distinct on (
+                       accession_number, security_id, security_type, record_type,
+                       transaction_date, transaction_code, transaction_acquired_disposed,
+                       transaction_shares, transaction_price_per_share
+                   )
+                   security_id, filing_date, transaction_date,
+                   transaction_acquired_disposed, transaction_shares
+            from insider_transactions
+            where security_id is not null
+              and filing_date is not null
+              and transaction_date is not null
+              and security_type = 'NON_DERIVATIVE'
+              and record_type = 'TRANSACTION'
+              and transaction_code in ('P', 'S')
+              and transaction_shares is not null
+              and transaction_shares > 0
+              and transaction_acquired_disposed in ('A', 'D')
+              and transaction_date >= '1990-01-01'
+              and (cast(:security_ids as bigint[]) is null
+                   or security_id = any(cast(:security_ids as bigint[])))
+            order by accession_number, security_id, security_type, record_type,
+                     transaction_date, transaction_code, transaction_acquired_disposed,
+                     transaction_shares, transaction_price_per_share,
+                     id
+        ) entry_dedup
+        order by security_id, visible_date, transaction_date
         """
     )
     events = pd.read_sql_query(
@@ -110,7 +133,10 @@ def load_insider_net_buy_panel(
         return pd.DataFrame(index=dates, columns=cols, dtype=np.float64)
 
     events = events.copy()
-    events["effective_visible_date"] = events["visible_date"] + pd.Timedelta(days=visible_delay_days)
+    # 防御性 cast 到 ns：调用方注入的事件表可能是 us 精度，merge_asof 要求两侧一致
+    events["effective_visible_date"] = (
+        events["visible_date"] + pd.Timedelta(days=visible_delay_days)
+    ).astype("datetime64[ns]")
 
     if requested_security_ids is None:
         universe = pd.Index(events["security_id"].unique(), dtype=np.int64).sort_values()

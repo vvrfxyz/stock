@@ -9,6 +9,8 @@ from sqlalchemy.engine import Engine
 from research.factors.asof import event_table_to_asof_panel
 
 _SHARES_COLUMNS = ["security_id", "visible_date", "period_end_date", "total_shares"]
+_SPLIT_COLUMNS = ["security_id", "ex_date", "split_from", "split_to"]
+_NS_PER_DAY = 86_400_000_000_000
 
 
 def _empty_shares_events() -> pd.DataFrame:
@@ -18,6 +20,17 @@ def _empty_shares_events() -> pd.DataFrame:
             "visible_date": pd.Series(dtype="datetime64[ns]"),
             "period_end_date": pd.Series(dtype="datetime64[ns]"),
             "total_shares": pd.Series(dtype=np.int64),
+        }
+    )
+
+
+def _empty_split_events() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "security_id": pd.Series(dtype=np.int64),
+            "ex_date": pd.Series(dtype="datetime64[ns]"),
+            "split_from": pd.Series(dtype=np.float64),
+            "split_to": pd.Series(dtype=np.float64),
         }
     )
 
@@ -58,6 +71,44 @@ def load_shares_events(
     events["security_id"] = events["security_id"].astype(np.int64)
     events["total_shares"] = events["total_shares"].astype(np.int64)
     return events[_SHARES_COLUMNS]
+
+
+def load_split_events(
+    engine: Engine,
+    *,
+    security_ids: list[int] | None = None,
+) -> pd.DataFrame:
+    """加载 corporate_actions 的 SPLIT 事件（ex_date 提前公告，作 PIT 可见日安全）。
+
+    distinct 按经济键去重：同一拆股的合成/vendor 双 ID 替身只保留一行。
+    """
+    if security_ids is not None and not security_ids:
+        return _empty_split_events()
+    sql = text(
+        """
+        select distinct security_id, ex_date,
+               split_from::float8 as split_from, split_to::float8 as split_to
+        from corporate_actions
+        where action_type = 'SPLIT'
+          and split_from is not null and split_from > 0
+          and split_to is not null and split_to > 0
+          and (:security_ids is null or security_id = any(:security_ids))
+        order by security_id, ex_date
+        """
+    )
+    splits = pd.read_sql_query(
+        sql,
+        engine,
+        params={"security_ids": security_ids},
+        parse_dates=["ex_date"],
+    )
+    if splits.empty:
+        return _empty_split_events()
+    splits = _to_ns(splits, ("ex_date",))
+    splits["security_id"] = splits["security_id"].astype(np.int64)
+    splits["split_from"] = splits["split_from"].astype(np.float64)
+    splits["split_to"] = splits["split_to"].astype(np.float64)
+    return splits[_SPLIT_COLUMNS]
 
 
 def _load_raw_close_wide(
@@ -102,14 +153,97 @@ def _coerce_security_columns(columns: pd.Index) -> pd.Index:
     return pd.Index([int(col) for col in columns], dtype=np.int64)
 
 
+def _normalize_split_events(splits: pd.DataFrame) -> pd.DataFrame:
+    """清洗 SPLIT 事件并按证券累计 log 拆股比（cum_log_ratio）。"""
+    sp = splits.reindex(columns=_SPLIT_COLUMNS).copy()
+    sp = sp.dropna(subset=_SPLIT_COLUMNS)
+    if sp.empty:
+        return sp.assign(cum_log_ratio=pd.Series(dtype=np.float64))
+    sp["split_from"] = sp["split_from"].astype(np.float64)
+    sp["split_to"] = sp["split_to"].astype(np.float64)
+    sp = sp[(sp["split_from"] > 0) & (sp["split_to"] > 0)]
+    if sp.empty:
+        return sp.assign(cum_log_ratio=pd.Series(dtype=np.float64))
+    sp = _to_ns(sp, ("ex_date",))
+    sp["security_id"] = sp["security_id"].astype(np.int64)
+    sp = sp.drop_duplicates(subset=_SPLIT_COLUMNS)
+    sp = sp.sort_values(["security_id", "ex_date"], kind="mergesort").reset_index(drop=True)
+    log_ratio = np.log(sp["split_to"] / sp["split_from"])
+    sp["cum_log_ratio"] = log_ratio.groupby(sp["security_id"]).cumsum()
+    return sp
+
+
+def _split_rollforward_shares(
+    shares: pd.DataFrame,
+    anchor_days: pd.DataFrame,
+    splits: pd.DataFrame,
+) -> pd.DataFrame:
+    """把 as-of 股本快照按 (锚点日, t] 内的 SPLIT 比例滚动到观测日。
+
+    快照值已含 ex_date <= 锚点日的拆股，故乘数取半开区间：
+    multiplier = exp(cumlog(t) - cumlog(anchor))。无拆股证券乘数恒为 1。
+    """
+    sp = _normalize_split_events(splits)
+    if sp.empty:
+        return shares
+    split_ids = shares.columns.intersection(pd.Index(sp["security_id"].unique(), dtype=np.int64))
+    if len(split_ids) == 0:
+        return shares
+    sp = sp[sp["security_id"].isin(split_ids)]
+
+    long = anchor_days.loc[:, split_ids].melt(
+        ignore_index=False, var_name="security_id", value_name="anchor_days"
+    )
+    long = long.reset_index(names="date").dropna(subset=["anchor_days"])
+    if long.empty:
+        return shares
+    long["security_id"] = long["security_id"].astype(np.int64)
+    # anchor_days 是"天数 since epoch"的 float（float64 精确表示），round 后还原成时间戳
+    long["anchor_date"] = pd.to_datetime(
+        long["anchor_days"].round().astype(np.int64) * _NS_PER_DAY
+    )
+
+    right = sp[["security_id", "ex_date", "cum_log_ratio"]].sort_values("ex_date", kind="mergesort")
+    at_t = pd.merge_asof(
+        long.sort_values("date", kind="mergesort"),
+        right.rename(columns={"cum_log_ratio": "cum_log_t"}),
+        left_on="date",
+        right_on="ex_date",
+        by="security_id",
+        direction="backward",
+    ).drop(columns=["ex_date"])
+    at_anchor = pd.merge_asof(
+        at_t.sort_values("anchor_date", kind="mergesort"),
+        right.rename(columns={"cum_log_ratio": "cum_log_anchor"}),
+        left_on="anchor_date",
+        right_on="ex_date",
+        by="security_id",
+        direction="backward",
+    )
+    at_anchor["multiplier"] = np.exp(
+        at_anchor["cum_log_t"].fillna(0.0) - at_anchor["cum_log_anchor"].fillna(0.0)
+    )
+    multiplier = at_anchor.pivot_table(
+        index="date", columns="security_id", values="multiplier", aggfunc="last"
+    )
+    multiplier = multiplier.reindex(index=shares.index, columns=shares.columns).fillna(1.0)
+    return shares * multiplier
+
+
 def compute_market_cap_panel(
     events: pd.DataFrame,
     prices_wide: pd.DataFrame,
     dates: pd.DatetimeIndex,
     max_staleness_days: int,
     visible_delay_days: int,
+    splits: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """合成事件与 raw close 宽表，计算 PIT 市值宽表。"""
+    """合成事件与 raw close 宽表，计算 PIT 市值宽表。
+
+    提供 splits（corporate_actions 的 SPLIT 事件）时，把 as-of 股本快照按
+    (快照 visible 锚点日, t] 内的拆股比例滚动到观测日——否则拆股 ex 日到下一次
+    股本快照之间市值恰错一个拆股比（raw close 已跳变、快照仍是旧股本）。
+    """
     dates = pd.DatetimeIndex(pd.to_datetime(list(dates))).astype("datetime64[ns]")
     prices = prices_wide.copy()
     prices.index = pd.DatetimeIndex(pd.to_datetime(prices.index)).astype("datetime64[ns]")
@@ -140,6 +274,25 @@ def compute_market_cap_panel(
         security_universe=security_ids,
     )
 
+    if splits is not None and not splits.empty and not ev.empty:
+        # 第二次 asof 取每格选中快照的 visible 锚点日（与 shares 面板同参数、
+        # 同排序键，逐格对应同一事件行）；只对有拆股的证券展开长表。
+        anchor_ev = ev.copy()
+        anchor_ev["_anchor_days"] = (
+            anchor_ev["visible_date"].astype("int64") // _NS_PER_DAY
+        ).astype(np.float64)
+        anchor_days = event_table_to_asof_panel(
+            anchor_ev,
+            dates=dates,
+            value_column="_anchor_days",
+            visible_date_column="visible_date",
+            staleness_anchor_column="visible_date",
+            visible_delay_days=visible_delay_days,
+            max_staleness_days=max_staleness_days,
+            security_universe=security_ids,
+        )
+        shares = _split_rollforward_shares(shares, anchor_days, splits)
+
     return (prices * shares).astype(np.float64)
 
 
@@ -151,9 +304,10 @@ def load_market_cap_panel(
     max_staleness_days: int = 400,
     visible_delay_days: int = 0,
 ) -> pd.DataFrame:
-    """一站式加载 raw close 与 PIT shares，返回市值宽表。"""
+    """一站式加载 raw close、PIT shares 与 SPLIT 事件，返回市值宽表。"""
     dates = pd.DatetimeIndex(pd.to_datetime(list(dates))).astype("datetime64[ns]")
     events = load_shares_events(engine, security_ids=security_ids)
+    splits = load_split_events(engine, security_ids=security_ids)
     prices = _load_raw_close_wide(engine, dates=dates, security_ids=security_ids)
     return compute_market_cap_panel(
         events,
@@ -161,6 +315,7 @@ def load_market_cap_panel(
         dates,
         max_staleness_days=max_staleness_days,
         visible_delay_days=visible_delay_days,
+        splits=splits,
     )
 
 

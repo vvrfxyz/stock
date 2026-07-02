@@ -178,8 +178,10 @@ def securities_with_uncovered_events(
 ) -> list[int]:
     """窗口内存在 corporate_actions 事件但无对应因子行的证券。
 
-    主要是因子构建曾只跑 is_active=True 导致的退市股缺口；缺因子的拆股/分红会在
-    价格序列里留下假跳空，这些证券必须从横截面样本中剔除。
+    主要是因子构建曾只跑 is_active=True 导致的退市股缺口，以及外币分红缺 FX 汇率
+    被构建跳过的事件；缺因子的拆股/分红会在价格序列里留下假跳空，这些证券必须从
+    横截面样本中剔除。匹配按 source_event_id 事件级对齐（同因子构建口径，只看
+    MASSIVE 来源），同日另一事件的因子行不会掩盖被跳过的事件。
     """
     sql = text(
         """
@@ -187,10 +189,11 @@ def securities_with_uncovered_events(
         from corporate_actions ca
         where ca.ex_date between :start and :end
           and ca.action_type in ('SPLIT', 'DIVIDEND')
+          and upper(ca.source) = 'MASSIVE'
           and not exists (
             select 1 from computed_adjustment_factors f
             where f.security_id = ca.security_id
-              and f.date = ca.ex_date
+              and f.source_event_id = ca.source_event_id
               and f.methodology_version = :mv)
         """
     )

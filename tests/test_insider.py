@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import research.factors.protocol as _proto
 from research.factors.protocol import FactorContext, get
-from research.insider import load_insider_net_buy_panel
+from research.insider import load_insider_events, load_insider_net_buy_panel
 
 
 # ---------------------------------------------------------------------------
@@ -29,7 +29,7 @@ def _insider_events(*rows) -> pd.DataFrame:
         )
     df = pd.DataFrame(rows, columns=["security_id", "visible_date", "transaction_date", "signed_shares"])
     for col in ("visible_date", "transaction_date"):
-        df[col] = pd.to_datetime(df[col])
+        df[col] = pd.to_datetime(df[col]).astype("datetime64[ns]")
     df["security_id"] = df["security_id"].astype(np.int64)
     df["signed_shares"] = df["signed_shares"].astype(np.float64)
     return df
@@ -353,3 +353,215 @@ def test_builtin_factor_registered(_isolate_registry):
     assert factor.lookback_days == 90
     assert factor.lag_days == 1
     assert factor.pit_guarantee is True
+
+
+# ---------------------------------------------------------------------------
+# SQL integration tests (load_insider_events against real PG)
+# ---------------------------------------------------------------------------
+
+def _insert_security(pg_db, security_id: int, symbol: str) -> None:
+    from sqlalchemy import text
+
+    with pg_db.engine.connect() as conn:
+        conn.execute(
+            text(
+                """
+                insert into securities
+                    (id, symbol, current_symbol, market, type, is_active, full_refresh_interval)
+                values
+                    (:id, :symbol, :symbol, 'US', 'CS', true, 30)
+                """
+            ),
+            {"id": security_id, "symbol": symbol},
+        )
+        conn.commit()
+
+
+def _insert_insider_transaction(
+    pg_db,
+    *,
+    row_id: int,
+    security_id: int,
+    accession: str,
+    owner_name: str,
+    security_type: str = "NON_DERIVATIVE",
+    record_type: str = "TRANSACTION",
+    filing_date: str = "2025-01-05",
+    transaction_date: str = "2025-01-02",
+    transaction_code: str = "P",
+    acquired_disposed: str = "A",
+    shares: float = 100.0,
+    price: float | None = 10.0,
+) -> None:
+    from sqlalchemy import text
+
+    with pg_db.engine.connect() as conn:
+        conn.execute(
+            text(
+                """
+                insert into insider_transactions
+                    (id, security_id, source, accession_number, source_row_hash,
+                     form_type, filing_date, owner_name,
+                     security_type, record_type, transaction_date, transaction_code,
+                     transaction_shares, transaction_price_per_share,
+                     transaction_acquired_disposed)
+                values
+                    (:id, :security_id, 'SEC_EDGAR', :accession, :row_hash,
+                     '4', :filing_date, :owner_name,
+                     :security_type, :record_type, :transaction_date, :transaction_code,
+                     :shares, :price, :acquired_disposed)
+                """
+            ),
+            {
+                "id": row_id,
+                "security_id": security_id,
+                "accession": accession,
+                "row_hash": f"hash-{row_id}",
+                "filing_date": filing_date,
+                "owner_name": owner_name,
+                "security_type": security_type,
+                "record_type": record_type,
+                "transaction_date": transaction_date,
+                "transaction_code": transaction_code,
+                "shares": shares,
+                "price": price,
+                "acquired_disposed": acquired_disposed,
+            },
+        )
+        conn.commit()
+
+
+@pytest.mark.integration
+def test_multi_owner_copies_counted_once(pg_db):
+    """联合申报同一 entry 按 owner 复制的行只计一次（取 min(id) 行）。"""
+    _insert_security(pg_db, 1, "aapl")
+    # 一笔 10 万股买入 × 3 个 reporting owner -> 解析层 3 行副本
+    for i, owner in enumerate(["Fund GP LLC", "Fund LP", "Manager"]):
+        _insert_insider_transaction(
+            pg_db,
+            row_id=10 + i,
+            security_id=1,
+            accession="0001-25-000001",
+            owner_name=owner,
+            shares=100000.0,
+        )
+    # 同一 accession 内另一条 entry（股数不同）不能被误并
+    _insert_insider_transaction(
+        pg_db,
+        row_id=20,
+        security_id=1,
+        accession="0001-25-000001",
+        owner_name="Fund GP LLC",
+        shares=500.0,
+    )
+
+    events = load_insider_events(pg_db.engine)
+
+    assert len(events) == 2
+    assert sorted(events["signed_shares"].tolist()) == [500.0, 100000.0]
+
+
+@pytest.mark.integration
+def test_multi_owner_dedupe_scoped_by_accession(pg_db):
+    """不同 accession 的字段全同 entry 是独立交易，不得跨 accession 去重。"""
+    _insert_security(pg_db, 1, "aapl")
+    _insert_insider_transaction(pg_db, row_id=1, security_id=1, accession="0001-25-000001", owner_name="CEO")
+    _insert_insider_transaction(pg_db, row_id=2, security_id=1, accession="0001-25-000002", owner_name="CEO")
+
+    events = load_insider_events(pg_db.engine)
+
+    assert len(events) == 2
+    assert events["signed_shares"].tolist() == [100.0, 100.0]
+
+
+@pytest.mark.integration
+def test_derivative_rows_excluded(pg_db):
+    """DERIVATIVE 表的 P/S 行必须被排除——买 put 不得计为看多。"""
+    _insert_security(pg_db, 1, "aapl")
+    # 买入 put 期权：code='P'、acquired='A'，若混入会被当成 5 万股看多
+    _insert_insider_transaction(
+        pg_db,
+        row_id=1,
+        security_id=1,
+        accession="0001-25-000001",
+        owner_name="CEO",
+        security_type="DERIVATIVE",
+        shares=50000.0,
+    )
+    # 卖出 call：同样必须排除
+    _insert_insider_transaction(
+        pg_db,
+        row_id=2,
+        security_id=1,
+        accession="0001-25-000002",
+        owner_name="CEO",
+        security_type="DERIVATIVE",
+        transaction_code="S",
+        acquired_disposed="D",
+        shares=30000.0,
+    )
+    # 真正的普通股开放市场买入
+    _insert_insider_transaction(
+        pg_db,
+        row_id=3,
+        security_id=1,
+        accession="0001-25-000003",
+        owner_name="CEO",
+        shares=100.0,
+    )
+
+    events = load_insider_events(pg_db.engine)
+
+    assert len(events) == 1
+    assert events["signed_shares"].tolist() == [100.0]
+
+
+@pytest.mark.integration
+def test_holding_rows_excluded(pg_db):
+    """record_type='HOLDING' 的行不是交易，必须被排除。"""
+    _insert_security(pg_db, 1, "aapl")
+    _insert_insider_transaction(
+        pg_db,
+        row_id=1,
+        security_id=1,
+        accession="0001-25-000001",
+        owner_name="CEO",
+        record_type="HOLDING",
+        shares=99999.0,
+    )
+    _insert_insider_transaction(
+        pg_db,
+        row_id=2,
+        security_id=1,
+        accession="0001-25-000002",
+        owner_name="CEO",
+        shares=100.0,
+    )
+
+    events = load_insider_events(pg_db.engine)
+
+    assert len(events) == 1
+    assert events["signed_shares"].tolist() == [100.0]
+
+
+@pytest.mark.integration
+def test_null_price_copies_deduped(pg_db):
+    """price 为 NULL 的多 owner 副本同样只计一次（distinct 视 NULL 相等）。"""
+    _insert_security(pg_db, 1, "aapl")
+    for i, owner in enumerate(["Owner A", "Owner B"]):
+        _insert_insider_transaction(
+            pg_db,
+            row_id=10 + i,
+            security_id=1,
+            accession="0001-25-000001",
+            owner_name=owner,
+            transaction_code="S",
+            acquired_disposed="D",
+            shares=2000.0,
+            price=None,
+        )
+
+    events = load_insider_events(pg_db.engine)
+
+    assert len(events) == 1
+    assert events["signed_shares"].tolist() == [-2000.0]

@@ -146,10 +146,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n=== Terminal Missing 敏感性（{len(has_terminal)} 只策略受影响）===")
         sens_rows = {}
         for r in has_terminal:
-            stress = run_backtest(
-                r.name, r.equity * 0 + 1, adj_close, cost_bps=args.cost_bps, terminal_return=-1.0
-            )
-            # 不能这样重跑——需要原始 weights。简化：直接报告 terminal days 占比
             days_pct = r.terminal_missing_position_days / max(len(r.daily_returns) * r.avg_positions, 1)
             sens_rows[r.name] = {
                 "terminal_days": r.terminal_missing_position_days,

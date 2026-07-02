@@ -11,7 +11,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from data_models.models import HistoricalShare, Security
+from data_models.models import CorporateAction, HistoricalShare, Security
 from data_sources.massive_source import MassiveSource
 from db_manager import DatabaseManager
 from utils.massive_config import (
@@ -61,6 +61,20 @@ def _extract_total_shares(overview: dict | None) -> int | None:
     return None
 
 
+def _needs_split_refresh(
+    latest_filing_date: date | None,
+    latest_split_ex_date: date | None,
+    end_date: date,
+) -> bool:
+    """快照之后有已生效的 SPLIT 时强制刷新：拆股 ex 日股本立即跳变，
+    等下一季度快照会留下最长一个季度的市值污染窗口。
+    ex_date 未到 end_date 的（提前公告的未来拆股）刷新也拿不到新股本，不触发。
+    """
+    if latest_filing_date is None or latest_split_ex_date is None:
+        return False
+    return latest_filing_date < latest_split_ex_date <= end_date
+
+
 def get_securities_to_process(
     db_manager: DatabaseManager,
     args: argparse.Namespace,
@@ -77,6 +91,13 @@ def get_securities_to_process(
             .order_by(Security.symbol.asc())
             .all()
         )
+        latest_split_ex_dates = dict(
+            session.query(CorporateAction.security_id, func.max(CorporateAction.ex_date))
+            .filter(CorporateAction.action_type == "SPLIT")
+            .filter(CorporateAction.ex_date <= end_date)
+            .group_by(CorporateAction.security_id)
+            .all()
+        )
 
     symbols = {symbol.lower() for symbol in args.symbols if symbol}
     selected: list[Security] = []
@@ -85,7 +106,13 @@ def get_securities_to_process(
             continue
         if not args.full_refresh and not symbols and security.is_active is not True:
             continue
-        if not args.full_refresh and not symbols and latest_filing_date and latest_filing_date >= current_quarter_start:
+        if (
+            not args.full_refresh
+            and not symbols
+            and latest_filing_date
+            and latest_filing_date >= current_quarter_start
+            and not _needs_split_refresh(latest_filing_date, latest_split_ex_dates.get(security.id), end_date)
+        ):
             continue
         selected.append(security)
 

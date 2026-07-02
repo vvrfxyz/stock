@@ -1,7 +1,8 @@
 """研究层 PIT days_to_cover 面板。
 
 days_to_cover = short_interest / avg_daily_volume(20 日)。
-分子用 short_interests 的 PIT 仓位（结算日 T+1 可见），
+分子用 short_interests 的 PIT 仓位——FINRA 半月报在结算日后约 8 个工作日（BD+8）
+才公布，可见延迟与 short_interest_ratio 共用 SHORT_INTEREST_VISIBLE_DELAY_DAYS，
 分母用 daily_prices 的 20 日滚动平均成交量。
 """
 from __future__ import annotations
@@ -12,7 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from research.factors.asof import event_table_to_asof_panel
-from research.short_interest import load_short_interest_events
+from research.short_interest import SHORT_INTEREST_VISIBLE_DELAY_DAYS, load_short_interest_events
 
 
 def _to_ns(df: pd.DataFrame, cols: tuple[str, ...]) -> pd.DataFrame:
@@ -66,7 +67,7 @@ def load_days_to_cover_panel(
     *,
     dates: pd.DatetimeIndex,
     security_ids: list[int] | None = None,
-    visible_delay_days: int = 1,
+    visible_delay_days: int = SHORT_INTEREST_VISIBLE_DELAY_DAYS,
     si_max_staleness_days: int = 60,
 ) -> pd.DataFrame:
     """一站式加载，返回 days_to_cover 宽表。"""

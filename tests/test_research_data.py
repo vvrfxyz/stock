@@ -4,8 +4,9 @@ from decimal import Decimal
 
 import numpy as np
 import pandas as pd
+import pytest
 
-from research.data import apply_adjustment
+from research.data import apply_adjustment, securities_with_uncovered_events
 from utils.adjusted_prices import factor_for_date
 
 
@@ -79,3 +80,91 @@ def test_apply_adjustment_event_on_bar_date_uses_next_event():
     )
     got = _vector_factors(prices, events)
     assert np.allclose(got, [0.25, 1.0])
+
+
+# ---------------------------------------------------------------------------
+# securities_with_uncovered_events：事件级（source_event_id）匹配语义
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+def test_uncovered_events_matches_at_event_level(pg_db):
+    from data_models.models import ComputedAdjustmentFactor, CorporateAction, Security
+
+    day = date(2024, 6, 3)
+    mv = "raw_actions_v1"
+    with pg_db.get_session() as session:
+        for sid in (1, 2, 3, 4):
+            session.add(
+                Security(
+                    id=sid,
+                    symbol=f"t{sid}",
+                    current_symbol=f"t{sid}",
+                    market="US",
+                    type="CS",
+                    is_active=True,
+                    full_refresh_interval=30,
+                )
+            )
+        session.flush()
+        # 证券 1：同日拆股已建因子 + 外币分红缺 FX 被跳过（无因子行）。
+        # 旧的"同证券同日期存在任意因子行"匹配会被拆股因子行掩盖而漏报。
+        session.add(
+            CorporateAction(
+                security_id=1, action_type="SPLIT", ex_date=day,
+                source="massive", source_event_id="ev-split-1",
+                split_from=Decimal("1"), split_to=Decimal("2"),
+            )
+        )
+        session.add(
+            CorporateAction(
+                security_id=1, action_type="DIVIDEND", ex_date=day,
+                source="massive", source_event_id="ev-div-1",
+                cash_amount=Decimal("1.5"), currency="CAD",
+            )
+        )
+        session.add(
+            ComputedAdjustmentFactor(
+                security_id=1, date=day, methodology_version=mv,
+                factor_type="historical_adjustment", factor_key="split:ev-split-1",
+                source_event_id="ev-split-1", action_type="SPLIT",
+                cumulative_factor=Decimal("0.5"), event_hash="h1",
+            )
+        )
+        # 证券 2：事件全覆盖，不应剔除
+        session.add(
+            CorporateAction(
+                security_id=2, action_type="DIVIDEND", ex_date=day,
+                source="MASSIVE", source_event_id="ev-div-2",
+                cash_amount=Decimal("0.2"), currency="USD",
+            )
+        )
+        session.add(
+            ComputedAdjustmentFactor(
+                security_id=2, date=day, methodology_version=mv,
+                factor_type="historical_adjustment", factor_key="dividend:ev-div-2",
+                source_event_id="ev-div-2", action_type="DIVIDEND",
+                cumulative_factor=Decimal("0.9"), event_hash="h2",
+            )
+        )
+        # 证券 3：事件完全无因子行（退市股缺口的原有语义）
+        session.add(
+            CorporateAction(
+                security_id=3, action_type="SPLIT", ex_date=day,
+                source="MASSIVE", source_event_id="ev-split-3",
+                split_from=Decimal("1"), split_to=Decimal("10"),
+            )
+        )
+        # 证券 4：非 MASSIVE 来源不参与因子构建，不应剔除
+        session.add(
+            CorporateAction(
+                security_id=4, action_type="DIVIDEND", ex_date=day,
+                source="SEC", source_event_id="ev-div-4",
+                cash_amount=Decimal("1.0"), currency="USD",
+            )
+        )
+        session.commit()
+
+    got = securities_with_uncovered_events(
+        pg_db.engine, start=date(2024, 6, 1), end=date(2024, 6, 30)
+    )
+    assert sorted(got) == [1, 3]

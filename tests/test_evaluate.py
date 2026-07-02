@@ -11,10 +11,12 @@ from research.backtest import hold_between_rebalances, run_backtest
 from research.evaluate import (
     FactorEvaluationError,
     _forward_return,
+    _markdown_table,
     _params_hash,
     _pit_regression,
     _quantile_weights_for_day,
     _rank_ic_series,
+    _result_summary,
     default_nw_lag,
     evaluate_factor,
     parse_args,
@@ -63,6 +65,23 @@ def test_pure_noise_factor_is_noisy():
 
     assert abs(result.ic_table.loc[1, "mean_ic"]) < 0.02
     assert abs(result.ic_table.loc[1, "nw_t"]) < 1.5
+    assert result.ic_table.loc[1, "is_noisy"] is True
+
+
+def test_ic_uses_eligible_cross_section_only():
+    rng = np.random.default_rng(3)
+    dates, universe, _ = _panel(n_dates=120, n_names=240)
+    fwd = pd.DataFrame(rng.normal(size=(len(dates), len(universe))), index=dates, columns=universe)
+    # eligible 名字上是纯噪声，ineligible 名字上是完美前视信号：
+    # IC 若不做 eligibility 过滤，会被不可交易的一半横截面拉到显著。
+    factor = pd.DataFrame(rng.normal(size=(len(dates), len(universe))), index=dates, columns=universe)
+    factor.iloc[:, 120:] = fwd.iloc[:, 120:]
+    eligible = pd.DataFrame(True, index=dates, columns=universe)
+    eligible.iloc[:, 120:] = False
+
+    result = evaluate_factor(factor, {1: fwd}, eligibility=eligible, horizons=(1,), min_coverage=50)
+
+    assert abs(result.ic_table.loc[1, "mean_ic"]) < 0.1
     assert result.ic_table.loc[1, "is_noisy"] is True
 
 
@@ -214,6 +233,22 @@ def test_coverage_diagnostic():
     result = evaluate_factor(factor, {1: factor.copy()}, eligibility=eligible, horizons=(1,), min_coverage=10)
 
     assert result.coverage["factor_coverage"].mean() == pytest.approx(0.5, abs=0.05)
+    assert result.coverage["factor_count"].median() == 60
+
+
+def test_result_summary_includes_count_coverage_metrics():
+    _, _, factor = _panel(n_dates=80, n_names=120)
+    factor.iloc[:10, :] = np.nan
+    factor.iloc[:, 60:] = np.nan
+    eligible = pd.DataFrame(True, index=factor.index, columns=factor.columns)
+
+    result = evaluate_factor(factor, {1: factor.copy()}, eligibility=eligible, horizons=(1,), min_coverage=50)
+    summary = _result_summary(result)
+
+    assert summary.loc[1, "factor_count_median"] == 60
+    assert summary.loc[1, "factor_count_max"] == 60
+    assert summary.loc[1, "days_below_min_coverage"] == 10
+    assert "factor_count_median" in _markdown_table(summary)
 
 
 def test_empty_factor_raises_and_single_horizon_all_nan_skips():
@@ -312,6 +347,43 @@ def test_run_evaluation_loads_risk_free_only_for_quantile_backtest_dates(monkeyp
     assert list(seen_indexes[0]) == list(dates[5:20])
 
 
+def test_uncovered_events_window_covers_forward_return_buffer(monkeypatch):
+    import research.evaluate as ev
+
+    dates, universe, _ = _panel(n_dates=30, n_names=120)
+    end = dates[19].date()
+    panel = {
+        "adj_close": pd.DataFrame(100.0, index=dates, columns=universe),
+        "close": pd.DataFrame(100.0, index=dates, columns=universe),
+        "dollar_volume": pd.DataFrame(10_000_000.0, index=dates, columns=universe),
+    }
+    seen = {}
+
+    def fake_uncovered(engine, *, start, end):
+        seen["end"] = end
+        return []
+
+    monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
+    monkeypatch.setattr(ev, "securities_with_uncovered_events", fake_uncovered)
+
+    ev.run_evaluation(
+        RecordingFactor(),
+        engine=object(),
+        start=dates.min().date(),
+        end=end,
+        horizons=(5,),
+        eval_start=dates[5].date(),
+        min_median_dollar_volume=1,
+        eligibility_window=1,
+        trials_path=None,
+        risk_free_series=None,
+    )
+
+    # 剔除窗口须覆盖前向收益实际用到的缓冲日期，而非止步于 end
+    assert seen["end"] == ev._buffered_end(end, 5)
+    assert seen["end"] > end
+
+
 def test_run_evaluation_requires_eval_start_for_short_default_warmup(monkeypatch):
     import research.evaluate as ev
 
@@ -351,9 +423,33 @@ def test_pit_regression_triggers_lookahead_suspect():
     universe = pd.Index(range(1, 121), dtype="int64")
     live = pd.DataFrame(0.0, index=dates, columns=universe)
 
-    diff = _pit_regression(TimeVaryingFactor(), live, object(), dates, universe)
+    diff, presence = _pit_regression(TimeVaryingFactor(), live, object(), dates, universe)
 
     assert diff > 1e-6
+    assert presence == 0
+
+
+@dataclass(frozen=True)
+class PresenceLeakFactor:
+    name = "presence_leak"
+
+    def compute(self, ctx: FactorContext) -> pd.DataFrame:
+        # as-of 重放时最后一天不可见，而 live 有值 → presence 型前视
+        values = pd.DataFrame(1.0, index=ctx.dates, columns=ctx.security_universe)
+        if ctx.as_of is not None:
+            values.loc[values.index >= pd.Timestamp(ctx.as_of)] = np.nan
+        return values
+
+
+def test_pit_regression_counts_presence_violations():
+    dates = pd.bdate_range("2025-01-02", periods=220)
+    universe = pd.Index(range(1, 121), dtype="int64")
+    live = pd.DataFrame(1.0, index=dates, columns=universe)
+
+    diff, presence = _pit_regression(PresenceLeakFactor(), live, object(), dates, universe)
+
+    assert pd.isna(diff)
+    assert presence > 0
 
 
 def test_params_hash_excludes_note():
@@ -387,7 +483,7 @@ def test_run_evaluation_strict_persists_before_raise(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
     monkeypatch.setattr(ev, "securities_with_uncovered_events", lambda *args, **kwargs: [])
-    monkeypatch.setattr(ev, "_pit_regression", lambda *args, **kwargs: 1.0)
+    monkeypatch.setattr(ev, "_pit_regression", lambda *args, **kwargs: (1.0, 0))
     monkeypatch.setattr("research._trials_store.append_trial", fake_append)
 
     with pytest.raises(FactorEvaluationError, match="failed PIT regression"):
@@ -408,6 +504,68 @@ def test_run_evaluation_strict_persists_before_raise(monkeypatch, tmp_path):
     assert appended == [("recording", tmp_path / "trials.parquet", True)]
 
 
+def test_run_evaluation_strict_fails_on_presence_violations(monkeypatch, tmp_path):
+    import research.evaluate as ev
+
+    dates, universe, _ = _panel(n_dates=20, n_names=120)
+    panel = {
+        "adj_close": pd.DataFrame(100.0, index=dates, columns=universe),
+        "close": pd.DataFrame(100.0, index=dates, columns=universe),
+        "dollar_volume": pd.DataFrame(10_000_000.0, index=dates, columns=universe),
+    }
+    monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
+    monkeypatch.setattr(ev, "securities_with_uncovered_events", lambda *args, **kwargs: [])
+    # 值差为 NaN、仅 presence 违规：strict 仍须失败
+    monkeypatch.setattr(ev, "_pit_regression", lambda *args, **kwargs: (np.nan, 3))
+
+    with pytest.raises(FactorEvaluationError, match="failed PIT regression"):
+        ev.run_evaluation(
+            RecordingFactor(),
+            engine=object(),
+            start=dates.min().date(),
+            end=dates.max().date(),
+            horizons=(1,),
+            eval_start=dates[2].date(),
+            min_median_dollar_volume=1,
+            eligibility_window=1,
+            trials_path=None,
+            strict=True,
+            risk_free_series=None,
+        )
+
+
+def test_run_evaluation_reports_presence_violations_in_diagnostics(monkeypatch):
+    import research.evaluate as ev
+
+    dates, universe, _ = _panel(n_dates=20, n_names=120)
+    panel = {
+        "adj_close": pd.DataFrame(100.0, index=dates, columns=universe),
+        "close": pd.DataFrame(100.0, index=dates, columns=universe),
+        "dollar_volume": pd.DataFrame(10_000_000.0, index=dates, columns=universe),
+    }
+    monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
+    monkeypatch.setattr(ev, "securities_with_uncovered_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ev, "_pit_regression", lambda *args, **kwargs: (np.nan, 7))
+
+    result = ev.run_evaluation(
+        RecordingFactor(),
+        engine=object(),
+        start=dates.min().date(),
+        end=dates.max().date(),
+        horizons=(1,),
+        eval_start=dates[2].date(),
+        min_median_dollar_volume=1,
+        eligibility_window=1,
+        trials_path=None,
+        risk_free_series=None,
+    )
+
+    assert result.diagnostics["pit_presence_violations"] == 7
+    assert result.diagnostics["lookahead_suspect"] is True
+    rows = result.to_trial_rows()
+    assert any(row["metric"] == "pit_presence_violations" and row["value"] == 7.0 for row in rows)
+
+
 def test_run_evaluation_raises_when_trial_append_fails(monkeypatch, tmp_path):
     import research.evaluate as ev
 
@@ -423,7 +581,7 @@ def test_run_evaluation_raises_when_trial_append_fails(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
     monkeypatch.setattr(ev, "securities_with_uncovered_events", lambda *args, **kwargs: [])
-    monkeypatch.setattr(ev, "_pit_regression", lambda *args, **kwargs: 1.0)
+    monkeypatch.setattr(ev, "_pit_regression", lambda *args, **kwargs: (1.0, 0))
     monkeypatch.setattr("research._trials_store.append_trial", fake_append)
 
     with pytest.raises(OSError, match="disk full"):

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from loguru import logger
 
 
 def event_table_to_asof_panel(
@@ -41,20 +40,9 @@ def event_table_to_asof_panel(
 
     ev["security_id"] = ev["security_id"].astype(np.int64)
     ev[value_column] = ev[value_column].astype(np.float64)
-    ev["effective_visible_date"] = ev[visible_date_column] + pd.Timedelta(
-        days=visible_delay_days
-    )
-
-    dup_key = ["security_id", "effective_visible_date"]
-    if ev.duplicated(subset=dup_key, keep=False).any():
-        n_before = len(ev)
-        ev = ev.sort_values(
-            [*dup_key, value_column], kind="mergesort"
-        ).drop_duplicates(subset=dup_key, keep="last")
-        logger.debug(
-            "event_table_to_asof_panel: deduped {} → {} rows on (security_id, effective_visible_date)",
-            n_before, len(ev),
-        )
+    ev["effective_visible_date"] = (
+        ev[visible_date_column] + pd.Timedelta(days=visible_delay_days)
+    ).astype("datetime64[ns]")
 
     grid = pd.DataFrame(
         {

@@ -9,6 +9,10 @@ from sqlalchemy.engine import Engine
 from research.factors.asof import event_table_to_asof_panel
 from research.market_cap import load_shares_events
 
+# FINRA 半月度空头仓位报告在结算日后约 8 个工作日（BD+8）才公布，
+# 统一取 14 个自然日作为 PIT 可见延迟兜底；所有消费 short_interests 的因子共用此常量。
+SHORT_INTEREST_VISIBLE_DELAY_DAYS = 14
+
 _SHORT_INTEREST_COLUMNS = ["security_id", "visible_date", "settlement_date", "short_interest"]
 _SHARES_COLUMNS = ["security_id", "visible_date", "period_end_date", "total_shares"]
 
@@ -131,7 +135,7 @@ def load_short_interest_ratio_panel(
     *,
     dates: pd.DatetimeIndex,
     security_ids: list[int] | None = None,
-    visible_delay_days: int = 14,
+    visible_delay_days: int = SHORT_INTEREST_VISIBLE_DELAY_DAYS,
     si_max_staleness_days: int = 30,
     shares_max_staleness_days: int = 400,
 ) -> pd.DataFrame:

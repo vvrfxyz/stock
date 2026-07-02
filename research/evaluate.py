@@ -7,6 +7,7 @@ import json
 import math
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -40,6 +41,17 @@ MIN_OBS = 60
 
 class FactorEvaluationError(Exception):
     pass
+
+
+@lru_cache(maxsize=1)
+def _engine_code_fingerprint() -> str:
+    """回测/评估引擎源码指纹；git 树 dirty 时 code_git_sha 不变，指纹仍能区分引擎改动。"""
+    import research.backtest as _backtest_module
+
+    digests = []
+    for module_file in (Path(_backtest_module.__file__), Path(__file__)):
+        digests.append(hashlib.sha1(module_file.read_bytes()).hexdigest()[:12])
+    return "-".join(digests)
 
 
 def _normalize_dates(index: pd.Index) -> pd.DatetimeIndex:
@@ -292,7 +304,8 @@ def _coverage(
 ) -> pd.DataFrame:
     eligible_counts = eligibility.sum(axis=1).replace(0, np.nan)
     factor_present = factor.notna() & eligibility
-    factor_counts = factor_present.sum(axis=1).replace(0, np.nan)
+    raw_factor_counts = factor_present.sum(axis=1).astype("int64")
+    factor_counts = raw_factor_counts.replace(0, np.nan)
     first_horizon = sorted(forward_returns)[0] if forward_returns else None
     if first_horizon is None:
         fwd_cov = pd.Series(np.nan, index=factor.index)
@@ -305,6 +318,7 @@ def _coverage(
     coverage = pd.DataFrame(
         {
             "n_universe": eligibility.sum(axis=1).astype("int64"),
+            "factor_count": raw_factor_counts,
             "factor_coverage": factor_present.sum(axis=1) / eligible_counts,
             "fwd_ret_coverage_given_factor": fwd_cov,
             "pit_violations": pit,
@@ -360,6 +374,7 @@ class EvaluationResult:
                 f"{eval_start}:{eval_end}",
                 as_of,
                 self.code_git_sha or "",
+                _engine_code_fingerprint(),
             ]
         )
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
@@ -441,9 +456,20 @@ class EvaluationResult:
             add(0, "coverage_factor_mean", self.coverage["factor_coverage"].mean())
             add(0, "coverage_factor_p05", self.coverage["factor_coverage"].quantile(0.05))
             add(0, "coverage_fwd_given_factor_p05", self.coverage["fwd_ret_coverage_given_factor"].quantile(0.05))
+            if "factor_count" in self.coverage:
+                add(0, "coverage_factor_count_p05", self.coverage["factor_count"].quantile(0.05))
+                add(0, "coverage_factor_count_median", self.coverage["factor_count"].median())
+                add(0, "coverage_factor_count_max", self.coverage["factor_count"].max())
+                min_coverage = int(self.config.get("min_coverage", 50))
+                add(0, "coverage_days_below_min_coverage", (self.coverage["factor_count"] < min_coverage).sum())
             add(0, "n_universe_mean", self.coverage["n_universe"].mean())
             add(0, "n_universe_min", self.coverage["n_universe"].min())
-        for metric in ("pit_regression_max_abs_diff", "factor_freshness_gap_days", "unexpected_coverage_jump_days"):
+        for metric in (
+            "pit_regression_max_abs_diff",
+            "pit_presence_violations",
+            "factor_freshness_gap_days",
+            "unexpected_coverage_jump_days",
+        ):
             add(0, metric, self.diagnostics.get(metric, np.nan))
         for horizon in self.diagnostics.get("skipped_horizons", ()):
             add(int(horizon), "flag_horizon_skipped", 1.0)
@@ -481,6 +507,9 @@ def evaluate_factor(
     }
     as_of = factor.attrs.get("as_of")
     as_of_ts = pd.Timestamp(as_of) if as_of is not None else None
+    # IC/IC-decay 与分位回测、coverage 共用可投资横截面：ineligible 名字上的
+    # 因子值不参与排名相关，min_coverage 计数口径与 coverage.factor_count 一致。
+    investable_factor = factor.where(eligibility)
     lag_rule = nw_lag_rule or default_nw_lag
     ic_rows: list[dict[str, Any]] = []
     skipped: list[int] = []
@@ -491,7 +520,7 @@ def evaluate_factor(
             skipped.append(horizon)
             ic_rows.append({"horizon": horizon, "mean_ic": np.nan, "std_ic": np.nan, "nw_t": np.nan, "nw_lag": 0, "n_obs": 0, "is_noisy": True})
             continue
-        ic = _rank_ic_series(factor, fwd, min_coverage)
+        ic = _rank_ic_series(investable_factor, fwd, min_coverage)
         n_obs = int(ic.notna().sum())
         requested_lag = int(lag_rule(horizon, n_obs)) if n_obs else 0
         effective_lag = min(requested_lag, max(n_obs - 1, 0))
@@ -510,7 +539,7 @@ def evaluate_factor(
         )
     ic_table = pd.DataFrame(ic_rows).set_index("horizon")
     ic_table["is_noisy"] = ic_table["is_noisy"].map(bool).astype(object)
-    ic_decay = _ic_decay_table(factor, aligned_returns, horizons, min_coverage)
+    ic_decay = _ic_decay_table(investable_factor, aligned_returns, horizons, min_coverage)
     q_metrics = _quantile_metrics(factor, eligibility, adj_close, horizons, n_quantiles, cost_bps, risk_free_returns)
     coverage = _coverage(factor, aligned_returns, eligibility, as_of_ts)
     non_nan_dates = factor.dropna(how="all").index
@@ -527,6 +556,7 @@ def evaluate_factor(
     pit_lookahead = bool(coverage["pit_violations"].max() > 0) if not coverage.empty else False
     diagnostics = {
         "pit_regression_max_abs_diff": np.nan,
+        "pit_presence_violations": np.nan,
         "factor_freshness_gap_days": float(freshness) if pd.notna(freshness) else np.nan,
         "unexpected_coverage_jump_days": jumps,
         "skipped_horizons": tuple(skipped),
@@ -584,24 +614,29 @@ def _pit_regression(
     engine: Engine,
     eval_dates: pd.DatetimeIndex,
     universe: pd.Index,
-) -> float:
+) -> tuple[float, int]:
     if len(eval_dates) == 0:
-        return np.nan
+        return np.nan, 0
     offsets = (60, 120, 180)
     sample_pos = sorted({max(len(eval_dates) - offset, 0) for offset in offsets if len(eval_dates) > offset})
     if not sample_pos:
-        return np.nan
+        return np.nan, 0
     diffs: list[float] = []
+    presence_violations = 0
     for pos in sample_pos:
         ts = eval_dates[pos]
         replay_dates = pd.DatetimeIndex(live_values.index[live_values.index <= ts])
         ctx = FactorContext(engine=engine, dates=replay_dates, security_universe=universe, as_of=ts)
         recomputed = factor_obj.compute(ctx).reindex(index=[ts], columns=universe)
         live = live_values.reindex(index=[ts], columns=universe)
+        # presence 不匹配（live 有值而 as-of 重放为 NaN，或反之）本身就是 PIT 违规；
+        # 值差取 nanmax 会跳过这些格子，必须单独计数。
+        mismatch = recomputed.notna().to_numpy() != live.notna().to_numpy()
+        presence_violations += int(mismatch.sum())
         diff = (recomputed - live).abs().to_numpy(dtype=float)
         if np.isfinite(diff).any():
             diffs.append(float(np.nanmax(diff)))
-    return max(diffs) if diffs else np.nan
+    return (max(diffs) if diffs else np.nan), presence_violations
 
 
 def run_evaluation(
@@ -630,8 +665,10 @@ def run_evaluation(
     from research._trials_store import _git_meta, append_trial
 
     effective_as_of = as_of or end
-    panel = load_adjusted_panel(engine, start=start, end=_buffered_end(end, max(horizons)), types=types, as_of=effective_as_of)
-    bad = set(securities_with_uncovered_events(engine, start=start, end=end)) | set(extra_drop_ids or [])
+    buffered_end = _buffered_end(end, max(horizons))
+    panel = load_adjusted_panel(engine, start=start, end=buffered_end, types=types, as_of=effective_as_of)
+    # 剔除窗口与缓冲面板一致：前向收益会用到 end 之后 max(horizons) 个交易日的价格。
+    bad = set(securities_with_uncovered_events(engine, start=start, end=buffered_end)) | set(extra_drop_ids or [])
     if bad:
         for key in panel:
             panel[key] = panel[key].drop(columns=[c for c in panel[key].columns if int(c) in bad], errors="ignore")
@@ -720,13 +757,20 @@ def run_evaluation(
         factor_name=factor_obj.name,
         risk_free_returns=risk_free_returns,
     )
-    pit_diff = _pit_regression(factor_obj, factor_values, engine, eval_dates, universe)
+    pit_diff, pit_presence = _pit_regression(factor_obj, factor_values, engine, eval_dates, universe)
     diagnostics = dict(result.diagnostics)
     diagnostics["pit_regression_max_abs_diff"] = pit_diff
-    diagnostics["lookahead_suspect"] = bool(diagnostics.get("lookahead_suspect", False) or (pd.notna(pit_diff) and pit_diff > 1e-6))
+    diagnostics["pit_presence_violations"] = pit_presence
+    diagnostics["lookahead_suspect"] = bool(
+        diagnostics.get("lookahead_suspect", False)
+        or (pd.notna(pit_diff) and pit_diff > 1e-6)
+        or pit_presence > 0
+    )
     result = replace(result, diagnostics=diagnostics)
     if pd.notna(pit_diff) and pit_diff > 1e-9:
         logger.warning("factor={} PIT regression max abs diff={}", factor_obj.name, pit_diff)
+    if pit_presence > 0:
+        logger.warning("factor={} PIT regression presence violations={}", factor_obj.name, pit_presence)
     if trials_path is not None:
         try:
             append_trial(result, trials_path)
@@ -790,6 +834,17 @@ def _parse_csv_ints(value: str) -> tuple[int, ...]:
 
 def _result_summary(result: EvaluationResult) -> pd.DataFrame:
     rows = []
+    factor_count_p05 = np.nan
+    factor_count_median = np.nan
+    factor_count_max = np.nan
+    days_below_min_coverage = np.nan
+    if not result.coverage.empty and "factor_count" in result.coverage:
+        counts = result.coverage["factor_count"]
+        factor_count_p05 = counts.quantile(0.05)
+        factor_count_median = counts.median()
+        factor_count_max = counts.max()
+        min_coverage = int(result.config.get("min_coverage", 50))
+        days_below_min_coverage = int((counts < min_coverage).sum())
     for horizon, row in result.ic_table.iterrows():
         label = f"{row['nw_t']:.3f}{'*' if bool(row['is_noisy']) else ''}" if pd.notna(row["nw_t"]) else "nan*"
         q_label = f"ls_q{result.n_quantiles}_q1"
@@ -803,6 +858,10 @@ def _result_summary(result: EvaluationResult) -> pd.DataFrame:
                 "nw_t": label,
                 "q_ls_sharpe_net": q_sharpe,
                 "coverage_p05": result.coverage["factor_coverage"].quantile(0.05) if not result.coverage.empty else np.nan,
+                "factor_count_p05": factor_count_p05,
+                "factor_count_median": factor_count_median,
+                "factor_count_max": factor_count_max,
+                "days_below_min_coverage": days_below_min_coverage,
                 "pit_violations_max": result.coverage["pit_violations"].max() if not result.coverage.empty else np.nan,
                 "n_obs": row["n_obs"],
             }
@@ -833,6 +892,8 @@ def _write_markdown_report(result: EvaluationResult, output_dir: Path) -> Path:
         "",
         "## Summary",
         _markdown_table(_result_summary(result)),
+        "",
+        f"Long-short convention: `ls_q{result.n_quantiles}_q1` is long q{result.n_quantiles} (highest factor values) and short q1 (lowest factor values).",
         "",
         "## IC decay",
         _markdown_table(result.ic_decay, include_index=False),
