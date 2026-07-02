@@ -146,3 +146,39 @@ def test_apply_merge_migrates_nonconflicting_rows_and_is_idempotent(pg_db):
         assert conn.execute(text(
             "SELECT count(*) FROM security_identity_events WHERE event_type = 'MERGE'"
         )).scalar() == 1
+
+
+@pytest.mark.integration
+def test_find_split_identities_cik_gate_and_placeholder_figi(pg_db):
+    """CIK 安全门：同 CIK 才自动进 plan；DIFF-CIK/缺 CIK/占位 FIGI 全部排除。"""
+    from scripts.repair_identity import find_split_identities
+
+    with pg_db.get_session() as s:
+        common = dict(market="US", type="CS", full_refresh_interval=30)
+        # 同 CIK 分裂：应进 plan，keep 活跃行
+        s.add(Security(id=1, symbol="new", current_symbol="new", is_active=True,
+                       composite_figi="BBG000000001", cik="0001", **common))
+        s.add(Security(id=2, symbol="old", current_symbol="old", is_active=False,
+                       composite_figi="BBG000000001", cik="0001", **common))
+        # DIFF-CIK 共用 FIGI（vendor 错数据）：排除
+        s.add(Security(id=3, symbol="powr", current_symbol="powr", is_active=True,
+                       composite_figi="BBG000000002", cik="0002", **common))
+        s.add(Security(id=4, symbol="fill", current_symbol="fill", is_active=False,
+                       composite_figi="BBG000000002", cik="0003", **common))
+        # 无 CIK（ETF）：排除，交人工
+        s.add(Security(id=5, symbol="etfa", current_symbol="etfa", is_active=True,
+                       composite_figi="BBG000000003", cik=None, **common))
+        s.add(Security(id=6, symbol="etfb", current_symbol="etfb", is_active=False,
+                       composite_figi="BBG000000003", cik=None, **common))
+        # 占位 FIGI 字面量：排除（约 90 只退市股共享 'UNKNOWN'）
+        s.add(Security(id=7, symbol="xtkg", current_symbol="xtkg", is_active=False,
+                       composite_figi="UNKNOWN", cik="0004", **common))
+        s.add(Security(id=8, symbol="esgl", current_symbol="esgl", is_active=False,
+                       composite_figi="UNKNOWN", cik="0005", **common))
+        s.commit()
+
+        plans = find_split_identities(s, limit=50)
+    assert len(plans) == 1
+    assert plans[0]["figi"] == "BBG000000001"
+    assert plans[0]["keep_id"] == 1
+    assert plans[0]["merge_ids"] == [2]

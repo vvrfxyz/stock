@@ -47,15 +47,20 @@ def create_parser() -> argparse.ArgumentParser:
 
 
 def find_split_identities(session, limit: int) -> list[dict]:
-    """找出同一 composite_figi 落在多个 security_id 的分裂身份。"""
+    """找出同一 composite_figi 落在多个 security_id 的分裂身份。
+
+    排除 'UNKNOWN' 之类的占位字面量——约 90 只退市股共享该假 FIGI，
+    若进入 plan 会把互不相干的公司合并成一只（灾难级）。"""
     sql = text("""
         SELECT composite_figi,
                array_agg(id ORDER BY id) AS security_ids,
                array_agg(symbol ORDER BY id) AS symbols,
                array_agg(is_active ORDER BY id) AS actives,
-               array_agg(coalesce(price_data_latest_date::text, 'NULL') ORDER BY id) AS latest_dates
+               array_agg(coalesce(price_data_latest_date::text, 'NULL') ORDER BY id) AS latest_dates,
+               array_agg(coalesce(cik, '') ORDER BY id) AS ciks
         FROM securities
         WHERE composite_figi IS NOT NULL AND composite_figi <> ''
+          AND composite_figi ~ '^BBG'
         GROUP BY composite_figi
         HAVING count(*) > 1
         ORDER BY composite_figi
@@ -63,11 +68,25 @@ def find_split_identities(session, limit: int) -> list[dict]:
     """)
     rows = session.execute(sql, {"limit": limit}).all()
     plans = []
+    skipped = 0
     for row in rows:
         ids = list(row.security_ids)
         symbols = list(row.symbols)
         actives = list(row.actives)
         latest = list(row.latest_dates)
+
+        # CIK 安全门：仅当全部行共享同一个非空 CIK（同一 SEC 注册主体，
+        # 即真·同身份改名/分裂）才自动合并。不同 CIK 共用 FIGI（vendor 错数据
+        # 或 ETF 壳转用途）与无 CIK（ETF）的组交人工甄别——2026-07-02 复核中
+        # powr/fill 等 DIFF-CIK 组合并会把两只不同基金的历史搅在一起。
+        ciks = set(row.ciks)
+        if len(ciks) != 1 or "" in ciks:
+            skipped += 1
+            logger.warning(
+                "跳过 figi={} 组（CIK 不一致或缺失，需人工甄别）: symbols={} ciks={}",
+                row.composite_figi, symbols, sorted(ciks),
+            )
+            continue
 
         # 选择保留的 id：优先活跃行，其次有最新价格数据的
         keep_idx = 0
@@ -89,6 +108,8 @@ def find_split_identities(session, limit: int) -> list[dict]:
             "merge_symbols": [symbols[i] for i in range(len(ids)) if ids[i] != keep_id],
             "detail": f"figi={row.composite_figi} ids={ids} symbols={symbols} active={actives} latest={latest}",
         })
+    if skipped:
+        logger.warning("共 {} 组因 CIK 安全门被跳过（人工甄别清单见上方 warning）。", skipped)
     return plans
 
 
