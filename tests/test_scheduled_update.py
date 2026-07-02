@@ -102,6 +102,7 @@ def test_scheduled_update_staggers_monthly_tasks():
 
 
 def test_scheduled_update_continues_after_step_failure_and_exits_nonzero(monkeypatch):
+    monkeypatch.setattr(main_module, "DatabaseManager", _FakeTrackingDb)
     executed = []
 
     def failing_step(argv=None):
@@ -125,6 +126,7 @@ def test_scheduled_update_continues_after_step_failure_and_exits_nonzero(monkeyp
 
 
 def test_scheduled_update_exits_zero_when_all_steps_succeed(monkeypatch):
+    monkeypatch.setattr(main_module, "DatabaseManager", _FakeTrackingDb)
     executed = []
 
     steps = [
