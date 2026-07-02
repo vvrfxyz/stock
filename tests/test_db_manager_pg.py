@@ -4,7 +4,8 @@
 - ON CONFLICT 的冲突键与 protected 字段保护；
 - 合成事件被真实 vendor 事件替换时的去重 DELETE；
 - 序列同步（手工导库后 INSERT 不撞主键）；
-- 各表 upsert 的"只更新提供字段 / NULL 不覆盖"语义。
+- 各表 upsert 的"只更新提供字段 / NULL 不覆盖"语义；
+- SAVEPOINT 隔离与部分唯一索引的 NULL 语义。
 """
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -21,6 +22,7 @@ from data_models.models import (
     SecFundamentalFact,
     Security,
     SecurityIdentifier,
+    SecurityIdentityEvent,
     ShortVolume,
 )
 
@@ -126,6 +128,56 @@ class TestUpsertSecuritiesBySymbol:
         assert written == 0
         assert _scalar(pg_db, "SELECT name FROM securities WHERE symbol='abcd'") == "Old Co"
         assert _scalar(pg_db, "SELECT composite_figi FROM securities WHERE symbol='abcd'") == "BBGOLD"
+        # 冲突同时落一条 QUARANTINE 审计事件
+        assert _scalar(pg_db, "SELECT event_type FROM security_identity_events WHERE security_id=1") == "QUARANTINE"
+
+    def test_identity_event_failure_does_not_poison_main_upsert(self, pg_db, monkeypatch):
+        """事件写入在 SAVEPOINT 内失败：只回滚事件本身，主 upsert 照常提交。"""
+        _insert_security(pg_db, 1, "abcd", name="Old Co", composite_figi="BBGOLD", cik="0000000001")
+
+        original = pg_db._sync_model_id_sequence
+
+        def broken_for_events(conn, model):
+            if model is SecurityIdentityEvent:
+                # 制造真实的 PG 服务端错误——不包 SAVEPOINT 时会毒化整个共享事务
+                conn.execute(text("SELECT 1/0"))
+            return original(conn, model)
+
+        monkeypatch.setattr(pg_db, "_sync_model_id_sequence", broken_for_events)
+
+        written = pg_db.upsert_securities_by_symbol([
+            {"symbol": "abcd", "market": "US", "type": "CS", "composite_figi": "BBGNEW", "cik": "0000000002"},
+            {"symbol": "wxyz", "market": "US", "type": "CS", "name": "Clean Co"},
+        ])
+
+        assert written == 1
+        assert _scalar(pg_db, "SELECT name FROM securities WHERE symbol='wxyz'") == "Clean Co"
+        assert _scalar(pg_db, "SELECT name FROM securities WHERE symbol='abcd'") == "Old Co"
+        assert _scalar(pg_db, "SELECT count(*) FROM security_identity_events") == 0
+
+    def test_batch_duplicate_symbols_keep_first_row(self, pg_db):
+        """vendor 同批返回大小写变体（如 TPC/TpC）归一化后撞同一冲突键——
+        保留首条并跳过后续，而非 CardinalityViolation 打挂整批。"""
+        written = pg_db.upsert_securities_by_symbol([
+            {"symbol": "tpc", "market": "US", "type": "CS", "name": "Tutor Perini", "composite_figi": "BBGTPC1"},
+            {"symbol": "tpc", "market": "US", "type": "CS", "name": "AT&T preferred", "composite_figi": "BBGTPC2"},
+            {"symbol": "msft", "market": "US", "type": "CS", "name": "Microsoft", "composite_figi": "BBGMSFT"},
+        ])
+
+        assert written == 2
+        assert _scalar(pg_db, "SELECT count(*) FROM securities WHERE symbol='tpc'") == 1
+        assert _scalar(pg_db, "SELECT name FROM securities WHERE symbol='tpc'") == "Tutor Perini"
+        assert _scalar(pg_db, "SELECT name FROM securities WHERE symbol='msft'") == "Microsoft"
+
+    def test_explicit_none_is_active_normalized_to_true(self, pg_db):
+        """is_active 显式 None 时 setdefault 失效——NULL 行不受 is_active IS TRUE
+        部分唯一索引约束，重复运行会反复插入；必须归一化为 True。"""
+        row = {"symbol": "aapl", "market": "US", "type": "CS", "is_active": None}
+        pg_db.upsert_securities_by_symbol([dict(row)])
+        pg_db.upsert_securities_by_symbol([dict(row)])
+
+        assert _scalar(pg_db, "SELECT count(*) FROM securities WHERE symbol='aapl'") == 1
+        assert _scalar(pg_db, "SELECT is_active FROM securities WHERE symbol='aapl'") is True
 
     def test_inactive_symbol_can_be_reused_for_new_identity(self, pg_db):
         _insert_security(pg_db, 1, "abcd", name="Old Co", composite_figi="BBGOLD", cik="0000000001", is_active=False)
@@ -157,6 +209,40 @@ class TestSecurityIdentityChanges:
         assert _scalar(pg_db, "SELECT current_symbol FROM securities WHERE id=1") == "meta"
         assert _scalar(pg_db, "SELECT count(*) FROM security_symbol_history WHERE security_id=1 AND symbol='fb'") == 1
 
+    def test_rename_closes_old_interval_and_opens_new_one(self, pg_db):
+        """区间语义：old_symbol 闭合（end_date=今天），new_symbol 开启（start_date=今天，end_date NULL）。"""
+        _insert_security(pg_db, 1, "fb", exchange="XNAS")
+
+        pg_db.rename_security(1, old_symbol="fb", new_symbol="meta", exchange="XNAS")
+
+        assert _scalar(
+            pg_db, "SELECT end_date FROM security_symbol_history WHERE security_id=1 AND symbol='fb'"
+        ) == date.today()
+        assert _scalar(
+            pg_db, "SELECT start_date FROM security_symbol_history WHERE security_id=1 AND symbol='meta'"
+        ) == date.today()
+        assert _scalar(
+            pg_db, "SELECT end_date FROM security_symbol_history WHERE security_id=1 AND symbol='meta'"
+        ) is None
+
+    def test_rename_closes_existing_open_interval_preserving_start_date(self, pg_db):
+        """old_symbol 已有开区间行（update_massive_events 写入口径）：闭合它而非另插一行。"""
+        _insert_security(pg_db, 1, "fb", exchange="XNAS")
+        pg_db.upsert_symbol_history([{
+            "security_id": 1, "symbol": "fb", "source": "MASSIVE",
+            "event_type": "ticker_change", "start_date": date(2012, 5, 18),
+        }])
+
+        pg_db.rename_security(1, old_symbol="fb", new_symbol="meta", exchange="XNAS")
+
+        assert _scalar(pg_db, "SELECT count(*) FROM security_symbol_history WHERE security_id=1 AND symbol='fb'") == 1
+        assert _scalar(
+            pg_db, "SELECT start_date FROM security_symbol_history WHERE security_id=1 AND symbol='fb'"
+        ) == date(2012, 5, 18)
+        assert _scalar(
+            pg_db, "SELECT end_date FROM security_symbol_history WHERE security_id=1 AND symbol='fb'"
+        ) == date.today()
+
     def test_rename_is_idempotent_on_history(self, pg_db):
         _insert_security(pg_db, 1, "fb", exchange="XNAS")
 
@@ -164,6 +250,11 @@ class TestSecurityIdentityChanges:
         pg_db.rename_security(1, old_symbol="fb", new_symbol="meta", exchange="XNAS")
 
         assert _scalar(pg_db, "SELECT count(*) FROM security_symbol_history WHERE security_id=1 AND symbol='fb'") == 1
+        assert _scalar(pg_db, "SELECT count(*) FROM security_symbol_history WHERE security_id=1 AND symbol='meta'") == 1
+        # meta 的区间保持打开
+        assert _scalar(
+            pg_db, "SELECT end_date FROM security_symbol_history WHERE security_id=1 AND symbol='meta'"
+        ) is None
 
     def test_insert_identity_events(self, pg_db):
         _insert_security(pg_db, 1, "meta")

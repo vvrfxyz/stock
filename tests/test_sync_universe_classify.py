@@ -1,8 +1,8 @@
-"""sync_massive_universe 的 _classify_incoming 单元测试。
+"""sync_massive_universe 的 _classify_incoming / _order_renames 单元测试。
 
 不依赖 PostgreSQL——直接构造 resolver 和 incoming rows。
 """
-from scripts.sync_massive_universe import _classify_incoming
+from scripts.sync_massive_universe import _classify_incoming, _order_renames
 from utils.security_identity import SecurityIdentityResolver, _SecurityRow
 
 
@@ -87,3 +87,83 @@ def test_classify_mixed_batch():
     assert len(recycle) == 1
     assert len(normal) == 2
     assert len(results) == 4
+
+
+def _ordered_symbols(entries):
+    return [(old, row["symbol"]) for row, _, old in entries]
+
+
+def test_order_renames_chain_feed_order_reversed():
+    # feed 顺序 A→B 在前、B→C 在后：必须把 B→C 排到 A→B 之前。
+    resolver = _build_resolver([
+        _row(1, "a", figi="BBG000AAA"),
+        _row(2, "b", figi="BBG000BBB"),
+    ])
+    incoming = [
+        {"symbol": "b", "composite_figi": "BBG000AAA"},   # A→B，依赖 B 被释放
+        {"symbol": "c", "composite_figi": "BBG000BBB"},   # B→C，释放 B
+    ]
+    rename, _, _, _ = _classify_incoming(resolver, incoming)
+    ordered = _order_renames(rename, resolver)
+    assert _ordered_symbols(ordered) == [("b", "c"), ("a", "b")]
+
+
+def test_order_renames_chain_feed_order_already_sorted():
+    # feed 顺序恰好正确（B→C 在前）：保持稳定，不打乱。
+    resolver = _build_resolver([
+        _row(1, "a", figi="BBG000AAA"),
+        _row(2, "b", figi="BBG000BBB"),
+    ])
+    incoming = [
+        {"symbol": "c", "composite_figi": "BBG000BBB"},   # B→C
+        {"symbol": "b", "composite_figi": "BBG000AAA"},   # A→B
+    ]
+    rename, _, _, _ = _classify_incoming(resolver, incoming)
+    ordered = _order_renames(rename, resolver)
+    assert _ordered_symbols(ordered) == [("b", "c"), ("a", "b")]
+
+
+def test_order_renames_long_chain():
+    # A→B→C→D 三连改名，倒序进 feed 也能收敛为依赖顺序。
+    resolver = _build_resolver([
+        _row(1, "a", figi="BBG000AAA"),
+        _row(2, "b", figi="BBG000BBB"),
+        _row(3, "c", figi="BBG000CCC"),
+    ])
+    incoming = [
+        {"symbol": "b", "composite_figi": "BBG000AAA"},   # A→B
+        {"symbol": "c", "composite_figi": "BBG000BBB"},   # B→C
+        {"symbol": "d", "composite_figi": "BBG000CCC"},   # C→D
+    ]
+    rename, _, _, _ = _classify_incoming(resolver, incoming)
+    ordered = _order_renames(rename, resolver)
+    assert _ordered_symbols(ordered) == [("c", "d"), ("b", "c"), ("a", "b")]
+
+
+def test_order_renames_swap_cycle_falls_back_to_feed_order():
+    # A↔B 互换成环：无法拓扑排序，退回 feed 顺序（执行时按单条失败隔离）。
+    resolver = _build_resolver([
+        _row(1, "a", figi="BBG000AAA"),
+        _row(2, "b", figi="BBG000BBB"),
+    ])
+    incoming = [
+        {"symbol": "b", "composite_figi": "BBG000AAA"},   # A→B
+        {"symbol": "a", "composite_figi": "BBG000BBB"},   # B→A
+    ]
+    rename, _, _, _ = _classify_incoming(resolver, incoming)
+    ordered = _order_renames(rename, resolver)
+    assert _ordered_symbols(ordered) == [("a", "b"), ("b", "a")]
+
+
+def test_order_renames_independent_rows_keep_feed_order():
+    resolver = _build_resolver([
+        _row(1, "fb", figi="BBG000MM2P62"),
+        _row(2, "twtr", figi="BBG000H6HNW3"),
+    ])
+    incoming = [
+        {"symbol": "meta", "composite_figi": "BBG000MM2P62"},
+        {"symbol": "x", "composite_figi": "BBG000H6HNW3"},
+    ]
+    rename, _, _, _ = _classify_incoming(resolver, incoming)
+    ordered = _order_renames(rename, resolver)
+    assert _ordered_symbols(ordered) == [("fb", "meta"), ("twtr", "x")]

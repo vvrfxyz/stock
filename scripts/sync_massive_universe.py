@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import time
+from collections import defaultdict, deque
 from datetime import timedelta
 
 from loguru import logger
@@ -65,6 +66,47 @@ def _classify_incoming(resolver, upsert_rows):
     return rename_rows, recycle_rows, normal_rows, results
 
 
+def _order_renames(rename_rows, resolver):
+    """按批内依赖排序 rename：new_symbol 恰好被本批另一条 rename 释放的排其后。
+
+    链式改名（A→B 与 B→C 同批）必须先执行 B→C 释放 B，A→B 才不会触发
+    rename_security 的占用防御。用 Kahn 拓扑排序（每条至多依赖一个释放者）；
+    环（如 A↔B 互换）无法排序，按原顺序附加，由调用方按单条失败隔离。
+    返回 (row, result, old_symbol) 三元组列表。
+    """
+    entries = []
+    for row, result in rename_rows:
+        old_symbol = resolver._existing_symbol(result.security_id)
+        entries.append((row, result, old_symbol))
+
+    # 释放某 symbol 的 rename 条目下标
+    releaser_of = {}
+    for idx, (_, _, old_symbol) in enumerate(entries):
+        if old_symbol:
+            releaser_of[old_symbol.lower()] = idx
+
+    dependents: dict[int, list[int]] = defaultdict(list)
+    indegree = [0] * len(entries)
+    for idx, (row, _, _) in enumerate(entries):
+        releaser = releaser_of.get(row["symbol"].lower())
+        if releaser is not None and releaser != idx:
+            dependents[releaser].append(idx)
+            indegree[idx] += 1
+
+    queue = deque(idx for idx in range(len(entries)) if indegree[idx] == 0)
+    order = []
+    while queue:
+        idx = queue.popleft()
+        order.append(idx)
+        for dep in dependents[idx]:
+            indegree[dep] -= 1
+            if indegree[dep] == 0:
+                queue.append(dep)
+    if len(order) < len(entries):
+        order.extend(idx for idx in range(len(entries)) if indegree[idx] > 0)
+    return [entries[idx] for idx in order]
+
+
 def main(argv: list[str] | None = None) -> int:
     start_time = time.monotonic()
     setup_logging()
@@ -95,16 +137,42 @@ def main(argv: list[str] | None = None) -> int:
 
         rename_rows, recycle_rows, normal_rows, _ = _classify_incoming(resolver, upsert_rows)
 
-        # 1) 处理改名：更新 symbol + 写 history + 写事件
+        # 1) 处理改名：先按批内依赖排序（new_symbol 被本批另一条 rename 释放的
+        #    排其后），再逐条执行 symbol 更新 + history + 事件。
+        #    单条失败（如占用冲突 ValueError）只隔离该条：记 QUARANTINE 事件后
+        #    跳过，不中止其余 rename / normal / mark-missing 步骤。
         identity_events = []
-        for row, result in rename_rows:
-            existing_symbol = resolver._existing_symbol(result.security_id)
-            db_manager.rename_security(
-                result.security_id,
-                old_symbol=existing_symbol or "",
-                new_symbol=row["symbol"],
-                exchange=row.get("exchange"),
-            )
+        skipped_renames: list[str] = []
+        for row, result, existing_symbol in _order_renames(rename_rows, resolver):
+            try:
+                db_manager.rename_security(
+                    result.security_id,
+                    old_symbol=existing_symbol or "",
+                    new_symbol=row["symbol"],
+                    exchange=row.get("exchange"),
+                )
+            except Exception as e:
+                skipped_renames.append(row["symbol"])
+                identity_events.append({
+                    "security_id": result.security_id,
+                    "event_type": "QUARANTINE",
+                    "old_symbol": existing_symbol,
+                    "new_symbol": row["symbol"],
+                    "resolution_source": "AUTO",
+                    "confidence": result.confidence,
+                    "details": json.dumps({
+                        "matched_field": result.matched_field,
+                        "incoming_figi": row.get("composite_figi"),
+                        "incoming_cik": row.get("cik"),
+                        "action": "rename skipped — write failed",
+                        "error": str(e),
+                    }, ensure_ascii=False),
+                })
+                logger.warning(
+                    "跳过 rename security_id={} {} -> {}：{}",
+                    result.security_id, existing_symbol, row["symbol"], e,
+                )
+                continue
             identity_events.append({
                 "security_id": result.security_id,
                 "event_type": "RENAME",
@@ -124,7 +192,10 @@ def main(argv: list[str] | None = None) -> int:
             db_manager.upsert_security_info(row_with_id)
 
         if rename_rows:
-            logger.info("检测到 {} 只证券改名，已自动更新 symbol。", len(rename_rows))
+            logger.info(
+                "检测到 {} 只证券改名，成功更新 {} 只，跳过 {} 只。",
+                len(rename_rows), len(rename_rows) - len(skipped_renames), len(skipped_renames),
+            )
 
         # 2) 处理回收：quarantine + 写事件，不 upsert
         for row, result in recycle_rows:
@@ -182,13 +253,20 @@ def main(argv: list[str] | None = None) -> int:
                 marked_inactive = result.rowcount or 0
 
         logger.success(
-            "Massive universe 同步完成: fetched={} upserted={} renamed={} recycled={} marked_inactive={}",
+            "Massive universe 同步完成: fetched={} upserted={} renamed={} rename_skipped={} recycled={} marked_inactive={}",
             len(upsert_rows),
             changed,
-            len(rename_rows),
+            len(rename_rows) - len(skipped_renames),
+            len(skipped_renames),
             len(recycle_rows),
             marked_inactive,
         )
+        if skipped_renames:
+            logger.warning(
+                "有 {} 条 rename 写入失败被跳过（已写 QUARANTINE 事件）: {}",
+                len(skipped_renames), ", ".join(skipped_renames),
+            )
+            return 1
         return 0
     except Exception as e:
         logger.opt(exception=e).critical("sync_massive_universe 执行失败: {}", e)

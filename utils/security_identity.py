@@ -29,12 +29,12 @@ __all__ = ["SecurityIdentityResolver", "ResolutionResult"]
 class ResolutionResult:
     """单次解析结果。"""
 
-    security_id: int
+    security_id: int  # -1 表示未绑定既有身份（NEW，或历史 symbol 多身份无法消歧）
     resolution_type: str  # "FIGI" / "CIK" / "ACTIVE_SYMBOL" / "HISTORY_SYMBOL" / "NEW"
     confidence: str  # "HIGH" / "MEDIUM" / "LOW"
     matched_field: str  # 命中的字段，例如 "composite_figi" / "symbol"
     is_rename: bool  # 同一身份但 symbol 变了
-    is_recycle: bool  # 同一 symbol 但身份不同
+    is_recycle: bool  # 命中了某行、但 incoming 身份与其冲突（symbol 复用 / 同 CIK 新证券）
 
 
 class _SecurityRow(NamedTuple):
@@ -187,6 +187,9 @@ class SecurityIdentityResolver:
 
         优先级：FIGI -> CIK -> 活跃 symbol -> 历史 symbol -> 新上市。
         返回的 ``ResolutionResult`` 携带匹配类型、置信度，以及改名/回收标记。
+        CIK / symbol 命中后都会用 ``_identity_conflict`` 复核 incoming 的
+        FIGI/CIK：冲突时一律降级为 LOW + is_recycle=True（绝不判 rename），
+        让上游走 quarantine/skip 而非自动改名。
         """
         norm_symbol = _norm_symbol(symbol)
         norm_figi = _norm_figi(composite_figi)
@@ -211,33 +214,40 @@ class SecurityIdentityResolver:
         if norm_cik is not None:
             candidates = self._by_cik.get(norm_cik)
             if candidates:
+                hit = None
+                confidence = "HIGH"
                 if len(candidates) == 1:
                     hit = candidates[0]
-                    is_rename = _norm_symbol(hit.symbol) != norm_symbol
-                    return ResolutionResult(
-                        security_id=hit.id,
-                        resolution_type="CIK",
-                        confidence="HIGH",
-                        matched_field="cik",
-                        is_rename=is_rename,
-                        is_recycle=False,
-                    )
-                # 多个候选：尝试用交易所消歧。
-                if norm_exchange is not None:
+                elif norm_exchange is not None:
+                    # 多个候选：尝试用交易所消歧。
                     exchange_matches = [
                         c for c in candidates if (c.exchange or "").strip() == norm_exchange
                     ]
                     if len(exchange_matches) == 1:
                         hit = exchange_matches[0]
-                        is_rename = _norm_symbol(hit.symbol) != norm_symbol
+                        confidence = "MEDIUM"
+                if hit is not None:
+                    # incoming FIGI 与既有行 FIGI 冲突：多半是同 CIK 下的另一只
+                    # 证券（新 share class / 同 trust 新 ETF），不能判 rename——
+                    # 与 ACTIVE_SYMBOL 分支的冲突处理一致，降级交 quarantine/人工。
+                    if self._identity_conflict(hit, norm_figi, None):
                         return ResolutionResult(
                             security_id=hit.id,
                             resolution_type="CIK",
-                            confidence="MEDIUM",
+                            confidence="LOW",
                             matched_field="cik",
-                            is_rename=is_rename,
-                            is_recycle=False,
+                            is_rename=False,
+                            is_recycle=True,
                         )
+                    is_rename = _norm_symbol(hit.symbol) != norm_symbol
+                    return ResolutionResult(
+                        security_id=hit.id,
+                        resolution_type="CIK",
+                        confidence=confidence,
+                        matched_field="cik",
+                        is_rename=is_rename,
+                        is_recycle=False,
+                    )
                 # 无法消歧：落到 symbol 匹配。
 
         # 3) 活跃 symbol。
@@ -267,7 +277,27 @@ class SecurityIdentityResolver:
         if norm_symbol is not None:
             hist = self._by_history_symbol.get(norm_symbol)
             if hist:
-                hit = hist[0][0]
+                hit = self._select_history_candidate(hist)
+                if hit is None:
+                    # 多行指向多个不同身份且 end_date 无法消歧：不绑定任何
+                    # 既有身份、不判 rename，交人工（dry_run 进 ambiguous）。
+                    return ResolutionResult(
+                        security_id=-1,
+                        resolution_type="HISTORY_SYMBOL",
+                        confidence="LOW",
+                        matched_field="symbol",
+                        is_rename=False,
+                        is_recycle=False,
+                    )
+                if self._identity_conflict(hit, norm_figi, norm_cik):
+                    return ResolutionResult(
+                        security_id=hit.id,
+                        resolution_type="HISTORY_SYMBOL",
+                        confidence="LOW",
+                        matched_field="symbol",
+                        is_rename=False,
+                        is_recycle=True,
+                    )
                 return ResolutionResult(
                     security_id=hit.id,
                     resolution_type="HISTORY_SYMBOL",
@@ -291,7 +321,7 @@ class SecurityIdentityResolver:
     def _identity_conflict(
         row: _SecurityRow, incoming_figi: str | None, incoming_cik: str | None
     ) -> bool:
-        """incoming 的 FIGI/CIK 与既有行不一致，说明 symbol 被复用了。"""
+        """incoming 的 FIGI/CIK 与既有行不一致，说明命中的行并非同一身份。"""
         if incoming_figi is not None:
             existing_figi = _norm_figi(row.composite_figi)
             if existing_figi is not None and existing_figi != incoming_figi:
@@ -301,6 +331,33 @@ class SecurityIdentityResolver:
             if existing_cik is not None and existing_cik != incoming_cik:
                 return True
         return False
+
+    @staticmethod
+    def _select_history_candidate(
+        hist: list[tuple[_SecurityRow, date | None, date | None]],
+    ) -> _SecurityRow | None:
+        """从同一历史 symbol 的多行区间里确定性地选出一个身份。
+
+        区间语义为 (symbol, start_date=生效日, end_date=失效日/NULL)：按
+        end_date 最近者优先，NULL（未闭合，视为仍在用）排最前。存量数据混有
+        两套矛盾的 start_date 写法且 end_date 大量未闭合，所以 start_date
+        不参与排序；最优 end_date 上若并列多个不同 security_id（典型即多行
+        NULL），视为无法消歧，返回 None。
+        """
+        ids = {row.id for row, _, _ in hist}
+        if len(ids) == 1:
+            return hist[0][0]
+
+        def _recency(entry: tuple[_SecurityRow, date | None, date | None]):
+            end_date = entry[2]
+            return (end_date is None, end_date or date.min)
+
+        best_key = max(_recency(entry) for entry in hist)
+        top_ids = {entry[0].id for entry in hist if _recency(entry) == best_key}
+        if len(top_ids) > 1:
+            return None
+        top_id = next(iter(top_ids))
+        return next(entry[0] for entry in hist if entry[0].id == top_id)
 
     # ------------------------------------------------------------------ #
     # 批量

@@ -46,8 +46,13 @@ class ReferenceDataMixin:
     def insert_missing_security_identifiers(self, rows_data: list[dict]) -> int:
         """只插入库内不存在的 (security_id, id_type, id_value, source) 身份行。
 
-        不能走 ON CONFLICT：唯一约束含 start_date，而身份快照行的 start_date 为 NULL，
-        PG 默认 NULLS DISTINCT 导致冲突永不触发、每次运行都会重复插入。
+        行可携带 start_date 作为 PIT 边界（如 SEC_FTD 行的观测期起始日）；存在性
+        判定刻意不含 start_date——同一身份映射只保留首次插入的行（含其 start_date），
+        后续运行即便算出不同的观测期也不新增、不改写（只插不改）。
+
+        不能走 ON CONFLICT：唯一约束含 start_date，快照行的 start_date 为 NULL 时
+        PG 默认 NULLS DISTINCT 导致冲突永不触发；非 NULL 时 5 元组冲突键也比这里的
+        4 元组语义键更宽，都会造成重复插入。
         """
         rows = [_clean_for_model(SecurityIdentifier, row) for row in rows_data]
         rows = [

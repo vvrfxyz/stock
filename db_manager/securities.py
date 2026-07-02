@@ -106,13 +106,27 @@ class SecuritiesMixin:
 
         valid_columns = set(Security.__table__.columns.keys())
         cleaned_rows: list[dict] = []
+        seen_symbols: set[str] = set()
         for row in securities_data:
             cleaned = {key: value for key, value in row.items() if key in valid_columns}
             if "symbol" not in cleaned:
                 continue
+            # 批内按冲突键 symbol 去重：vendor 可能同批返回大小写变体（如 TPC/TpC），
+            # 归一化后撞同一冲突键会让整批 ON CONFLICT 抛 CardinalityViolation。
+            # 两条往往是不同身份，不能 last-wins——保留首条并告警，留待人工拆分。
+            if cleaned["symbol"] in seen_symbols:
+                logger.warning(
+                    "批内 symbol={} 重复（大小写变体/vendor 重复行，可能是不同身份），保留首条并跳过后续行。",
+                    cleaned["symbol"],
+                )
+                continue
+            seen_symbols.add(cleaned["symbol"])
             cleaned.setdefault("full_refresh_interval", random.randint(25, 40))
             cleaned.setdefault("current_symbol", cleaned.get("symbol"))
-            cleaned.setdefault("is_active", True)
+            # setdefault 对显式 None 失效：is_active=NULL 会绕过 is_active IS TRUE
+            # 的部分唯一索引反复插入重复行，这里统一归一化为 True。
+            if cleaned.get("is_active") is None:
+                cleaned["is_active"] = True
             cleaned_rows.append(cleaned)
 
         if not cleaned_rows:
@@ -178,11 +192,12 @@ class SecuritiesMixin:
                     "跳过 {} 条疑似 ticker 回收的 securities upsert（已记录 identity event）。",
                     skipped_conflicts,
                 )
-            # 写冲突事件到 security_identity_events（失败不阻断主写入）
-            if identity_events:
+            # 写冲突事件到 security_identity_events。包进 SAVEPOINT：事件插入失败
+            # 只回滚嵌套事务本身，不毒化共享连接上的主 upsert 事务（同 repair_identity 的做法）。
+            valid_events = [e for e in identity_events if e.get("security_id")]
+            if valid_events:
                 try:
-                    valid_events = [e for e in identity_events if e.get("security_id")]
-                    if valid_events:
+                    with conn.begin_nested():
                         self._lock_model_sequence_sync(conn, SecurityIdentityEvent)
                         self._sync_model_id_sequence(conn, SecurityIdentityEvent)
                         for grp in _group_rows_by_key_set(
@@ -307,10 +322,17 @@ class SecuritiesMixin:
         exchange: str | None = None,
         source: str = "MASSIVE",
     ) -> None:
-        """改名：更新 symbol/current_symbol 并写 symbol history 行。
+        """改名：更新 symbol/current_symbol 并维护 symbol history 区间。
+
+        区间语义：每行表示 (symbol, start_date=生效日, end_date=失效日/NULL 表示仍在用)。
+        改名时关闭 old_symbol 的开区间行（end_date=今天；old_symbol 无任何既有行时
+        补插一条 end_date=今天 的闭合行，start_date 未知留 NULL），并为 new_symbol
+        插入 start_date=今天 的开区间行——与 update_massive_events 写入的
+        (新 ticker, start_date=生效日) 口径一致。
 
         如果 new_symbol 已被另一个活跃行占用，抛出 ValueError 而非违反唯一索引。
         """
+        today = date.today()
         with self.engine.connect() as conn:
             # 防御：new_symbol 不得已被其他活跃行占用
             conflict = conn.execute(
@@ -329,18 +351,52 @@ class SecuritiesMixin:
             )
             self._lock_model_sequence_sync(conn, SecuritySymbolHistory)
             self._sync_model_id_sequence(conn, SecuritySymbolHistory)
-            history_row = _clean_for_model(SecuritySymbolHistory, {
+            if old_symbol:
+                closed = conn.execute(
+                    update(SecuritySymbolHistory)
+                    .where(
+                        SecuritySymbolHistory.security_id == security_id,
+                        SecuritySymbolHistory.symbol == old_symbol,
+                        SecuritySymbolHistory.end_date.is_(None),
+                    )
+                    .values(end_date=today)
+                ).rowcount or 0
+                if not closed:
+                    has_any = conn.execute(
+                        select(SecuritySymbolHistory.id)
+                        .where(
+                            SecuritySymbolHistory.security_id == security_id,
+                            SecuritySymbolHistory.symbol == old_symbol,
+                        )
+                        .limit(1)
+                    ).scalar()
+                    if has_any is None:
+                        closing_row = _clean_for_model(SecuritySymbolHistory, {
+                            "security_id": security_id,
+                            "symbol": old_symbol,
+                            "exchange": exchange,
+                            "source": source,
+                            "event_type": "ticker_change",
+                            "end_date": today,
+                        })
+                        conn.execute(pg_insert(SecuritySymbolHistory).values(closing_row))
+            new_row = _clean_for_model(SecuritySymbolHistory, {
                 "security_id": security_id,
-                "symbol": old_symbol,
+                "symbol": new_symbol,
                 "exchange": exchange,
                 "source": source,
                 "event_type": "ticker_change",
-                "start_date": date.today(),
+                "start_date": today,
             })
-            stmt = pg_insert(SecuritySymbolHistory).values(history_row)
+            stmt = pg_insert(SecuritySymbolHistory).values(new_row)
             stmt = stmt.on_conflict_do_update(
                 index_elements=["security_id", "symbol", "source", "start_date"],
-                set_={"exchange": stmt.excluded.exchange, "event_type": stmt.excluded.event_type},
+                set_={
+                    "exchange": stmt.excluded.exchange,
+                    "event_type": stmt.excluded.event_type,
+                    # 同日重复 rename：new_symbol 重新生效，区间重新打开
+                    "end_date": None,
+                },
             )
             conn.execute(stmt)
             conn.commit()
