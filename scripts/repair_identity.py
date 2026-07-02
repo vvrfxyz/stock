@@ -101,13 +101,42 @@ TABLES_WITH_SECURITY_ID = [
     "historical_floats",
     "short_interests",
     "short_volumes",
-    "news_articles",
+    "news_article_insights",
     "security_symbol_history",
     "security_identifiers",
+    "sec_filings",
     "sec_fundamental_facts",
     "insider_transactions",
     "institutional_holdings",
 ]
+
+# 唯一键含 security_id 的表：整表改挂会撞 keep 侧已有行，迁移时按键列加
+# NOT EXISTS 守卫，冲突行留在 husk（inactive）侧。键列取自 models.py 的唯一约束。
+TABLE_CONFLICT_KEYS: dict[str, list[str]] = {
+    "daily_prices": ["date"],
+    "corporate_actions": ["action_type", "source", "source_event_id"],
+    "computed_adjustment_factors": ["methodology_version", "factor_key"],
+    "vendor_adjustment_factors": ["source", "factor_key"],
+    "historical_shares": ["filing_date", "source"],
+    "historical_floats": ["effective_date", "source"],
+    "short_interests": ["settlement_date", "source"],
+    "short_volumes": ["date", "source"],
+    "security_symbol_history": ["symbol", "source", "start_date"],
+    "security_identifiers": ["id_type", "id_value", "source", "start_date"],
+}
+
+
+def _migrate_sql(table: str, keep_id, merge_id) -> str:
+    """单表改挂 SQL；键冲突表带 NOT EXISTS 守卫（参数可为字面量或 :bind 名）。"""
+    stmt = f"UPDATE {table} SET security_id = {keep_id} WHERE security_id = {merge_id}"
+    cols = TABLE_CONFLICT_KEYS.get(table)
+    if cols:
+        match = " AND ".join(f"t2.{c} IS NOT DISTINCT FROM {table}.{c}" for c in cols)
+        stmt += (
+            f" AND NOT EXISTS (SELECT 1 FROM {table} t2"
+            f" WHERE t2.security_id = {keep_id} AND {match})"
+        )
+    return stmt
 
 
 def generate_merge_sql(plan: dict) -> list[str]:
@@ -117,16 +146,7 @@ def generate_merge_sql(plan: dict) -> list[str]:
     stmts = []
     for merge_id in merge_ids:
         for table in TABLES_WITH_SECURITY_ID:
-            stmts.append(
-                f"UPDATE {table} SET security_id = {keep_id} "
-                f"WHERE security_id = {merge_id} "
-                f"AND NOT EXISTS (SELECT 1 FROM {table} t2 "
-                f"WHERE t2.security_id = {keep_id} "
-                f"AND t2.date = {table}.date) "
-                f"/* 仅对有 date 列的表生效，其他表直接 UPDATE */;"
-                if table in ("daily_prices", "corporate_actions", "short_volumes", "short_interests")
-                else f"UPDATE {table} SET security_id = {keep_id} WHERE security_id = {merge_id};"
-            )
+            stmts.append(_migrate_sql(table, keep_id, merge_id) + ";")
         stmts.append(
             f"UPDATE securities SET is_active = false WHERE id = {merge_id};"
         )
@@ -134,7 +154,11 @@ def generate_merge_sql(plan: dict) -> list[str]:
 
 
 def apply_merge(db_manager, plan: dict) -> int:
-    """执行合并：迁移数据行、标记旧 id inactive、写 identity event。"""
+    """执行合并：迁移数据行、标记旧 id inactive、写 identity event。
+
+    与 generate_merge_sql 同一套守卫 SQL：键冲突行留在 husk 侧不迁移。
+    savepoint 仅作意外兜底（如迁移期间的漂移 schema）。重复执行幂等：
+    已写过的 MERGE 事件不重复落库。"""
     keep_id = plan["keep_id"]
     rows_migrated = 0
     with db_manager.engine.connect() as conn:
@@ -142,21 +166,31 @@ def apply_merge(db_manager, plan: dict) -> int:
             for table in TABLES_WITH_SECURITY_ID:
                 savepoint = conn.begin_nested()
                 try:
-                    result = conn.execute(text(
-                        f"UPDATE {table} SET security_id = :keep WHERE security_id = :old"
-                    ), {"keep": keep_id, "old": merge_id})
+                    result = conn.execute(text(_migrate_sql(table, keep_id, merge_id)))
                     rows_migrated += result.rowcount or 0
                     savepoint.commit()
                 except Exception as exc:
                     savepoint.rollback()
                     logger.warning(
-                        "合并 {} -> {}: {} 表迁移跳过（唯一约束冲突）: {}",
-                        merge_id, keep_id, table, type(exc).__name__,
+                        "合并 {} -> {}: {} 表迁移跳过（{}）: {}",
+                        merge_id, keep_id, table, type(exc).__name__, exc,
                     )
             conn.execute(text(
                 "UPDATE securities SET is_active = false WHERE id = :old"
             ), {"old": merge_id})
         conn.commit()
+
+    with db_manager.get_session() as session:
+        already = session.execute(text(
+            "SELECT 1 FROM security_identity_events "
+            "WHERE security_id = :keep AND event_type = 'MERGE' "
+            "AND old_symbol = :old_symbols LIMIT 1"
+        ), {
+            "keep": keep_id,
+            "old_symbols": ", ".join(plan["merge_symbols"])[:30],
+        }).first()
+    if already:
+        return rows_migrated
 
     db_manager.insert_identity_events([{
         "security_id": keep_id,
