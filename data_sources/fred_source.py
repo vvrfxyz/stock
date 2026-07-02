@@ -7,6 +7,8 @@ from decimal import Decimal, InvalidOperation
 
 import requests
 
+from utils.secret_masking import mask_api_keys_in_text
+
 DEFAULT_SERIES_ID = "DTB3"
 _FRED_API_URL = "https://api.stlouisfed.org/fred/series/observations"
 _API_KEY_ENV = "FRED_API_KEY"
@@ -35,13 +37,18 @@ def fetch_fred_series(
     if since is not None:
         params["observation_start"] = since.isoformat()
     http = session or requests
-    response = http.get(
-        _FRED_API_URL,
-        params=params,
-        timeout=_DEFAULT_TIMEOUT,
-        headers={"User-Agent": "stock-pipeline fred sync"},
-    )
-    response.raise_for_status()
+    try:
+        response = http.get(
+            _FRED_API_URL,
+            params=params,
+            timeout=_DEFAULT_TIMEOUT,
+            headers={"User-Agent": "stock-pipeline fred sync"},
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        # requests 的异常消息会拼接完整 URL（含 api_key）；掩码后重抛并用
+        # from None 切断异常链，防止上游 traceback 渲染泄漏明文 key。
+        raise RuntimeError(f"FRED 请求失败: {normalized} - {mask_api_keys_in_text(exc)}") from None
     return parse_fred_observations(response.json(), series_id=normalized)
 
 

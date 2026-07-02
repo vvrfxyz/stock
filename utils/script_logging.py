@@ -32,6 +32,9 @@ def _add_file_sink(log_name: str) -> int:
         rotation="10 MB",
         retention="10 days",
         level="DEBUG",
+        backtrace=True,
+        # diagnose=True 会把 traceback 各帧的变量值（apiKey、DSN 密码等）标注进日志。
+        diagnose=False,
     )
 
 
@@ -41,7 +44,7 @@ def setup_logging(log_name: str) -> None:
 
     if not _console_ready:
         logger.remove()
-        logger.add(sys.stderr, level="INFO", format=LOG_FORMAT)
+        logger.add(sys.stderr, level="INFO", format=LOG_FORMAT, backtrace=True, diagnose=False)
         _console_ready = True
 
     if _primary_log_name is None:

@@ -5,7 +5,9 @@ set -euo pipefail
 # 因此默认走 `docker exec` 在容器内 dump（--format=custom 二进制流写到宿主机文件）。
 # 运行用户可能不在 docker 组但有免密 sudo docker（253 即如此）：STOCK_DOCKER_SUDO=auto
 # 时自动探测——能直连 docker 就直连，否则回退 `sudo -n docker`。
-# 设 STOCK_BACKUP_MODE=host 可改用宿主机 pg_dump + DATABASE_URL（需自行装 postgresql-client）。
+# 设 STOCK_BACKUP_MODE=host 可改用宿主机 pg_dump（需自行装 postgresql-client）；
+# DATABASE_URL 会被解析成 PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE 环境变量
+# 供 pg_dump 读取，含口令的 URL 不进 argv（ps 全局可见）。
 
 REPO_DIR="${STOCK_REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 BACKUP_DIR="${STOCK_BACKUP_DIR:-$HOME/stock_backups/postgres}"
@@ -16,12 +18,25 @@ DOCKER_SUDO="${STOCK_DOCKER_SUDO:-auto}"
 PG_DUMP_BIN="${PG_DUMP_BIN:-pg_dump}"
 TIMESTAMP="$(/bin/date -u '+%Y%m%dT%H%M%SZ')"
 
-if [[ -f "$REPO_DIR/.env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "$REPO_DIR/.env"
-  set +a
-fi
+# 只从 .env 提取本脚本需要的键；不整体 source（set -a 会把全部秘密
+# 导出进当前环境，并被 docker/pg_dump/rsync 等子进程继承）。
+env_file_get() {
+  local key="$1" line
+  [[ -f "$REPO_DIR/.env" ]] || return 1
+  line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$REPO_DIR/.env" | tail -n 1 || true)"
+  [[ -n "$line" ]] || return 1
+  line="${line#*=}"
+  line="${line%$'\r'}"
+  if [[ ${#line} -ge 2 && ( "$line" == \"*\" || "$line" == \'*\' ) ]]; then
+    line="${line:1:${#line}-2}"
+  fi
+  printf '%s' "$line"
+}
+
+if _v="$(env_file_get DATABASE_URL)"; then DATABASE_URL="$_v"; fi
+if _v="$(env_file_get POSTGRES_USER)"; then POSTGRES_USER="$_v"; fi
+if _v="$(env_file_get POSTGRES_DB)"; then POSTGRES_DB="$_v"; fi
+unset _v
 
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
 POSTGRES_DB="${POSTGRES_DB:-stock}"
@@ -75,7 +90,38 @@ dump_via_host() {
     echo "DATABASE_URL is required for host-mode backup (set it in .env)" >&2
     return 1
   fi
-  "$PG_DUMP_BIN" --format=custom --no-owner --no-acl --file="$TMP" "$DATABASE_URL"
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 not found on host (needed to parse DATABASE_URL)" >&2
+    return 1
+  fi
+  # 含口令的 URL 不进 pg_dump argv（ps 全局可见）：经环境变量传给 python
+  # 解析成 libpq 的 PG* 变量，pg_dump 从子 shell 环境读取连接信息。
+  local pg_env
+  pg_env="$(STOCK_DB_URL="$DATABASE_URL" python3 - <<'PY'
+import os
+from urllib.parse import parse_qs, unquote, urlsplit
+
+url = urlsplit(os.environ["STOCK_DB_URL"])
+query = parse_qs(url.query)
+pairs = {
+    "PGHOST": unquote(url.hostname) if url.hostname else "",
+    "PGPORT": str(url.port) if url.port else "",
+    "PGUSER": unquote(url.username) if url.username else "",
+    "PGPASSWORD": unquote(url.password) if url.password else "",
+    "PGDATABASE": unquote(url.path.lstrip("/")),
+    "PGSSLMODE": (query.get("sslmode") or [""])[0],
+}
+for key, value in pairs.items():
+    if value:
+        print(f"{key}={value}")
+PY
+)" || return 1
+  (
+    while IFS='=' read -r key value; do
+      if [[ -n "$key" ]]; then export "$key=$value"; fi
+    done <<<"$pg_env"
+    exec "$PG_DUMP_BIN" --format=custom --no-owner --no-acl --file="$TMP"
+  )
 }
 
 case "$BACKUP_MODE" in

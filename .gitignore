@@ -152,6 +152,10 @@ log/
 # Massive API keys (never commit)
 activation_value.txt
 
+# Archives may embed secrets (e.g. activation_value.txt inside a repo snapshot) — never commit
+*.zip
+归档.zip
+
 # Local data artifacts
 *.csv
 research/output/

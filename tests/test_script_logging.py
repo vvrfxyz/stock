@@ -79,3 +79,30 @@ def test_standalone_script_is_its_own_primary(fresh_logging):
 
     files = _log_files(tmp_path)
     assert len(files) == 1 and files[0].startswith("update_prices_")
+
+
+def test_traceback_does_not_annotate_local_variable_values(fresh_logging):
+    module, tmp_path = fresh_logging
+    module.setup_logging("main_controller")
+
+    try:
+        api_key = "plain-secret-value"
+        api_key + 1  # TypeError；diagnose=True 时 loguru 会把 api_key 的值标注进 traceback
+    except TypeError as e:
+        logger.opt(exception=e).error("boom")
+    logger.complete()
+
+    primary = next((tmp_path / "logs").glob("main_controller_*.log"))
+    content = primary.read_text()
+    assert "Traceback" in content                 # backtrace 保留
+    assert "plain-secret-value" not in content    # diagnose 关闭：变量值不落日志
+
+
+def test_all_sinks_have_diagnose_disabled(fresh_logging):
+    module, _ = fresh_logging
+    module.setup_logging("main_controller")   # stderr + 主文件 sink
+    module.setup_logging("sub_step")          # 子脚本文件 sink
+
+    handlers = list(logger._core.handlers.values())
+    assert len(handlers) == 3
+    assert all(handler._exception_formatter._diagnose is False for handler in handlers)

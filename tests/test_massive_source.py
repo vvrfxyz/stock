@@ -1,8 +1,10 @@
+import traceback
 import unittest
 from datetime import date
 
+from loguru import logger
 from requests import HTTPError
-from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import ConnectionError as RequestsConnectionError, RequestException
 
 from data_sources.massive_source import MassiveSource, _mask_api_keys_in_text
 
@@ -149,6 +151,68 @@ class MassiveSourceTests(unittest.TestCase):
         self.assertEqual(payload["name"], "Akero Therapeutics, Inc.")
         self.assertFalse(payload["is_active"])
         self.assertEqual(session.calls[1]["params"]["date"], "2025-12-08")
+
+    def test_retry_exhaustion_masks_message_and_severs_exception_chain(self):
+        session = FakeSession(
+            [
+                RequestsConnectionError(
+                    "HTTPSConnectionPool: /v2/aggs/ticker/AAPL?adjusted=false&apiKey=plain-secret-key refused"
+                ),
+            ]
+        )
+        source = MassiveSource(DummyRateLimiter(), session=session, max_retries=0, retry_backoff_seconds=0)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            source._request_json(path="/v2/aggs/ticker/AAPL/range/1/day/2020-01-01/2020-01-02")
+
+        exc = ctx.exception
+        self.assertIn("apiKey=***", str(exc))
+        self.assertNotIn("plain-secret-key", str(exc))
+        self.assertIsNone(exc.__cause__)
+        self.assertTrue(exc.__suppress_context__)
+        rendered = "".join(traceback.format_exception(exc))
+        self.assertNotIn("plain-secret-key", rendered)
+
+    def test_generic_request_exception_is_masked_on_rethrow(self):
+        session = FakeSession([RequestException("stream broken apiKey=other-secret-key end")])
+        source = MassiveSource(DummyRateLimiter(), session=session, max_retries=0, retry_backoff_seconds=0)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            source._request_json(path="/v3/reference/tickers")
+
+        self.assertNotIn("other-secret-key", "".join(traceback.format_exception(ctx.exception)))
+        self.assertIn("apiKey=***", str(ctx.exception))
+
+    def test_generic_request_exception_is_retried(self):
+        session = FakeSession(
+            [
+                RequestException("chunked encoding broke"),
+                FakeResponse({"status": "OK", "results": []}),
+            ]
+        )
+        source = MassiveSource(DummyRateLimiter(), session=session, max_retries=1, retry_backoff_seconds=0)
+
+        payload = source._request_json(path="/v3/reference/tickers")
+
+        self.assertEqual(payload["status"], "OK")
+        self.assertEqual(len(session.calls), 2)
+
+    def test_http_error_logs_masked_response_text(self):
+        session = FakeSession(
+            [FakeResponse({"error": "unauthorized apiKey=leaky-secret-key"}, status_code=401)]
+        )
+        source = MassiveSource(DummyRateLimiter(), session=session)
+        records = []
+        sink_id = logger.add(lambda message: records.append(str(message)), level="ERROR")
+        try:
+            with self.assertRaises(HTTPError):
+                source._request_json(path="/v3/reference/tickers")
+        finally:
+            logger.remove(sink_id)
+
+        joined = "".join(records)
+        self.assertIn("apiKey=***", joined)
+        self.assertNotIn("leaky-secret-key", joined)
 
     def test_request_json_retries_on_transient_connection_error(self):
         session = FakeSession(

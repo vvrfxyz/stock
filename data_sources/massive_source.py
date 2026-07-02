@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import threading
 import time
-import re
 from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Iterable, Optional
@@ -13,43 +12,21 @@ import requests
 from loguru import logger
 from requests import HTTPError
 from requests.adapters import HTTPAdapter
-from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout as RequestsTimeout
+from requests.exceptions import RequestException
 
 from data_sources.base import DataSourceInterface
 from utils.key_rate_limiter import KeyRateLimiter
 from utils.massive_config import MASSIVE_BASE_URL, iter_chunks, is_supported_us_security_type
+from utils.secret_masking import (
+    mask_api_key_in_url as _mask_api_key_in_url,
+    mask_api_keys_in_text as _mask_api_keys_in_text,
+)
 
 _DIVIDEND_QUANT = Decimal("1.0000000000")
 _SPLIT_QUANT = Decimal("1.0000000000")
 _TRANSIENT_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 _PG_BIGINT_MIN = -(2 ** 63)
 _PG_BIGINT_MAX = 2 ** 63 - 1
-_API_KEY_QUERY_RE = re.compile(r"(?i)(apiKey=)[^&\s)'\",>]+")
-
-
-def _mask_api_key_in_url(raw_url: Optional[str]) -> Optional[str]:
-    if not raw_url:
-        return raw_url
-    try:
-        parsed = urlparse(raw_url)
-        query_items = parse_qsl(parsed.query, keep_blank_values=True)
-        masked = []
-        changed = False
-        for key, value in query_items:
-            if key.lower() == "apikey":
-                masked.append((key, "***"))
-                changed = True
-            else:
-                masked.append((key, value))
-        if not changed:
-            return raw_url
-        return urlunparse(parsed._replace(query=urlencode(masked, doseq=True)))
-    except Exception:
-        return raw_url
-
-
-def _mask_api_keys_in_text(raw_text: Any) -> str:
-    return _API_KEY_QUERY_RE.sub(r"\1***", str(raw_text))
 
 
 def _parse_date(value: Optional[Any]) -> Optional[date]:
@@ -239,11 +216,13 @@ class MassiveSource(DataSourceInterface):
             response = None
             try:
                 response = self._get_session().get(request_url, params=request_params, timeout=self.timeout)
-            except (RequestsConnectionError, RequestsTimeout) as exc:
+            except RequestException as exc:
                 if attempt >= self.max_retries:
+                    # 原始异常消息可能含明文 apiKey；掩码后重抛并用 from None
+                    # 切断异常链，防止 traceback 渲染把未脱敏消息带进日志。
                     raise RuntimeError(
                         f"Massive 请求网络异常: {request_label} - {_mask_api_keys_in_text(exc)}"
-                    ) from exc
+                    ) from None
                 delay = self._get_retry_delay(attempt)
                 logger.warning(
                     "Massive 请求网络异常，{:.1f} 秒后重试({}/{}): {} - {}",
@@ -307,7 +286,7 @@ class MassiveSource(DataSourceInterface):
                     raise RuntimeError(f"Massive 返回错误: {payload}")
                 return payload
             except HTTPError:
-                logger.error("Massive 请求失败: {} {}", response.status_code, response.text[:500])
+                logger.error("Massive 请求失败: {} {}", response.status_code, _mask_api_keys_in_text(response.text)[:500])
                 raise
             finally:
                 close = getattr(response, "close", None)
