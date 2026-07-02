@@ -4,9 +4,18 @@ delta_institutional_ownership.
 
 All tests run without a database connection: panel tests monkeypatch
 ``load_institutional_aggregates``; aggregate-level tests (period monotonic
-guard, HHI) monkeypatch ``pd.read_sql_query``. The aggregation SQL itself
-(accession-level dedup, original-only visibility) is locked by the PostgreSQL
-integration tests in tests/test_institutional_pg.py.
+guard, HHI, two-stage straggler/panel semantics) monkeypatch
+``pd.read_sql_query``. The aggregation SQL itself (accession-level dedup,
+original-only visibility, two-stage on-time/final event emission) is locked
+by the PostgreSQL integration tests in tests/test_institutional_pg.py.
+
+Two-stage visibility (2026-07): each (security_id, period) may emit up to two
+events — an on-time batch (only filings by period + 46 days) and a final one
+(all filings). Tests here lock the pandas-side behavior: the monotonic guard
+letting both same-period events through while dropping late old-period finals,
+the panel showing on-time values from the deadline (no more "born stale"
+quarters), and the delta prior-base pairing rule (latest prior-period event
+with visible_date <= current event's — no lookahead).
 """
 from __future__ import annotations
 
@@ -495,6 +504,194 @@ class TestDeltaPriorBaseAfterGuard:
         # so every prior-quarter base was already visible at the current event
         by_sec = agg.sort_values(["security_id", "period"])
         assert by_sec.groupby("security_id")["visible_date"].is_monotonic_increasing.all()
+
+
+# ---------------------------------------------------------------------------
+# Two-stage visibility tests (on-time batch + final event per period)
+# ---------------------------------------------------------------------------
+
+class TestTwoStageGuardCoexistence:
+    """Monotonic guard + two-stage events: same-period pairs pass, late
+    old-period finals drop while their on-time batch survives."""
+
+    def test_same_period_pair_passes_guard(self, monkeypatch):
+        _patch_sql(
+            monkeypatch,
+            # Q3 on-time batch then Q3 final: same period, ascending visible_date
+            (1, "2025-09-30", "2025-11-14", 40, 400_000.0, 4_000.0, 4_000_000.0),
+            (1, "2025-09-30", "2025-12-20", 41, 410_000.0, 4_100.0, 4_100_000.0),
+        )
+
+        agg = institutional.load_institutional_aggregates(object())
+
+        assert len(agg) == 2
+        assert agg["period"].tolist() == [pd.Timestamp("2025-09-30")] * 2
+        assert agg["visible_date"].tolist() == [
+            pd.Timestamp("2025-11-14"), pd.Timestamp("2025-12-20"),
+        ]
+        # hhi computed per event row
+        assert agg["hhi"].notna().all()
+
+    def test_late_final_dropped_ontime_survives(self, monkeypatch):
+        _patch_sql(
+            monkeypatch,
+            # Q3 on-time batch
+            (1, "2025-09-30", "2025-11-14", 40, 400_000.0, 4_000.0, 4_000_000.0),
+            # Q3 final arrives AFTER Q4's on-time batch — must be dropped
+            (1, "2025-09-30", "2026-06-07", 41, 410_000.0, 4_100.0, 4_100_000.0),
+            # Q4 (no straggler for Q4: single final-only event)
+            (1, "2025-12-31", "2026-02-14", 42, 420_000.0, 4_200.0, 4_200_000.0),
+        )
+
+        agg = institutional.load_institutional_aggregates(object())
+
+        assert list(zip(agg["period"], agg["visible_date"])) == [
+            (pd.Timestamp("2025-09-30"), pd.Timestamp("2025-11-14")),
+            (pd.Timestamp("2025-12-31"), pd.Timestamp("2026-02-14")),
+        ]
+        assert agg["n_holders"].tolist() == [40.0, 42.0]
+
+
+class TestTwoStageStragglerPanel:
+    """Core fix: a straggler filing ~250 days late no longer blanks the whole
+    quarter — the on-time batch is visible from the deadline until next quarter."""
+
+    def test_no_nan_gap_despite_250_day_straggler(self, monkeypatch):
+        _patch_sql(
+            monkeypatch,
+            # Q3 on-time batch: visible at the deadline
+            (1, "2025-09-30", "2025-11-14", 40, 400_000.0, 4_000.0, 4_000_000.0),
+            # Q3 final: straggler filed ~250 days after period end. Old single-event
+            # semantics made this the ONLY Q3 event with visible_date 2026-06-07,
+            # already past period + 200d staleness -> the quarter was born stale (NaN).
+            (1, "2025-09-30", "2026-06-07", 41, 410_000.0, 4_100.0, 4_100_000.0),
+            # Q4 on time
+            (1, "2025-12-31", "2026-02-14", 42, 420_000.0, 4_200.0, 4_200_000.0),
+        )
+
+        dates = pd.DatetimeIndex(pd.to_datetime([
+            "2025-11-13",   # before the on-time batch is visible
+            "2025-11-14",   # on-time batch visible at the deadline
+            "2026-01-15",   # mid-quarter: old semantics gave NaN here
+            "2026-02-13",   # last day before Q4
+            "2026-02-14",   # Q4 takes over
+            "2026-06-15",   # after the straggler: Q4 still shown, no regression
+        ]))
+        panels = load_institutional_holdings_panel(
+            _DUMMY_ENGINE, dates=dates, security_ids=[1],
+        )
+
+        n = panels["n_holders"][1]
+        assert np.isnan(n.loc["2025-11-13"])
+        assert n.loc["2025-11-14"] == 40.0
+        assert n.loc["2026-01-15"] == 40.0       # the fix: no more "born stale" NaN
+        assert n.loc["2026-02-13"] == 40.0
+        assert n.loc["2026-02-14"] == 42.0
+        assert n.loc["2026-06-15"] == 42.0       # late Q3 final dropped, no rollback
+        # No NaN gap anywhere from deadline through Q4 staleness window
+        assert n.loc["2025-11-14":].notna().all()
+
+    def test_final_updates_values_when_not_late_beyond_next_quarter(self, monkeypatch):
+        _patch_sql(
+            monkeypatch,
+            # Q3 on-time batch then Q3 final one month later (before Q4 events)
+            (1, "2025-09-30", "2025-11-14", 40, 400_000.0, 4_000.0, 4_000_000.0),
+            (1, "2025-09-30", "2025-12-20", 41, 410_000.0, 4_100.0, 4_100_000.0),
+        )
+
+        dates = pd.DatetimeIndex(pd.to_datetime(["2025-12-01", "2026-01-05"]))
+        panels = load_institutional_holdings_panel(
+            _DUMMY_ENGINE, dates=dates, security_ids=[1],
+        )
+
+        # On-time value first, switched to the full aggregate once final arrives
+        assert panels["n_holders"].loc["2025-12-01", 1] == 40.0
+        assert panels["n_holders"].loc["2026-01-05", 1] == 41.0
+
+
+class TestDeltaTwoStagePairing:
+    """Delta prior base = latest prior-period event with visible_date <= the
+    current event's visible_date. _patch_agg bypasses the guard, so these lock
+    the pairing rule itself (including the lookahead lock)."""
+
+    def test_ontime_current_ignores_later_prior_final(self, monkeypatch):
+        _patch_agg(
+            monkeypatch,
+            # Q3 on-time (1000 sh) and Q3 final (1100 sh, visible AFTER Q4 on-time)
+            (1, "2025-11-14", "2025-09-30", 40, 400_000.0, 1_000.0, 0.04),
+            (1, "2026-03-01", "2025-09-30", 41, 410_000.0, 1_100.0, 0.04),
+            # Q4 on-time (1200 sh) and Q4 final (1300 sh)
+            (1, "2026-02-14", "2025-12-31", 42, 420_000.0, 1_200.0, 0.04),
+            (1, "2026-03-20", "2025-12-31", 43, 430_000.0, 1_300.0, 0.04),
+        )
+
+        dates = pd.DatetimeIndex(pd.to_datetime(["2026-02-20", "2026-03-25"]))
+        panel = load_delta_institutional_ownership_panel(
+            _DUMMY_ENGINE, dates=dates, security_ids=[1],
+        )
+
+        # Q4 on-time at 2026-02-20: prior Q3 final (visible 2026-03-01) is NOT
+        # yet visible -> base is Q3 on-time's 1000, never 1100 (lookahead lock)
+        assert abs(panel.loc["2026-02-20", 1] - 0.2) < 1e-10
+        # Q4 final at 2026-03-25: prior Q3 final now visible -> base 1100
+        assert abs(panel.loc["2026-03-25", 1] - (1_300.0 - 1_100.0) / 1_100.0) < 1e-10
+
+    def test_prior_final_visible_same_day_is_valid_base(self, monkeypatch):
+        _patch_agg(
+            monkeypatch,
+            (1, "2025-11-14", "2025-09-30", 40, 400_000.0, 1_000.0, 0.04),
+            # Q3 final visible the SAME day as Q4 on-time: <= rule, not lookahead
+            (1, "2026-02-14", "2025-09-30", 41, 410_000.0, 1_100.0, 0.04),
+            (1, "2026-02-14", "2025-12-31", 42, 420_000.0, 1_200.0, 0.04),
+        )
+
+        dates = pd.DatetimeIndex(pd.to_datetime(["2026-02-20"]))
+        panel = load_delta_institutional_ownership_panel(
+            _DUMMY_ENGINE, dates=dates, security_ids=[1],
+        )
+
+        # base = Q3 final 1100 (visible_date equal is allowed): (1200-1100)/1100
+        assert abs(panel.loc["2026-02-20", 1] - (1_200.0 - 1_100.0) / 1_100.0) < 1e-10
+
+    def test_no_visible_prior_candidate_is_nan(self, monkeypatch):
+        _patch_agg(
+            monkeypatch,
+            # Q3's ONLY event (all-late final) visible after Q4 on-time
+            (1, "2026-03-01", "2025-09-30", 41, 410_000.0, 1_000.0, 0.04),
+            (1, "2026-02-14", "2025-12-31", 42, 420_000.0, 1_200.0, 0.04),
+            (1, "2026-03-20", "2025-12-31", 43, 430_000.0, 1_300.0, 0.04),
+        )
+
+        dates = pd.DatetimeIndex(pd.to_datetime(["2026-02-20", "2026-03-25"]))
+        panel = load_delta_institutional_ownership_panel(
+            _DUMMY_ENGINE, dates=dates, security_ids=[1],
+        )
+
+        # Q4 on-time: no prior-period candidate visible yet -> NaN
+        assert np.isnan(panel.loc["2026-02-20", 1])
+        # Q4 final: Q3's event visible by 2026-03-20 -> base 1000
+        assert abs(panel.loc["2026-03-25", 1] - 0.3) < 1e-10
+
+    def test_end_to_end_with_guard_straggler_final_never_used(self, monkeypatch):
+        _patch_sql(
+            monkeypatch,
+            # Q3 on-time (1000 sh); Q3 final is a straggler after Q4 events (guard drops it)
+            (1, "2025-09-30", "2025-11-14", 40, 400_000.0, 1_000.0, 4_000_000.0),
+            (1, "2025-09-30", "2026-06-07", 41, 410_000.0, 1_100.0, 4_100_000.0),
+            # Q4 on-time (1200 sh) and Q4 final (1250 sh)
+            (1, "2025-12-31", "2026-02-14", 42, 420_000.0, 1_200.0, 4_200_000.0),
+            (1, "2025-12-31", "2026-03-05", 43, 430_000.0, 1_250.0, 4_300_000.0),
+        )
+
+        dates = pd.DatetimeIndex(pd.to_datetime(["2026-02-20", "2026-03-10"]))
+        panel = load_delta_institutional_ownership_panel(
+            object(), dates=dates, security_ids=[1],
+        )
+
+        # Both Q4 events pair with Q3's on-time 1000 (the dropped straggler
+        # final never becomes a base)
+        assert abs(panel.loc["2026-02-20", 1] - 0.2) < 1e-10
+        assert abs(panel.loc["2026-03-10", 1] - 0.25) < 1e-10
 
 
 # ---------------------------------------------------------------------------
