@@ -253,6 +253,13 @@ def find_suspect_ftd_links(session) -> list:
         这里只把"窗口内出现非当前 symbol 的行"当变更信号，当前 symbol 自己的
         首发行（IPO 上市日）不触发，避免对脏历史数据误报。
 
+    rename/symbol_history 两路信号另有共同前提 symbol_held_elsewhere：当前 symbol
+    必须曾属于其他证券（securities 现值或 symbol history 任意行）。自改名到一个
+    从没人用过的全新 ticker 时（2026-07-02 复核的 ugro->flzh 实例，CIK 连续的同一
+    身份），FTD 文件里能匹配上该 symbol 的观测只可能发生在改名之后，链接必然指向
+    正确身份，CUSIP 也随同一持久身份走——没有竞争持有人就没有错链面。RECYCLE/
+    QUARANTINE 事件本身就是跨身份冲突的证据，不加此前提。
+
     无 start_date 的存量快照行用 created_at 回推保守窗口。事件按 security_id 关联，
     已被 repair_identity 拆分/重连的旧事件不会波及新归属。返回行含 identifier_id，
     供 repair_cusip_links 定位删除。
@@ -267,7 +274,19 @@ def find_suspect_ftd_links(session) -> list:
                    i.created_at AS linked_at,
                    coalesce(i.start_date, i.created_at::date - :fallback_days) AS period_start,
                    coalesce(i.start_date + :period_days, i.created_at::date) AS period_end,
-                   lower(s.symbol) AS current_symbol
+                   lower(s.symbol) AS current_symbol,
+                   (
+                       EXISTS (
+                           SELECT 1 FROM securities s2
+                           WHERE s2.id <> i.security_id
+                             AND lower(s2.symbol) = lower(s.symbol)
+                       )
+                       OR EXISTS (
+                           SELECT 1 FROM security_symbol_history h2
+                           WHERE h2.security_id <> i.security_id
+                             AND lower(h2.symbol) = lower(s.symbol)
+                       )
+                   ) AS symbol_held_elsewhere
             FROM security_identifiers i
             JOIN securities s ON s.id = i.security_id
             WHERE i.source = 'SEC_FTD' AND i.id_type = 'CUSIP'
@@ -275,7 +294,7 @@ def find_suspect_ftd_links(session) -> list:
         SELECT * FROM (
             SELECT l.identifier_id, l.security_id, l.cusip, l.start_date,
                    l.period_start, l.linked_at, l.current_symbol,
-                   EXISTS (
+                   l.symbol_held_elsewhere AND EXISTS (
                        SELECT 1 FROM security_identity_events e
                        WHERE e.security_id = l.security_id
                          AND e.event_type = 'RENAME'
@@ -294,7 +313,7 @@ def find_suspect_ftd_links(session) -> list:
                          AND e.created_at::date <= l.period_end + :grace_days
                          AND e.created_at::date >= l.period_start - :fallback_days
                    ) AS via_recycle_event,
-                   EXISTS (
+                   l.symbol_held_elsewhere AND EXISTS (
                        SELECT 1 FROM security_symbol_history h
                        WHERE h.security_id = l.security_id
                          AND lower(h.symbol) <> l.current_symbol

@@ -147,9 +147,11 @@ def _add_event(session, security_id, event_type, old_symbol, new_symbol, created
 
 class TestFtdSymbolAttribution:
     def test_rename_hijack_flagged(self, pg_db):
-        # 证券 6 月 10 日才改名获得 'hot'，5 月的 FTD 观测里的 'hot' 属于别人
+        # 证券 6 月 10 日才改名获得 'hot'（此前属于已退市的证券 2），
+        # 5 月的 FTD 观测里的 'hot' 属于别人
         with _session(pg_db) as s:
             _add_security(s, id=1, symbol="hot")
+            _add_security(s, id=2, symbol="hot", is_active=False)
             _add_event(s, 1, "RENAME", "cold", "hot", _ts(2026, 6, 10))
             _add_ftd_identifier(s, 1, "111111111", date(2026, 5, 1), _ts(2026, 7, 1))
             s.commit()
@@ -159,10 +161,25 @@ class TestFtdSymbolAttribution:
             assert rows[0].identifier_id is not None
             assert audit.check_ftd_symbol_attribution(s, limit=10) == 1
 
+    def test_rename_to_fresh_ticker_not_flagged(self, pg_db):
+        # 同一身份改名到从没人用过的全新 ticker（ugro->flzh 实例）：
+        # 没有竞争持有人，FTD 能匹配上该 symbol 的观测必然指向本证券，不报
+        with _session(pg_db) as s:
+            _add_security(s, id=1, symbol="flzh")
+            _add_event(s, 1, "RENAME", "ugro", "flzh", _ts(2026, 6, 10))
+            s.add(SecuritySymbolHistory(
+                security_id=1, symbol="ugro", source="MASSIVE",
+                event_type="ticker_change", start_date=date(2026, 6, 10),
+            ))
+            _add_ftd_identifier(s, 1, "111111111", date(2026, 5, 1), _ts(2026, 7, 1))
+            s.commit()
+            assert audit.find_suspect_ftd_links(s) == []
+
     def test_rename_after_link_creation_not_flagged(self, pg_db):
         # 链接建立在改名之前：当时匹配是对的，之后的改名不追溯否定 CUSIP 归属
         with _session(pg_db) as s:
             _add_security(s, id=1, symbol="hot")
+            _add_security(s, id=2, symbol="hot", is_active=False)
             _add_event(s, 1, "RENAME", "cold", "hot", _ts(2026, 6, 10))
             _add_ftd_identifier(s, 1, "111111111", date(2026, 3, 1), _ts(2026, 4, 1))
             s.commit()
@@ -172,6 +189,7 @@ class TestFtdSymbolAttribution:
         # 改名早于观测期起点：观测到的已经是改名后的 symbol，链接正确
         with _session(pg_db) as s:
             _add_security(s, id=1, symbol="hot")
+            _add_security(s, id=2, symbol="hot", is_active=False)
             _add_event(s, 1, "RENAME", "cold", "hot", _ts(2026, 1, 10))
             _add_ftd_identifier(s, 1, "111111111", date(2026, 5, 1), _ts(2026, 7, 1))
             s.commit()
@@ -207,9 +225,11 @@ class TestFtdSymbolAttribution:
             assert audit.find_suspect_ftd_links(s) == []
 
     def test_symbol_history_flux_flagged(self, pg_db):
-        # 无身份事件（早于事件表上线）的存量改名：symbol history 显示窗口内换过代码
+        # 无身份事件（早于事件表上线）的存量改名：symbol history 显示窗口内换过代码，
+        # 且当前 symbol 曾属于别的证券（存在竞争持有人）
         with _session(pg_db) as s:
             _add_security(s, id=1, symbol="cur")
+            _add_security(s, id=2, symbol="cur", is_active=False)
             s.add(SecuritySymbolHistory(
                 security_id=1, symbol="old", source="MASSIVE",
                 event_type="ticker_change", start_date=date(2026, 6, 10),
@@ -219,6 +239,19 @@ class TestFtdSymbolAttribution:
             rows = audit.find_suspect_ftd_links(s)
             assert len(rows) == 1
             assert rows[0].via_symbol_history is True
+
+    def test_symbol_history_flux_to_fresh_ticker_not_flagged(self, pg_db):
+        # 窗口内换过代码但换到的是全新 ticker（没有竞争持有人）：CUSIP 随同一
+        # 持久身份走，链接必然正确，不报
+        with _session(pg_db) as s:
+            _add_security(s, id=1, symbol="cur")
+            s.add(SecuritySymbolHistory(
+                security_id=1, symbol="old", source="MASSIVE",
+                event_type="ticker_change", start_date=date(2026, 6, 10),
+            ))
+            _add_ftd_identifier(s, 1, "333333333", date(2026, 5, 1), _ts(2026, 7, 1))
+            s.commit()
+            assert audit.find_suspect_ftd_links(s) == []
 
     def test_ipo_first_listing_history_not_flagged(self, pg_db):
         # 新上市首发行（history 只有当前 symbol 自己）不是改名信号，不得误报 IPO
@@ -256,6 +289,7 @@ def _add_holding(session, hash_ch, cusip, security_id):
 class TestRepairCusipLinks:
     def _seed_bad_link(self, s):
         _add_security(s, id=1, symbol="hot")
+        _add_security(s, id=2, symbol="hot", is_active=False)  # 竞争持有人：错链面存在
         _add_event(s, 1, "RENAME", "cold", "hot", _ts(2026, 6, 10))
         _add_ftd_identifier(s, 1, "111111111", date(2026, 5, 1), _ts(2026, 7, 1))
         _add_holding(s, "a", "111111111", security_id=1)   # 经错链回填，应重置
@@ -302,6 +336,7 @@ class TestRepairCusipLinks:
     def test_limit_caps_plans(self, pg_db):
         with _session(pg_db) as s:
             _add_security(s, id=1, symbol="hot")
+            _add_security(s, id=2, symbol="hot", is_active=False)
             _add_event(s, 1, "RENAME", "cold", "hot", _ts(2026, 6, 10))
             _add_ftd_identifier(s, 1, "111111111", date(2026, 5, 1), _ts(2026, 7, 1))
             _add_ftd_identifier(s, 1, "222222222", date(2026, 5, 1), _ts(2026, 7, 1))
