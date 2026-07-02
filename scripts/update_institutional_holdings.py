@@ -58,12 +58,19 @@ def discover_filings(source: SecEdgarSource, args: argparse.Namespace) -> list[d
     if args.since:
         day = date.fromisoformat(args.since)
         today = date.today()
+        missing_index_days = 0
         while day <= today:
             if day.weekday() < 5:
                 index_text = source.fetch_daily_form_index(day)
                 if index_text:
                     refs.extend(parse_form_index(index_text, FORM_13F_TYPES))
+                else:
+                    # 假日属正常（weekday 只是交易日近似）；连续多日缺失需人工核查
+                    missing_index_days += 1
+                    logger.warning("{} 为工作日但 SEC 未发布 daily form index。", day)
             day += timedelta(days=1)
+        if missing_index_days:
+            logger.warning("--since 扫描共 {} 个工作日缺少 daily form index。", missing_index_days)
 
     deduped = {ref["accession_number"]: ref for ref in refs}
     refs = list(deduped.values())
@@ -95,13 +102,32 @@ def filter_pending(db_manager: DatabaseManager, refs: list[dict]) -> list[dict]:
 
 
 def load_cusip_map(db_manager: DatabaseManager) -> dict[str, int]:
+    """CUSIP -> security_id 写时映射；只接受无歧义映射。
+
+    一个 CUSIP 对应多个 security_id 时整体剔除并告警——与
+    reference_data.map_unlinked_holdings_to_securities 的
+    HAVING count(DISTINCT security_id) = 1 语义一致，绝不 last-wins 错链。
+    """
     with db_manager.get_session() as session:
         rows = (
             session.query(SecurityIdentifier.id_value, SecurityIdentifier.security_id)
             .filter(SecurityIdentifier.id_type == "CUSIP")
             .all()
         )
-    return {value.upper(): security_id for value, security_id in rows}
+    ids_by_cusip: dict[str, set[int]] = {}
+    for value, security_id in rows:
+        ids_by_cusip.setdefault(value.upper(), set()).add(security_id)
+    ambiguous = sorted(c for c, ids in ids_by_cusip.items() if len(ids) > 1)
+    if ambiguous:
+        logger.warning(
+            "剔除 {} 个歧义 CUSIP 映射（一对多 security_id）: {}",
+            len(ambiguous), ", ".join(ambiguous[:20]) + ("…" if len(ambiguous) > 20 else ""),
+        )
+    return {
+        cusip: next(iter(ids))
+        for cusip, ids in ids_by_cusip.items()
+        if len(ids) == 1
+    }
 
 
 def process_filing(
@@ -119,6 +145,14 @@ def process_filing(
         row["filer_cik"] = row["filer_cik"] or ref["filer_cik"]
         row["form_type"] = row.get("form_type") or ref["form_type"]
         row["filing_date"] = ref["filing_date"]
+    # period=NULL 的行对消费端（period is not null 过滤）永久不可见，且 filter_pending
+    # 按 accession 判"已完成"后不再重解析——解析器 SGML 头回填仍缺时拒写，留在 pending。
+    missing = sorted(
+        {field for row in rows for field in ("period", "filer_cik", "form_type") if not row.get(field)}
+    )
+    if missing:
+        raise ValueError(f"关键字段缺失（primary_doc 与 SGML 头均无）: {', '.join(missing)}，拒绝写库")
+    for row in rows:
         cusip = (row.get("cusip") or "").upper()
         if cusip in cusip_map:
             row["security_id"] = cusip_map[cusip]

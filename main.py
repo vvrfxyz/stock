@@ -44,6 +44,7 @@ from scripts.health_report import main as health_report_main
 from scripts.cleanup_us_universe import main as cleanup_us_universe_main
 from scripts.migrate_database import main as migrate_main
 from db_manager import DatabaseManager
+from utils.massive_task import TaskResult
 from utils.script_logging import setup_logging as configure_script_logging
 from utils.trading_calendar import get_last_completed_trading_date, shift_trading_date
 
@@ -65,18 +66,27 @@ def execute_script(main_func, args_list):
     """
     调用子脚本的 main(argv)，并把非零 int 返回码统一转换为 SystemExit，
     使调度层可以按退出码感知失败。
+
+    返回脚本随退出码附带的 stats dict（TaskResult.stats 或 (exit_code, stats) 元组；
+    无统计时为 None）；失败时 stats 挂在 SystemExit.code（TaskResult）上，
+    调度层两条路径都能把统计写进 pipeline_task_runs。
     """
     script_name = main_func.__module__ + ".py"
     try:
         logger.debug(f"正在执行: {script_name} with args: {args_list}")
         result = main_func(args_list)
-        if type(result) is int and result != 0:
-            raise SystemExit(result)
+        stats = getattr(result, "stats", None)
+        if isinstance(result, tuple) and len(result) == 2:
+            result, stats = result
+        if isinstance(result, int) and not isinstance(result, bool) and result != 0:
+            raise SystemExit(TaskResult(int(result), stats))
+        return stats
     except SystemExit as e:
         # argparse 的 --help 会触发 SystemExit(0)，这是正常行为
         if e.code != 0:
             logger.error(f"脚本 {script_name} 异常退出，退出码: {e.code}")
             raise
+        return None
 
 
 # ==============================================================================
@@ -92,7 +102,7 @@ def run_update(args):
     market = (args.market or "US").upper()
     if market != "US":
         logger.critical("update 当前仅支持 US 市场。")
-        return
+        raise SystemExit(2)
 
     symbols = [symbol.lower() for symbol in getattr(args, "symbols", []) if symbol]
 
@@ -357,10 +367,12 @@ def run_scheduled_update(args):
                 pass
         exit_code = 0
         error_msg = None
+        stats = None
         try:
-            execute_script(step.main_func, step.args)
+            stats = execute_script(step.main_func, step.args)
         except SystemExit as exc:
             exit_code = exc.code or 1
+            stats = getattr(exc.code, "stats", None)
             error_msg = f"exit={exc.code}"
             severity = "BLOCKING" if exc.code == 2 else "WARNING"
             failed_steps.append(f"{step.name}(exit={exc.code},{severity})")
@@ -372,7 +384,9 @@ def run_scheduled_update(args):
             logger.opt(exception=exc).error("步骤 {} 发生未捕获异常，继续执行后续步骤: {}", step.name, exc)
         if db_for_tracking and task_run_id:
             try:
-                db_for_tracking.finish_task_run(task_run_id, exit_code=exit_code, error_sample=error_msg)
+                db_for_tracking.finish_task_run(
+                    task_run_id, exit_code=exit_code, error_sample=error_msg, stats=stats
+                )
             except Exception:
                 pass
 
@@ -478,6 +492,7 @@ def run_update_adjustment_factors(args):
     logger.info("执行: 重建/对账复权因子 reference/cache")
     cli_args = []
     if args.all: cli_args.append('--all')
+    if getattr(args, 'changed_since', 0): cli_args.extend(['--changed-since', str(args.changed_since)])
     if args.market: cli_args.extend(['--market', args.market])
     if args.source: cli_args.extend(['--source', args.source])
     if args.limit > 0: cli_args.extend(['--limit', str(args.limit)])
@@ -486,6 +501,8 @@ def run_update_adjustment_factors(args):
     if args.refresh_vendor_daily_bars: cli_args.append('--refresh-vendor-daily-bars')
     if args.daily_start_date: cli_args.extend(['--daily-start-date', args.daily_start_date])
     if args.daily_end_date: cli_args.extend(['--daily-end-date', args.daily_end_date])
+    if getattr(args, 'fail_on_vendor_mismatch', False): cli_args.append('--fail-on-vendor-mismatch')
+    if getattr(args, 'max_mismatch_rate', None) is not None: cli_args.extend(['--max-mismatch-rate', str(args.max_mismatch_rate)])
     cli_args.extend(args.symbols)
     execute_script(update_adjustment_factors_main, cli_args)
 
@@ -649,7 +666,7 @@ def run_rebuild_massive_dataset(args):
     market = (args.market or "US").upper()
     if market != "US":
         logger.critical("rebuild_massive_dataset 当前仅支持 US。")
-        return
+        raise SystemExit(2)
 
     end_trading_date = get_last_completed_trading_date(market)
     start_trading_date = shift_trading_date(market, end_trading_date, sessions=-4)
@@ -708,10 +725,8 @@ def run_migrate(args):
 #  主函数：命令行解析器
 # ==============================================================================
 
-def main():
-    """主程序入口，负责解析命令行参数并分发任务"""
-    setup_logging()
-
+def build_parser() -> argparse.ArgumentParser:
+    """构建中央控制器的命令行解析器（独立函数便于测试子命令注册与转发）。"""
     parser = argparse.ArgumentParser(
         description="美股数据系统中央控制器",
         formatter_class=argparse.RawTextHelpFormatter
@@ -897,6 +912,7 @@ def main():
     p_adjustment = subparsers.add_parser('update_adjustment_factors', help="重建内部复权因子 cache，并与供应商 reference 对账")
     p_adjustment.add_argument('symbols', nargs='*', help="要处理的股票代码列表。")
     p_adjustment.add_argument('--all', action='store_true', help='处理所有保留类型 CS/ETF（含 inactive，用于避免退市股因子缺口）。')
+    p_adjustment.add_argument('--changed-since', type=int, default=0, help="只重建最近 N 天公司行动有新增或修订的证券（增量重建）。")
     p_adjustment.add_argument('--market', type=str, default='US', help="当前仅支持 US。")
     p_adjustment.add_argument('--source', type=str, default='MASSIVE', help="公司行动/供应商因子来源。")
     p_adjustment.add_argument('--limit', type=int, default=0, help="限制处理证券数量。")
@@ -905,6 +921,8 @@ def main():
     p_adjustment.add_argument('--refresh-vendor-daily-bars', action='store_true', help="额外拉取 Massive adjusted/raw 日线 reference 因子。")
     p_adjustment.add_argument('--daily-start-date', type=str, help="refresh vendor daily bars 的开始日期。")
     p_adjustment.add_argument('--daily-end-date', type=str, help="refresh vendor daily bars 的结束日期。")
+    p_adjustment.add_argument('--fail-on-vendor-mismatch', action='store_true', help="存在 vendor mismatch 时以非零退出码结束（周末全量重建严格模式）。")
+    p_adjustment.add_argument('--max-mismatch-rate', type=float, default=None, help="允许的最大 vendor mismatch 比率 (0.0-1.0)，超过则非零退出。")
     p_adjustment.set_defaults(func=run_update_adjustment_factors)
 
     p_cleanup_us = subparsers.add_parser('cleanup_us_universe', help="清理 US 中非普通股 / ETF 证券")
@@ -924,7 +942,14 @@ def main():
     p_health.add_argument('--days', type=int, default=7, help="回看天数。")
     p_health.set_defaults(func=run_health_report)
 
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    """主程序入口，负责解析命令行参数并分发任务"""
+    setup_logging()
+
+    args = build_parser().parse_args()
     args.func(args)
 
 

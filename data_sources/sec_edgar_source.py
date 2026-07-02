@@ -35,6 +35,11 @@ _ARCHIVES_ROOT = "https://www.sec.gov/Archives"
 _DEFAULT_TIMEOUT = 30
 _MIN_REQUEST_INTERVAL = 1.0 / 8  # 8 req/s，低于 SEC 10 req/s 上限
 
+# SEC 限流封禁页（403）的响应体签名；命中才视为可退避重试的限流
+_SEC_RATE_LIMIT_SIGNATURES = ("Request Rate Threshold", "Undeclared Automated Tool")
+_FORM_INDEX_MAX_ATTEMPTS = 4
+_FORM_INDEX_BACKOFF_SECONDS = 10.0
+
 
 def normalize_cik(value: Any) -> str | None:
     """CIK 规范形式：去前导零的纯数字字符串；securities.cik 沿用 Massive 的 10 位补零格式，
@@ -74,6 +79,15 @@ def _parse_datetime(value: Any) -> datetime | None:
         return datetime.fromisoformat(str(value))
     except ValueError:
         return None
+
+
+def _is_sec_rate_limited(response: requests.Response) -> bool:
+    """403 响应体是否为 SEC 限流封禁页（区别于 UA 不合规等永久性 403）。"""
+    try:
+        body = response.text or ""
+    except Exception:
+        return False
+    return any(sig in body for sig in _SEC_RATE_LIMIT_SIGNATURES)
 
 
 class SecEdgarSource:
@@ -268,15 +282,36 @@ class SecEdgarSource:
     # ------------------------------------------------------------------
 
     def fetch_daily_form_index(self, day: date) -> str | None:
-        """抓取某交易日的 daily form index 文本；非工作日/未发布返回 None。"""
+        """抓取某交易日的 daily form index 文本。
+
+        仅 404 视为"该日未发布索引"返回 None（假日/未生成）；403 若响应体带
+        SEC 限流签名则退避重试，重试耗尽后抛出——绝不把限流当"非工作日"静默
+        跳过（会永久丢失该日的 filing 发现）。其他 4xx/5xx 一律抛出。
+        """
         quarter = (day.month - 1) // 3 + 1
         url = _DAILY_FORM_INDEX_URL.format(year=day.year, quarter=quarter, ymd=day.strftime("%Y%m%d"))
-        try:
-            return self._get_text(url)
-        except requests.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code in (403, 404):
-                return None
-            raise
+        for attempt in range(1, _FORM_INDEX_MAX_ATTEMPTS + 1):
+            try:
+                return self._get_text(url)
+            except requests.HTTPError as exc:
+                response = exc.response
+                if response is not None and response.status_code == 404:
+                    return None
+                if (
+                    response is not None
+                    and response.status_code == 403
+                    and _is_sec_rate_limited(response)
+                    and attempt < _FORM_INDEX_MAX_ATTEMPTS
+                ):
+                    wait = _FORM_INDEX_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                    logger.warning(
+                        "SEC 限流 403（{}，第 {}/{} 次），{}s 后重试。",
+                        day, attempt, _FORM_INDEX_MAX_ATTEMPTS, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
+        raise RuntimeError(f"SEC daily form index 重试耗尽: {url}")  # pragma: no cover
 
     def fetch_quarterly_form_index(self, year: int, quarter: int) -> str:
         return self._get_text(_QUARTERLY_FORM_INDEX_URL.format(year=year, quarter=quarter))
@@ -592,6 +627,18 @@ def _parse_us_date(value: str | None) -> date | None:
         return None
 
 
+def _parse_sgml_header_field(submission_text: str, field: str) -> str | None:
+    """从全文提交的 SGML 头（<SEC-HEADER> 段）取字段值，如 'CONFORMED PERIOD OF REPORT'。"""
+    header_end = submission_text.find("</SEC-HEADER>")
+    header = submission_text[:header_end] if header_end >= 0 else submission_text[:4096]
+    marker = f"{field}:"
+    idx = header.find(marker)
+    if idx < 0:
+        return None
+    value = header[idx + len(marker):].split("\n", 1)[0].strip()
+    return value or None
+
+
 def _extract_xml_documents(submission_text: str) -> list[tuple[str, str]]:
     """从全文提交 .txt 中提取 (filename, xml_text) 列表。"""
     documents = []
@@ -622,6 +669,8 @@ def parse_thirteenf_submission(submission_text: str, accession_number: str) -> l
     """13F-HR 全文提交 -> institutional_holdings 行。
 
     primary_doc（edgarSubmission）给 filer/period 元数据，informationTable 给逐持仓行。
+    primary_doc 损坏/缺失时从 SGML 头回填 period/form_type/filer_cik（零额外请求）——
+    period 为 NULL 的行入库后对消费端永久不可见，宁可回填也不裸写。
     行哈希用 accession + 表内序号（同一 filing 中可能存在完全相同的持仓行，
     内容哈希会误去重）。
     """
@@ -652,6 +701,14 @@ def parse_thirteenf_submission(submission_text: str, accession_number: str) -> l
         file_number = _text_ns(primary_root, "form13FFileNumber")
         manager = _find_ns(primary_root, "filingManager")
         filer_name = _text_ns(manager, "name")
+
+    # SGML 头回退（CONFORMED PERIOD OF REPORT 为 YYYYMMDD）
+    if period is None:
+        period = _parse_index_date(_parse_sgml_header_field(submission_text, "CONFORMED PERIOD OF REPORT") or "")
+    if form_type is None:
+        form_type = _parse_sgml_header_field(submission_text, "CONFORMED SUBMISSION TYPE")
+    if filer_cik is None:
+        filer_cik = cik_to_10digit(_parse_sgml_header_field(submission_text, "CENTRAL INDEX KEY"))
 
     rows = []
     entry_index = 0

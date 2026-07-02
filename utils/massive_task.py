@@ -33,6 +33,21 @@ from utils.massive_config import (
 from utils.script_logging import setup_logging
 
 
+class TaskResult(int):
+    """int 退出码 + 可选 stats 附件。
+
+    对 `raise SystemExit(main())` 和 `== 0` 判断保持纯 int 语义；
+    调度层（main.execute_script）通过 .stats 拿到统计并写入 pipeline_task_runs。
+    """
+
+    stats: dict | None
+
+    def __new__(cls, exit_code: int, stats: dict | None = None) -> "TaskResult":
+        obj = super().__new__(cls, exit_code)
+        obj.stats = stats
+        return obj
+
+
 def build_standard_parser(
     description: str,
     *,
@@ -143,13 +158,14 @@ def run_massive_task(
     task_name: str,
     argv: list[str] | None,
     parser_factory: Callable[[], argparse.ArgumentParser],
-    runner: Callable[[argparse.Namespace, MassiveSource, DatabaseManager], int | None],
+    runner: Callable[[argparse.Namespace, MassiveSource, DatabaseManager], int | tuple[int, dict] | None],
 ) -> int:
     """脚本 main(argv) 的统一外壳：解析参数、构建/释放运行时、兜底异常与耗时。
 
     runner 可以返回:
     - int: 退出码
-    - (int, dict): 退出码 + 统计摘要（写入 pipeline_task_runs.error_sample 供 health_report 展示）
+    - (int, dict): 退出码 + 统计摘要，以 TaskResult.stats 附件返回给调度层
+      （execute_script 转交 finish_task_run 写入 pipeline_task_runs 供 health_report 展示）
     - None: 视为 0
     """
     start_time = time.monotonic()
@@ -168,7 +184,7 @@ def run_massive_task(
         if isinstance(result, tuple):
             exit_code, stats = result
             logger.info("任务统计: {}", stats)
-            return exit_code
+            return TaskResult(exit_code, stats)
         return result if isinstance(result, int) else 0
     except Exception as e:
         logger.opt(exception=e).critical("{} 执行失败: {}", task_name, e)

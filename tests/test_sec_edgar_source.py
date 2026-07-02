@@ -1,7 +1,11 @@
 import unittest
 from datetime import date
+from unittest import mock
+
+import requests
 
 from data_sources.sec_edgar_source import (
+    _FORM_INDEX_MAX_ATTEMPTS,
     SecEdgarSource,
     cik_to_10digit,
     normalize_cik,
@@ -41,6 +45,89 @@ class FakeSession:
 
 def _source(payload_by_url_part):
     return SecEdgarSource(session=FakeSession(payload_by_url_part), user_agent="test test@example.com")
+
+
+class FakeHttpResponse:
+    """带状态码/响应体的替身；raise_for_status 行为与 requests 对齐。"""
+
+    def __init__(self, status_code=200, text=""):
+        self.status_code = status_code
+        self.text = text
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"status {self.status_code}", response=self)
+
+
+class SequenceSession:
+    """按调用顺序吐出预置响应；用于限流重试路径测试。"""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.headers = {}
+        self.calls = []
+
+    def mount(self, *args, **kwargs):
+        return None
+
+    def get(self, url, timeout=None):
+        self.calls.append(url)
+        return self.responses.pop(0)
+
+
+# SEC 限流封禁页的两种签名文案（真实页面两句都有，这里各取一种覆盖 any() 分支）
+RATE_LIMIT_BODY_THRESHOLD = "<html><p>Your request rate has exceeded the SEC's Request Rate Threshold.</p></html>"
+RATE_LIMIT_BODY_AUTOMATED = "<html><h1>Your Request Originates from an Undeclared Automated Tool</h1></html>"
+
+
+class DailyFormIndexTests(unittest.TestCase):
+    DAY = date(2026, 6, 10)
+
+    def _fetch(self, responses):
+        session = SequenceSession(responses)
+        source = SecEdgarSource(session=session, user_agent="test test@example.com")
+        with mock.patch("data_sources.sec_edgar_source.time.sleep"):
+            return source.fetch_daily_form_index(self.DAY), session
+
+    def test_404_means_not_published_returns_none(self):
+        result, session = self._fetch([FakeHttpResponse(404, "Not Found")])
+        self.assertIsNone(result)
+        self.assertEqual(len(session.calls), 1)
+
+    def test_403_rate_limited_retries_then_succeeds(self):
+        result, session = self._fetch(
+            [
+                FakeHttpResponse(403, RATE_LIMIT_BODY_THRESHOLD),
+                FakeHttpResponse(403, RATE_LIMIT_BODY_AUTOMATED),
+                FakeHttpResponse(200, "form index text"),
+            ]
+        )
+        self.assertEqual(result, "form index text")
+        self.assertEqual(len(session.calls), 3)
+
+    def test_403_rate_limited_exhausted_raises_not_none(self):
+        session = SequenceSession(
+            [FakeHttpResponse(403, RATE_LIMIT_BODY_THRESHOLD)] * (_FORM_INDEX_MAX_ATTEMPTS + 2)
+        )
+        source = SecEdgarSource(session=session, user_agent="test test@example.com")
+        with mock.patch("data_sources.sec_edgar_source.time.sleep"):
+            with self.assertRaises(requests.HTTPError):
+                source.fetch_daily_form_index(self.DAY)
+        # 重试耗尽后必须抛出（本次运行失败），绝不能静默当"非工作日"
+        self.assertEqual(len(session.calls), _FORM_INDEX_MAX_ATTEMPTS)
+
+    def test_403_without_rate_limit_signature_raises_immediately(self):
+        session = SequenceSession([FakeHttpResponse(403, "<html>Forbidden</html>")])
+        source = SecEdgarSource(session=session, user_agent="test test@example.com")
+        with self.assertRaises(requests.HTTPError):
+            source.fetch_daily_form_index(self.DAY)
+        self.assertEqual(len(session.calls), 1)
+
+    def test_5xx_not_swallowed(self):
+        session = SequenceSession([FakeHttpResponse(500, "Server Error")])
+        source = SecEdgarSource(session=session, user_agent="test test@example.com")
+        with self.assertRaises(requests.HTTPError):
+            source.fetch_daily_form_index(self.DAY)
 
 
 class CikNormalizationTests(unittest.TestCase):

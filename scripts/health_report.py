@@ -64,14 +64,12 @@ def report_table_freshness(session) -> int:
         try:
             row = session.execute(text(sql)).one()
             n, latest = row[0], row[1]
-            status = "OK" if n > 0 else "EMPTY"
             if n == 0:
                 issues += 1
             logger.info("  {:40s}  rows={:>10,}  latest={}", table_name, n, latest or "NULL")
         except Exception as exc:
             session.rollback()
             logger.warning("  {:40s}  ERROR: {}", table_name, exc)
-            issues += 1
             issues += 1
     return issues
 
@@ -160,7 +158,16 @@ def report_pipeline_runs(session, days: int) -> int:
         ORDER BY task_name, status
     """), {"days": days}).all()
 
-    if not rows:
+    # 被 kill 的步骤不会回写 ended_at/status，永久停留 RUNNING；超过 12 小时按失败计 P1
+    stuck_rows = session.execute(text("""
+        SELECT task_name, run_id, started_at
+        FROM pipeline_task_runs
+        WHERE status = 'RUNNING'
+          AND started_at < now() - interval '12 hours'
+        ORDER BY started_at DESC
+    """)).all()
+
+    if not rows and not stuck_rows:
         logger.info("  无 pipeline_task_runs 记录（首次运行前正常）。")
         return 0
 
@@ -174,6 +181,12 @@ def report_pipeline_runs(session, days: int) -> int:
                     mark, task_name, status, cnt, max_dur or "-", last_run or "-")
         if status == "FAILED":
             issues += cnt
+
+    if stuck_rows:
+        issues += len(stuck_rows)
+        logger.warning("  [P1] 停留 RUNNING 超过 12 小时（进程疑似被 kill）: {} 条", len(stuck_rows))
+        for task_name, run_id, started_at in stuck_rows[:5]:
+            logger.warning("    {} [{}] started={}", task_name, run_id, started_at)
 
     # 最近失败样例
     recent_failures = session.execute(text("""
@@ -227,6 +240,72 @@ def report_price_data_consistency(session) -> tuple[int, int]:
     return p0, p1
 
 
+def _is_standard_quarter_end(d: date) -> bool:
+    """标准 13F 季末：3/6/9/12 月的最后一天。"""
+    return d.month in (3, 6, 9, 12) and (d + timedelta(days=1)).month != d.month
+
+
+def report_institutional_holdings_completeness(session, today: date | None = None) -> int:
+    """13F reporting period coverage guardrail."""
+    _section("13F 持仓覆盖")
+    today = today or date.today()
+    p1 = 0
+    # 只把标准季末 period 纳入候选，防 EDGAR 畸形 period 以 filings=1 永久占据 LIMIT 4 名额
+    rows = session.execute(text("""
+        SELECT period,
+               count(distinct accession_number) as filings,
+               count(*) as rows,
+               count(*) FILTER (WHERE security_id IS NOT NULL) as mapped_rows,
+               round(
+                   100.0 * count(*) FILTER (WHERE security_id IS NOT NULL)
+                   / nullif(count(*), 0),
+                   2
+               ) as mapped_pct
+        FROM institutional_holdings
+        WHERE period IS NOT NULL
+          AND period = (date_trunc('quarter', period) + interval '3 months' - interval '1 day')::date
+        GROUP BY period
+        ORDER BY period DESC
+        LIMIT 4
+    """)).all()
+    if not rows:
+        logger.warning("  [P1] institutional_holdings 无 period 覆盖数据。")
+        return 1
+
+    min_filings = 1000
+    min_mapped_pct = 85.0
+    # 13F 申报截止为 period 后 45 天，加缓冲取 60 天判定申报窗口是否已关闭
+    deadline_buffer = timedelta(days=60)
+    for period, filings, n_rows, mapped_rows, mapped_pct in reversed(rows):
+        if not _is_standard_quarter_end(period):
+            logger.info("  period={}  非标准季末（EDGAR 畸形 period），忽略", period)
+            continue
+        mapped_pct_value = float(mapped_pct or 0.0)
+        logger.info(
+            "  period={}  filings={:>6,}  rows={:>10,}  mapped={:>10,}  mapped_pct={:.2f}%",
+            period,
+            filings,
+            n_rows,
+            mapped_rows,
+            mapped_pct_value,
+        )
+        if period + deadline_buffer >= today:
+            logger.info("    在途季度（申报截止未过），仅展示不计入阈值")
+            continue
+        if filings < min_filings or mapped_pct_value < min_mapped_pct:
+            p1 += 1
+            logger.warning(
+                "    [P1] 13F 覆盖低于阈值: filings={} (min={}), mapped_pct={:.2f}% (min={:.2f}%)",
+                filings,
+                min_filings,
+                mapped_pct_value,
+                min_mapped_pct,
+            )
+    if p1 == 0:
+        logger.info("  13F 最近 reporting periods 覆盖: OK")
+    return p1
+
+
 def report_staleness(session) -> int:
     """P2 advisory: 各数据域的新鲜度。"""
     _section("数据新鲜度 (P2 Advisory)")
@@ -266,6 +345,7 @@ def main(argv: list[str] | None = None) -> int:
                 ("securities_summary", lambda: report_securities_summary(session)),
                 ("table_freshness", lambda: report_table_freshness(session)),
                 ("price_consistency", lambda: report_price_data_consistency(session)),
+                ("institutional_holdings_completeness", lambda: report_institutional_holdings_completeness(session)),
                 ("identity_health", lambda: report_identity_health(session)),
                 ("pipeline_runs", lambda: report_pipeline_runs(session, args.days)),
                 ("staleness", lambda: report_staleness(session)),
@@ -278,6 +358,8 @@ def main(argv: list[str] | None = None) -> int:
                     elif name == "price_consistency":
                         p0_total += result[0]
                         p1_total += result[1]
+                    elif name == "institutional_holdings_completeness":
+                        p1_total += result
                     elif name == "identity_health":
                         p0_total += result
                     elif name == "pipeline_runs":

@@ -1,8 +1,12 @@
 """EDGAR form index 与 13F-HR 全文提交解析的单元测试。"""
 from datetime import date
 from decimal import Decimal
+from unittest.mock import MagicMock
+
+import pytest
 
 from data_sources.sec_edgar_source import parse_form_index, parse_thirteenf_submission
+from scripts.update_institutional_holdings import load_cusip_map, process_filing
 
 FORM_INDEX_TEXT = """Description:           Daily Index of EDGAR Dissemination Feed by Form Type
 Last Data Received:    Jun 10, 2026
@@ -171,3 +175,90 @@ class TestParseThirteenfSubmission:
     def test_submission_without_information_table_returns_empty(self):
         head, _, _ = THIRTEENF_SUBMISSION.partition("<DOCUMENT>\n<TYPE>INFORMATION TABLE")
         assert parse_thirteenf_submission(head, "acc") == []
+
+
+# primary_doc XML 损坏（标签不闭合 -> ParseError）但 information table 完好
+BROKEN_PRIMARY_DOC = THIRTEENF_SUBMISSION.replace("</edgarSubmission>", "</edgarSubmissionX>")
+
+# SGML 头含 CONFORMED PERIOD OF REPORT / CENTRAL INDEX KEY 的损坏 primary_doc 变体
+BROKEN_PRIMARY_WITH_HEADER = BROKEN_PRIMARY_DOC.replace(
+    "CONFORMED SUBMISSION TYPE:\t13F-HR\n",
+    "CONFORMED SUBMISSION TYPE:\t13F-HR\n"
+    "CONFORMED PERIOD OF REPORT:\t20251231\n"
+    "CENTRAL INDEX KEY:\t\t\t0001779506\n",
+)
+
+
+class TestSgmlHeaderFallback:
+    def test_period_and_cik_backfilled_from_sgml_header(self):
+        rows = parse_thirteenf_submission(BROKEN_PRIMARY_WITH_HEADER, "0001779506-26-000002")
+        assert len(rows) == 2
+        for row in rows:
+            assert row["period"] == date(2025, 12, 31)
+            assert row["form_type"] == "13F-HR"
+            assert row["filer_cik"] == "0001779506"
+
+    def test_period_stays_none_when_header_also_missing(self):
+        rows = parse_thirteenf_submission(BROKEN_PRIMARY_DOC, "0001779506-26-000002")
+        assert len(rows) == 2
+        assert all(row["period"] is None for row in rows)
+        # form_type 仍能从 CONFORMED SUBMISSION TYPE 回填
+        assert all(row["form_type"] == "13F-HR" for row in rows)
+
+    def test_intact_primary_doc_takes_precedence_over_header(self):
+        with_header = THIRTEENF_SUBMISSION.replace(
+            "CONFORMED SUBMISSION TYPE:\t13F-HR\n",
+            "CONFORMED SUBMISSION TYPE:\t13F-HR\nCONFORMED PERIOD OF REPORT:\t20240630\n",
+        )
+        rows = parse_thirteenf_submission(with_header, "acc")
+        assert all(row["period"] == date(2025, 12, 31) for row in rows)
+
+
+def _ref() -> dict:
+    return {
+        "accession_number": "0001779506-26-000002",
+        "filer_cik": "0001779506",
+        "form_type": "13F-HR",
+        "filing_date": date(2026, 6, 10),
+        "file_path": "edgar/data/1779506/0001779506-26-000002.txt",
+    }
+
+
+class TestProcessFiling:
+    def test_period_null_rejected_and_not_written(self):
+        source = MagicMock()
+        source.fetch_full_submission.return_value = BROKEN_PRIMARY_DOC
+        db = MagicMock()
+        with pytest.raises(ValueError, match="period"):
+            process_filing(_ref(), source, db, {})
+        db.upsert_institutional_holdings.assert_not_called()
+
+    def test_period_backfilled_rows_written_with_cusip_map(self):
+        source = MagicMock()
+        source.fetch_full_submission.return_value = BROKEN_PRIMARY_WITH_HEADER
+        db = MagicMock()
+        db.upsert_institutional_holdings.return_value = 2
+        status, written = process_filing(_ref(), source, db, {"037833100": 42})
+        assert status == "SUCCESS"
+        assert written == 2
+        rows = db.upsert_institutional_holdings.call_args[0][0]
+        assert all(row["period"] == date(2025, 12, 31) for row in rows)
+        by_cusip = {row["cusip"]: row for row in rows}
+        assert by_cusip["037833100"]["security_id"] == 42
+        assert "security_id" not in by_cusip["78462F103"]
+
+
+class TestLoadCusipMap:
+    def test_ambiguous_cusip_excluded(self):
+        session = MagicMock()
+        session.query.return_value.filter.return_value.all.return_value = [
+            ("037833100", 1),
+            ("78462f103", 2),
+            ("78462F103", 3),  # 大小写归一后同 CUSIP -> 一对多，整体剔除
+            ("594918104", 7),
+            ("594918104", 7),  # 重复行但同一 security -> 保留
+        ]
+        db = MagicMock()
+        db.get_session.return_value.__enter__.return_value = session
+        mapping = load_cusip_map(db)
+        assert mapping == {"037833100": 1, "594918104": 7}

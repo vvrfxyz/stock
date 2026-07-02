@@ -187,8 +187,9 @@ def get_last_completed_trading_date(market: str, now: datetime | None = None) ->
 
     calendar = _get_calendar(market)
 
+    _close_dt, market_date = _get_market_close_datetime(market, now)
     now_ts = pd.Timestamp(now)
-    session = calendar.date_to_session(now_ts.date(), direction="previous")
+    session = calendar.date_to_session(market_date, direction="previous")
     session_close = calendar.session_close(session)
 
     if now_ts <= session_close:

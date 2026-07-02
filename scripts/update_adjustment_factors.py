@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, localcontext
 
 from loguru import logger
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from tqdm import tqdm
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -54,8 +54,9 @@ def create_parser() -> argparse.ArgumentParser:
         "--changed-since",
         type=int,
         default=0,
-        help="只重建最近 N 天 corporate_actions(分红/拆股)内容有新增或修订的证券（增量重建，"
-             "配合每日调度避免全量 churn；按事件 updated_at 判定，非 securities 水位线）。",
+        help="只重建最近 N 天 corporate_actions(分红/拆股)内容有新增或修订、或事件 ex_date 刚生效"
+             "的证券（增量重建，配合每日调度避免全量 churn；按事件 updated_at/ex_date 判定，"
+             "非 securities 水位线）。",
     )
     parser.add_argument("--market", type=str, default="US", help="当前仅支持 US。")
     parser.add_argument("--source", type=str, default="MASSIVE", help="公司行动/供应商因子来源。")
@@ -363,13 +364,18 @@ def get_securities_to_update(db_manager: DatabaseManager, args: argparse.Namespa
             # 增量重建：只取最近 N 天 corporate_actions 内容真正变化过的证券，避免每日全量
             # DELETE+INSERT churn。注意不能用 securities.actions_last_updated_at——该水位线
             # 每次 actions 拉取都会被刷新（即便无新事件），整张表会每天全量命中。
+            # 另按 ex_date 刚过（[cutoff, 今天]）兜底：预告分红按公告价折的因子须在
+            # ex_date 生效后用真实前收盘重算，此触发不能依赖 upsert 恰好刷新 updated_at。
             cutoff = datetime.now() - timedelta(days=args.changed_since)
             changed_subq = (
                 session.query(CorporateAction.security_id)
                 .filter(
                     func.upper(CorporateAction.source) == args.source.upper(),
                     CorporateAction.action_type.in_(["DIVIDEND", "SPLIT"]),
-                    CorporateAction.updated_at >= cutoff,
+                    or_(
+                        CorporateAction.updated_at >= cutoff,
+                        CorporateAction.ex_date.between(cutoff.date(), date.today()),
+                    ),
                 )
                 .distinct()
             )

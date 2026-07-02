@@ -3,12 +3,16 @@
 证券选择函数已由 test_select_us_securities 单独覆盖，这里统一打桩，
 专注验证：source 调用 -> 行归一化 -> db 写入 -> watermark -> 退出码 的链路。
 """
-from datetime import date
+from datetime import date, timedelta
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pandas as pd
 import pytest
+from sqlalchemy import MetaData, create_engine
+from sqlalchemy.orm import sessionmaker
+
+from data_models.models import Security
 
 import scripts.update_massive_actions as actions
 import scripts.update_massive_details as details
@@ -17,6 +21,7 @@ import scripts.update_massive_news as news
 import scripts.update_massive_prices as prices
 import scripts.update_massive_shares as shares
 import scripts.update_massive_short_data as short_data
+import scripts.update_grouped_daily as grouped_daily
 import scripts.update_risk_free_rates as risk_free
 
 END_DATE = date(2026, 6, 11)
@@ -124,6 +129,205 @@ class TestPricesRun:
         db.upsert_daily_prices.assert_not_called()
         # 落后的 metadata 被对齐
         db.update_security_price_latest_date.assert_called_once_with(1, END_DATE, is_full_run=False)
+
+
+# ---------------------------------------------------------------------------
+# grouped daily
+# ---------------------------------------------------------------------------
+
+GROUPED_AGGS = [
+    {"T": "AAPL", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 100.0, "vw": 1.2, "n": 10},
+    {"T": "MSFT", "o": 3, "h": 4, "l": 2.5, "c": 3.5, "v": 200, "vw": 3.2, "n": 20},
+    {"T": "UNMAPPED", "o": 5, "h": 6, "l": 4.5, "c": 5.5, "v": 300},
+]
+
+
+def _grouped_db_with_existing(existing_rows):
+    """远期 existing-only 路径的 db 桩：get_session 查询返回该日已存在的 (security_id,) 行。"""
+    db = Mock()
+    session = Mock()
+    session.query.return_value.filter.return_value = existing_rows
+    session_context = MagicMock()
+    session_context.__enter__.return_value = session
+    db.get_session.return_value = session_context
+    return db
+
+
+class TestGroupedDailyProcessDate:
+    def test_recent_window_upserts_rows_without_existing_partition(self):
+        source, db = Mock(), Mock()
+        db.get_session.side_effect = AssertionError("近窗 upsert 不应查询既有行")
+        db.upsert_daily_prices.return_value = 2
+        source.get_grouped_daily_data.return_value = GROUPED_AGGS
+
+        result = grouped_daily.process_date(
+            date(2026, 6, 29), source, db, {"aapl": 1, "msft": 2},
+            allow_insert=True,
+        )
+
+        assert result == ("2026-06-29", "SUCCESS", 2)
+        rows = db.upsert_daily_prices.call_args.args[0]
+        assert [row["security_id"] for row in rows] == [1, 2]
+        assert rows[0]["date"] == date(2026, 6, 29)
+        assert rows[0]["volume"] == 100
+        db.ensure_security_price_latest_date_at_least.assert_called_once_with([1, 2], date(2026, 6, 29))
+
+    def test_far_history_without_existing_rows_skips_insert(self):
+        source = Mock()
+        db = _grouped_db_with_existing([])
+
+        result = grouped_daily.process_date(
+            date(2025, 1, 6), source, db, {"aapl": 1, "msft": 2},
+            allow_insert=False,
+        )
+
+        assert result == ("2025-01-06", "SKIPPED_NO_EXISTING_DATA", 0)
+        source.get_grouped_daily_data.assert_not_called()
+        db.upsert_daily_prices.assert_not_called()
+        db.bulk_update_mappings.assert_not_called()
+        db.ensure_security_price_latest_date_at_least.assert_not_called()
+
+    def test_far_history_updates_existing_rows_only(self):
+        source = Mock()
+        db = _grouped_db_with_existing([(1,)])
+        db.bulk_update_mappings.return_value = 1
+        source.get_grouped_daily_data.return_value = GROUPED_AGGS
+
+        result = grouped_daily.process_date(
+            date(2025, 1, 6), source, db, {"aapl": 1, "msft": 2},
+            allow_insert=False,
+        )
+
+        assert result == ("2025-01-06", "SUCCESS", 1)
+        db.upsert_daily_prices.assert_not_called()
+        rows = db.bulk_update_mappings.call_args.args[1]
+        assert [row["security_id"] for row in rows] == [1]  # msft 无既有行，不得 INSERT
+        db.ensure_security_price_latest_date_at_least.assert_called_once_with([1], date(2025, 1, 6))
+
+    def test_null_watermark_security_not_stamped(self):
+        source, db = Mock(), Mock()
+        db.upsert_daily_prices.return_value = 2
+        source.get_grouped_daily_data.return_value = GROUPED_AGGS
+
+        result = grouped_daily.process_date(
+            date(2026, 6, 29), source, db, {"aapl": 1, "msft": 2},
+            allow_insert=True, skip_stamp_ids={1},
+        )
+
+        assert result == ("2026-06-29", "SUCCESS", 2)
+        # NULL 水位的 1 不盖戳，保住 update_massive_prices 的自动全量回填入口
+        db.ensure_security_price_latest_date_at_least.assert_called_once_with([2], date(2026, 6, 29))
+
+    def test_all_null_watermark_skips_stamping_entirely(self):
+        source, db = Mock(), Mock()
+        db.upsert_daily_prices.return_value = 2
+        source.get_grouped_daily_data.return_value = GROUPED_AGGS
+
+        grouped_daily.process_date(
+            date(2026, 6, 29), source, db, {"aapl": 1, "msft": 2},
+            allow_insert=True, skip_stamp_ids={1, 2},
+        )
+
+        db.ensure_security_price_latest_date_at_least.assert_not_called()
+
+
+class TestGroupedDailySymbolMap:
+    @pytest.fixture()
+    def session(self):
+        engine = create_engine("sqlite:///:memory:")
+        # PG 上 symbol 唯一索引是 partial（仅 active 行）；sqlite 不识别 postgresql_where
+        # 会退化成全表 unique，插不进 active+inactive 同 symbol，故去掉索引建表
+        table = Security.__table__.to_metadata(MetaData())
+        table.indexes.clear()
+        table.create(engine)
+        session = sessionmaker(bind=engine)()
+        yield session
+        session.close()
+
+    def _add(self, session, id_, symbol, active, latest=None):
+        session.add(Security(
+            id=id_, symbol=symbol, current_symbol=symbol, market="US",
+            type="CS", is_active=active, full_refresh_interval=30,
+            price_data_latest_date=latest,
+        ))
+
+    def test_active_symbol_wins_over_inactive(self, session):
+        self._add(session, 1, "aapl", True)
+        self._add(session, 2, "aapl", False)  # 回收/退市旧身份占同一 symbol
+        session.commit()
+
+        assert grouped_daily.load_symbol_to_id_map(session) == {"aapl": 1}
+
+    def test_duplicate_active_symbol_dropped_entirely(self, session):
+        self._add(session, 1, "dup", True)
+        self._add(session, 2, "DUP", True)  # lowercase 后碰撞：整体剔除，不 last-wins
+        self._add(session, 3, "msft", True)
+        session.commit()
+
+        assert grouped_daily.load_symbol_to_id_map(session) == {"msft": 3}
+
+    def test_null_watermark_ids_loaded(self, session):
+        self._add(session, 1, "aapl", True, latest=date(2026, 6, 29))
+        self._add(session, 2, "newipo", True, latest=None)
+        session.commit()
+
+        assert grouped_daily.load_null_watermark_ids(session) == {2}
+
+
+class TestGroupedDailyMain:
+    LAST_COMPLETED = date(2026, 6, 30)
+
+    def _stub_runtime(self, monkeypatch, process_stub):
+        monkeypatch.setattr(grouped_daily, "setup_logging", lambda: None)
+        monkeypatch.setattr(grouped_daily, "enforce_us_market", lambda market: None)
+        monkeypatch.setattr(grouped_daily, "get_massive_api_keys", lambda: ["key"])
+        monkeypatch.setattr(grouped_daily, "KeyRateLimiter", lambda *args, **kwargs: object())
+        monkeypatch.setattr(grouped_daily, "MassiveSource", lambda rate_limiter: Mock())
+        monkeypatch.setattr(grouped_daily, "get_last_completed_trading_date", lambda market: self.LAST_COMPLETED)
+        # 简化为按自然日回移：近窗下限 = 2026-06-21
+        monkeypatch.setattr(
+            grouped_daily, "shift_trading_date",
+            lambda market, session_date, sessions: session_date + timedelta(days=sessions),
+        )
+        monkeypatch.setattr(grouped_daily, "load_symbol_to_id_map", lambda session: {"aapl": 1})
+        monkeypatch.setattr(grouped_daily, "load_null_watermark_ids", lambda session: set())
+
+        db = Mock()
+        db.get_session.return_value = MagicMock()
+        monkeypatch.setattr(grouped_daily, "DatabaseManager", lambda: db)
+        monkeypatch.setattr(grouped_daily, "process_date", process_stub)
+        return db
+
+    def test_main_returns_one_when_a_date_fails(self, monkeypatch):
+        db = self._stub_runtime(
+            monkeypatch,
+            lambda target_date, source, db_manager, symbol_to_id_map, **kwargs: (target_date.isoformat(), "ERROR", 0),
+        )
+
+        result = grouped_daily.main(["--start-date", "2026-06-29", "--end-date", "2026-06-29"])
+
+        assert result == 1
+        db.close.assert_called_once()
+
+    def test_main_clamps_end_date_and_splits_upsert_window(self, monkeypatch):
+        calls: dict[date, bool] = {}
+
+        def process_stub(target_date, source, db_manager, symbol_to_id_map, *, allow_insert, skip_stamp_ids):
+            calls[target_date] = allow_insert
+            return target_date.isoformat(), "SUCCESS", 1
+
+        self._stub_runtime(monkeypatch, process_stub)
+
+        result = grouped_daily.main(["--start-date", "2026-06-20", "--end-date", "2026-07-05"])
+
+        assert result == 0
+        # 超出最近已完成交易日（06-30）的部分被钳掉
+        assert max(calls) == self.LAST_COMPLETED
+        assert min(calls) == date(2026, 6, 20)
+        # 近窗下限 06-21：更早的日期退回 existing-only，不允许 INSERT
+        assert calls[date(2026, 6, 20)] is False
+        assert calls[date(2026, 6, 21)] is True
+        assert calls[self.LAST_COMPLETED] is True
 
 
 # ---------------------------------------------------------------------------

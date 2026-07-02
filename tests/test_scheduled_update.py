@@ -5,6 +5,30 @@ import pytest
 
 import main as main_module
 from main import ScheduledStep, build_scheduled_update_steps
+from utils.massive_task import TaskResult
+
+
+class _FakeTrackingDb:
+    """记录 start/finish_task_run 调用的假 DatabaseManager。"""
+
+    def __init__(self):
+        self._next_id = 0
+        self.task_names = {}
+        self.finished = []
+        self.closed = False
+
+    def start_task_run(self, run_id, task_name):
+        self._next_id += 1
+        self.task_names[self._next_id] = task_name
+        return self._next_id
+
+    def finish_task_run(self, task_run_id, *, exit_code, error_sample=None, stats=None):
+        self.finished.append(
+            (self.task_names[task_run_id], exit_code, error_sample, stats)
+        )
+
+    def close(self):
+        self.closed = True
 
 
 def _step_names(run_date: date) -> list[str]:
@@ -112,3 +136,28 @@ def test_scheduled_update_exits_zero_when_all_steps_succeed(monkeypatch):
     main_module.run_scheduled_update(SimpleNamespace(run_date="2026-06-10", market="US"))
 
     assert executed == ["a", "b"]
+
+
+def test_scheduled_update_passes_stats_to_finish_task_run(monkeypatch):
+    fake_db = _FakeTrackingDb()
+    monkeypatch.setattr(main_module, "DatabaseManager", lambda: fake_db)
+
+    ok_stats = {"processed": 10, "written": 5, "failed": 0}
+    fail_stats = {"processed": 3, "written": 0, "failed": 3}
+    steps = [
+        ScheduledStep("step_ok", lambda argv=None: TaskResult(0, ok_stats), []),
+        ScheduledStep("step_fail", lambda argv=None: TaskResult(1, fail_stats), []),
+        ScheduledStep("step_plain", lambda argv=None: 0, []),
+    ]
+    monkeypatch.setattr(main_module, "build_scheduled_update_steps", lambda run_date, market: steps)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main_module.run_scheduled_update(SimpleNamespace(run_date="2026-06-10", market="US"))
+
+    assert exc_info.value.code == 1
+    by_name = {name: (exit_code, error, stats) for name, exit_code, error, stats in fake_db.finished}
+    assert by_name["step_ok"] == (0, None, ok_stats)
+    assert by_name["step_fail"][0] == 1
+    assert by_name["step_fail"][2] == fail_stats
+    assert by_name["step_plain"] == (0, None, None)
+    assert fake_db.closed

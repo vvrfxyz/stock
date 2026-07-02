@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from utils.massive_task import build_standard_parser, run_concurrently, run_massive_task
+from utils.massive_task import TaskResult, build_standard_parser, run_concurrently, run_massive_task
 
 
 class TestBuildStandardParser:
@@ -126,3 +126,28 @@ class TestRunMassiveTask:
         assert code == 1
         # enforce_us_market 在构建 source/db 之前抛出
         assert not source.closed and not db.closed
+
+    def test_tuple_result_returns_task_result_with_stats(self, patched_runtime):
+        stats = {"processed": 10, "written": 5, "failed": 0}
+        result = run_massive_task("t", [], self._parser_factory, lambda a, s, d: (0, stats))
+        assert result == 0
+        assert isinstance(result, int)
+        assert result.stats == stats
+
+    def test_tuple_result_keeps_nonzero_exit_code_and_stats(self, patched_runtime):
+        stats = {"processed": 3, "failed": 3}
+        result = run_massive_task("t", [], self._parser_factory, lambda a, s, d: (1, stats))
+        assert result == 1
+        assert result.stats == stats
+
+
+class TestTaskResult:
+    def test_int_semantics_preserved(self):
+        # __main__ 的 raise SystemExit(main()) 依赖 int 子类语义
+        assert SystemExit(TaskResult(3, {"a": 1})).code == 3
+        assert TaskResult(0, {"a": 1}) == 0
+        assert not TaskResult(0)
+        assert TaskResult(1)
+
+    def test_stats_default_none(self):
+        assert TaskResult(0).stats is None
