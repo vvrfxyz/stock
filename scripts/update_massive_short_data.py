@@ -104,6 +104,12 @@ def process_batch(
         volume_start_by_symbol[symbol] = (
             history_floor if force or volume_latest is None else max(volume_latest + timedelta(days=1), history_floor)
         )
+        # 死票回收防护：list_date 之前的做空数据属于该 symbol 的旧身份
+        # （同 update_massive_prices 的回填 clamp）。
+        list_date = symbol_to_security[symbol].list_date
+        if list_date:
+            interest_start_by_symbol[symbol] = max(interest_start_by_symbol[symbol], list_date)
+            volume_start_by_symbol[symbol] = max(volume_start_by_symbol[symbol], list_date)
 
     interest_batch_start = min(interest_start_by_symbol.values())
     volume_batch_start = min(volume_start_by_symbol.values())

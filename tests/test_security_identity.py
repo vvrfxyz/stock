@@ -291,6 +291,39 @@ def test_no_match_new_listing():
     assert result.resolution_type == "NEW"
     assert result.confidence == "HIGH"
     assert result.security_id == -1
+    assert result.recycled_from is None
+
+
+def test_new_listing_over_inactive_symbol_flags_dead_ticker_recycle():
+    # 2026-07 事故场景：Golden Ocean（inactive）退市后 gogl 被新 ETF 复用。
+    # NEW 判定不变（新行照常插入），但 recycled_from 指向旧身份供审计。
+    r = _build([_row(1419, "gogl", figi="BBG000GOLDEN", is_active=False)])
+    result = r.resolve(symbol="gogl", composite_figi="BBG02314R3P8")
+    assert result.resolution_type == "NEW"
+    assert result.security_id == -1
+    assert result.recycled_from == 1419
+
+
+def test_new_listing_over_multiple_inactive_holders_stays_none():
+    # 同 symbol 多个 inactive 旧身份：无法确定回收自谁，不猜。
+    rows = [
+        _row(1, "dead", figi="BBG000AAA", is_active=False),
+        _row(2, "dead", figi="BBG000BBB", is_active=False),
+    ]
+    r = _build(rows)
+    result = r.resolve(symbol="dead", composite_figi="BBG000CCC")
+    assert result.resolution_type == "NEW"
+    assert result.recycled_from is None
+
+
+def test_active_symbol_match_never_sets_recycled_from():
+    # 命中活跃行（正常匹配或 quarantine 型回收）都不该走 dead-ticker 路径。
+    r = _build([_row(1, "aapl", figi="BBG000B9XRY4")])
+    normal = r.resolve(symbol="aapl", composite_figi="BBG000B9XRY4")
+    assert normal.recycled_from is None
+    conflict = r.resolve(symbol="aapl", composite_figi="BBG000OTHER")
+    assert conflict.is_recycle is True
+    assert conflict.recycled_from is None
 
 
 def test_resolve_batch():

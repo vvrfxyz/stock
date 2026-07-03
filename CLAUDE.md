@@ -143,6 +143,7 @@ python -m pytest tests/ -q -m "not integration"  # 仅纯单元测试
 ## Data Integrity Notes
 
 - Price scripts should update only through the most recent completed trading session.
+- Massive is symbol-keyed: history fetched for a recycled ticker belongs to whichever entity held the symbol then. Price/actions/short-data backfills are therefore clamped to `securities.list_date`, `sync_massive_universe` writes a `DEAD_TICKER_RECYCLE` RECYCLE event when a NEW listing reuses an inactive security's symbol, and `check_data_integrity` blocks on same-symbol securities with overlapping daily-price spans (2026-07 gogl/lazr/pinc/spcx/opi/fusd incident).
 - `securities.price_data_latest_date` should match `daily_prices.max(date)`.
 - Company actions are keyed by Massive `source_event_id`; synthetic historical IDs should be cleaned up when a real vendor event ID becomes available.
 - `computed_adjustment_factors.methodology_version` currently uses `raw_actions_v1`. Non-USD dividends (CAD/NOK/ILS cross-listings) are converted to USD via ECB rates from `fx_rates` when available — run `update_fx_rates` first, then a factor rebuild picks them up; without FX data the events are skipped as before. Vendor reconciliation excludes these events from the chain (vendor never emits factor rows for them).

@@ -93,6 +93,31 @@ def _group_by_ticker(rows: list[dict]) -> dict[str, list[dict]]:
     return grouped
 
 
+def _event_ex_date(item: dict) -> date | None:
+    raw = item.get("ex_dividend_date") or item.get("execution_date") or item.get("ex_date")
+    if raw is None or isinstance(raw, date):
+        return raw
+    try:
+        return date.fromisoformat(str(raw)[:10])
+    except ValueError:
+        return None
+
+
+def _clamp_to_list_date(security: Security, items: list[dict]) -> list[dict]:
+    """死票回收防护：Massive 按 ticker 键控事件，list_date 之前的分红/拆股属于
+    该 symbol 的旧身份，一律丢弃（同 update_massive_prices 的回填 clamp）。"""
+    if not security.list_date or not items:
+        return items
+    kept = [item for item in items if (_event_ex_date(item) or security.list_date) >= security.list_date]
+    dropped = len(items) - len(kept)
+    if dropped:
+        logger.info(
+            "[{}] 丢弃 {} 条早于 list_date {} 的公司行动（属于该 symbol 的旧身份）。",
+            security.symbol, dropped, security.list_date,
+        )
+    return kept
+
+
 def _strip_ticker(rows: list[dict]) -> list[dict]:
     return [{key: value for key, value in row.items() if key != "ticker"} for row in rows]
 
@@ -199,8 +224,8 @@ def process_batch(
     for security in securities:
         symbol = security.symbol
         try:
-            security_dividends = _strip_ticker(dividends_by_symbol.get(symbol, []))
-            security_splits = _strip_ticker(splits_by_symbol.get(symbol, []))
+            security_dividends = _clamp_to_list_date(security, _strip_ticker(dividends_by_symbol.get(symbol, [])))
+            security_splits = _clamp_to_list_date(security, _strip_ticker(splits_by_symbol.get(symbol, [])))
 
             if security_dividends:
                 inferred_currency = _infer_currency(security)

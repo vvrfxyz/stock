@@ -203,3 +203,37 @@ class TestSingleRenameFailureIsolated:
         assert db.active == {"a": 1, "b": 2}
         assert [e["event_type"] for e in db.identity_events] == ["QUARANTINE", "QUARANTINE"]
         assert db.symbol_upserts == [{"symbol": "new1"}]
+
+
+class TestDeadTickerRecycle:
+    def test_new_listing_over_inactive_symbol_writes_recycle_event(self, monkeypatch):
+        # 2026-07 事故场景：inactive 旧身份（Golden Ocean）退市后，新 ETF 复用 gogl。
+        # 新行照常走 normal upsert，但必须留下 RECYCLE 审计事件。
+        existing = [_row(1419, "gogl", figi="BBG000GOLDEN", is_active=False)]
+        resolver = _build_resolver(existing)
+        db = FakeDB({})
+        payloads = [{"symbol": "gogl", "composite_figi": "BBG02314R3P8"}]
+
+        code = _run_main(monkeypatch, payloads, resolver, db)
+        assert code == 0
+        # 新行照常插入
+        assert db.symbol_upserts == payloads
+        # RECYCLE 事件指向旧身份
+        assert len(db.identity_events) == 1
+        event = db.identity_events[0]
+        assert event["event_type"] == "RECYCLE"
+        assert event["security_id"] == 1419
+        assert event["related_security_id"] == 1419
+        details = json.loads(event["details"])
+        assert details["kind"] == "DEAD_TICKER_RECYCLE"
+        assert details["incoming_figi"] == "BBG02314R3P8"
+
+    def test_plain_new_listing_writes_no_event(self, monkeypatch):
+        resolver = _build_resolver([_row(1, "aapl", figi="BBG000B9XRY4")])
+        db = FakeDB({"aapl": 1})
+        payloads = [{"symbol": "brandnew", "composite_figi": "BBG000FRESH"}]
+
+        code = _run_main(monkeypatch, payloads, resolver, db)
+        assert code == 0
+        assert db.symbol_upserts == payloads
+        assert db.identity_events == []

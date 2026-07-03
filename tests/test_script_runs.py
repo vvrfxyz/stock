@@ -130,6 +130,35 @@ class TestPricesRun:
         # 落后的 metadata 被对齐
         db.update_security_price_latest_date.assert_called_once_with(1, END_DATE, is_full_run=False)
 
+    def test_full_backfill_clamped_to_list_date(self, monkeypatch):
+        # 死票回收防护：新证券（水位 NULL）全量回填不得早于 list_date，
+        # 否则会把该 symbol 旧身份的历史 bar 吞进来。
+        sec = _security(list_date=date(2026, 6, 1))
+        monkeypatch.setattr(prices, "get_last_completed_trading_date", lambda market: END_DATE)
+        monkeypatch.setattr(prices, "get_securities_to_update", lambda db, args, end: [sec])
+        source, db = Mock(), Mock()
+        source.get_historical_data.return_value = self._frame()
+        db.get_security_price_max_date.return_value = date(2026, 6, 10)
+
+        result = prices.run(prices.create_parser().parse_args([]), source, db)
+        assert _exit_code(result) == 0
+        assert source.get_historical_data.call_args.kwargs["start"] == "2026-06-01"
+        # clamp 不改变 is_full_run 语义：list_date 起就是本证券的全部可用历史
+        db.update_security_price_latest_date.assert_called_once_with(1, date(2026, 6, 10), is_full_run=True)
+
+    def test_old_list_date_does_not_move_backfill_start(self, monkeypatch):
+        # 老公司 list_date 远早于 730 天窗口：clamp 应无效果。
+        sec = _security(list_date=date(1997, 2, 7))
+        monkeypatch.setattr(prices, "get_last_completed_trading_date", lambda market: END_DATE)
+        monkeypatch.setattr(prices, "get_securities_to_update", lambda db, args, end: [sec])
+        source, db = Mock(), Mock()
+        source.get_historical_data.return_value = self._frame()
+        db.get_security_price_max_date.return_value = date(2026, 6, 10)
+
+        prices.run(prices.create_parser().parse_args([]), source, db)
+        from utils.massive_config import get_massive_history_floor
+        assert source.get_historical_data.call_args.kwargs["start"] == get_massive_history_floor(END_DATE).isoformat()
+
 
 # ---------------------------------------------------------------------------
 # grouped daily
@@ -373,6 +402,34 @@ class TestActionsRun:
         result = actions.run(actions.create_parser().parse_args([]), source, db)
         assert _exit_code(result) == 1
 
+    def test_events_before_list_date_dropped(self, monkeypatch):
+        # 死票回收防护：list_date 之前的事件属于该 symbol 的旧身份，不落库。
+        sec = _security(list_date=date(2026, 6, 1))
+        monkeypatch.setattr(actions, "get_last_completed_trading_date", lambda market: END_DATE)
+        monkeypatch.setattr(actions, "get_securities_to_update", lambda db, args: [sec])
+        source, db = Mock(), Mock()
+        source.get_dividends_batch.return_value = [
+            {"ticker": "aapl", "ex_dividend_date": date(2025, 3, 11), "cash_amount": "0.15",
+             "currency": "USD", "source_event_id": "old1", "historical_adjustment_factor": "0.99"},
+            {"ticker": "aapl", "ex_dividend_date": date(2026, 6, 5), "cash_amount": "0.21",
+             "currency": "USD", "source_event_id": "new1", "historical_adjustment_factor": "0.999"},
+        ]
+        source.get_splits_batch.return_value = [
+            {"ticker": "aapl", "execution_date": date(2024, 11, 21), "split_from": 15, "split_to": 1,
+             "source_event_id": "oldsplit", "historical_adjustment_factor": "15"},
+        ]
+        db.upsert_dividends.return_value = 1
+        db.upsert_splits.return_value = 0
+        db.upsert_vendor_adjustment_factors.return_value = 1
+
+        result = actions.run(actions.create_parser().parse_args([]), source, db)
+        assert _exit_code(result) == 0
+        dividends = db.upsert_dividends.call_args.args[1]
+        assert [d["source_event_id"] for d in dividends] == ["new1"]
+        db.upsert_splits.assert_not_called()  # 旧身份拆股整条被丢弃后为空
+        factor_rows = db.upsert_vendor_adjustment_factors.call_args.args[0]
+        assert [row["factor_key"] for row in factor_rows] == ["dividend:new1"]
+
 
 # ---------------------------------------------------------------------------
 # events
@@ -443,6 +500,31 @@ class TestShortDataRun:
 
         result = short_data.run(short_data.create_parser().parse_args([]), source, db)
         assert _exit_code(result) == 1
+
+    def test_rows_before_list_date_dropped(self, monkeypatch):
+        # 死票回收防护：list_date 之前的做空数据属于该 symbol 的旧身份。
+        sec = _security(list_date=date(2026, 6, 1))
+        monkeypatch.setattr(short_data, "get_last_completed_trading_date", lambda market: END_DATE)
+        monkeypatch.setattr(short_data, "get_securities_to_update", lambda db, args, end: [sec])
+        source, db = Mock(), Mock()
+        db.get_security_short_max_dates.return_value = {1: {"interest": None, "volume": None}}
+        source.get_short_interest_batch.return_value = [
+            {"ticker": "aapl", "settlement_date": date(2025, 8, 15), "short_interest": 5},   # 旧身份
+            {"ticker": "aapl", "settlement_date": date(2026, 6, 15), "short_interest": 10},  # 本证券
+        ]
+        source.get_short_volume_batch.return_value = [
+            {"ticker": "aapl", "date": date(2025, 7, 1), "short_volume": 3},   # 旧身份
+            {"ticker": "aapl", "date": date(2026, 6, 10), "short_volume": 7},  # 本证券
+        ]
+        db.upsert_short_interests.return_value = 1
+        db.upsert_short_volumes.return_value = 1
+
+        result = short_data.run(short_data.create_parser().parse_args([]), source, db)
+        assert _exit_code(result) == 0
+        interests = db.upsert_short_interests.call_args.args[0]
+        assert [row["settlement_date"] for row in interests] == [date(2026, 6, 15)]
+        volumes = db.upsert_short_volumes.call_args.args[0]
+        assert [row["date"] for row in volumes] == [date(2026, 6, 10)]
 
 
 # ---------------------------------------------------------------------------

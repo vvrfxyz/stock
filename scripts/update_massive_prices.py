@@ -134,6 +134,17 @@ def process_security(
             start_dt = max(next_date, history_floor)
             is_full_run = start_dt == history_floor
 
+        # 死票回收防护：Massive 按 ticker 键控历史，list_date 之前的 bar 属于该
+        # symbol 的旧身份，一律不拉（2026-07 gogl/lazr/pinc/spcx/opi/fusd 事故：
+        # 回收 ticker 的新证券全量回填吞掉了旧实体两年的行情）。is_full_run 语义
+        # 不变——对新证券而言 list_date 起就是它的全部可用历史。
+        if security.list_date and security.list_date > start_dt:
+            logger.info(
+                "[{}] 回填起点从 {} clamp 到 list_date {}（symbol 历史早于本证券上市日）。",
+                symbol, start_dt, security.list_date,
+            )
+            start_dt = security.list_date
+
         if start_dt > end_trading_date:
             return symbol, "SUCCESS_UP_TO_DATE", 0
 

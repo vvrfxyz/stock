@@ -319,6 +319,48 @@ def check_unexplained_jumps(session, limit: int, window_start: date, threshold: 
     return 0  # 预警不计入失败退出码
 
 
+def check_recycled_symbol_overlap(session, limit: int, window_start: date) -> int:
+    """同一 symbol 挂多个 security 且日线区间重叠：ticker 回收串写（阻塞）。
+
+    死票回收后新证券按 symbol 回填会吞掉旧身份的历史（2026-07 gogl/lazr/pinc/
+    spcx/opi/fusd 事故）。正常状态下新旧两行的 bar 区间必须不相交。
+    只报重叠段延伸到 window_start 之后的对，避免每天重复翻出陈年遗留。
+    """
+    sql = text(
+        """
+        WITH dup AS (
+            SELECT symbol FROM securities GROUP BY symbol HAVING COUNT(*) > 1
+        ),
+        spans AS (
+            SELECT s.id, s.symbol, MIN(dp.date) AS first_bar, MAX(dp.date) AS last_bar
+            FROM securities s
+            JOIN dup USING (symbol)
+            JOIN daily_prices dp ON dp.security_id = s.id
+            GROUP BY s.id, s.symbol
+        )
+        SELECT a.symbol, a.id AS id_a, b.id AS id_b,
+               GREATEST(a.first_bar, b.first_bar) AS overlap_start,
+               LEAST(a.last_bar, b.last_bar) AS overlap_end
+        FROM spans a
+        JOIN spans b ON b.symbol = a.symbol AND b.id > a.id
+        WHERE a.first_bar <= b.last_bar AND b.first_bar <= a.last_bar
+          AND LEAST(a.last_bar, b.last_bar) >= :window_start
+        ORDER BY LEAST(a.last_bar, b.last_bar) DESC
+        """
+    )
+    rows = session.execute(sql, {"window_start": window_start}).all()
+    _report_rows(
+        f"同 symbol 多证券日线区间重叠（重叠延伸至 {window_start} 后，疑似 ticker 回收串写）",
+        len(rows),
+        [
+            f"{r.symbol} sec={r.id_a} vs sec={r.id_b} 重叠 {r.overlap_start} -> {r.overlap_end}"
+            for r in rows
+        ],
+        limit,
+    )
+    return len(rows)
+
+
 def main(argv: list[str] | None = None) -> int:
     start_time = time.monotonic()
     setup_logging()
@@ -333,6 +375,7 @@ def main(argv: list[str] | None = None) -> int:
             issues += check_price_latest_date_consistency(session, limit=args.limit)
             issues += check_symbol_normalization(session, limit=args.limit)
             issues += check_ohlc_validity(session, limit=args.limit, window_start=window_start)
+            issues += check_recycled_symbol_overlap(session, limit=args.limit, window_start=window_start)
             check_calendar_gaps(
                 session, limit=args.limit, window_start=window_start, min_sessions=args.gap_min_sessions
             )

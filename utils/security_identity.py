@@ -35,6 +35,7 @@ class ResolutionResult:
     matched_field: str  # 命中的字段，例如 "composite_figi" / "symbol"
     is_rename: bool  # 同一身份但 symbol 变了
     is_recycle: bool  # 命中了某行、但 incoming 身份与其冲突（symbol 复用 / 同 CIK 新证券）
+    recycled_from: int | None = None  # 死票回收：NEW 上市但 symbol 仍挂在某 inactive 行名下时，指向该旧身份
 
 
 class _SecurityRow(NamedTuple):
@@ -307,7 +308,17 @@ class SecurityIdentityResolver:
                     is_recycle=False,
                 )
 
-        # 5) 全部未命中：新上市。
+        # 5) 全部未命中：新上市。若该 symbol 仍挂在某 inactive 行名下（老代码
+        #    退市后被新股复用——"死票回收"），带上 recycled_from 供上游写
+        #    RECYCLE 审计事件；此场景旧行已 inactive、不占活跃 symbol 唯一索引，
+        #    新行照常插入，与 quarantine 型回收（active 行冲突）不同。
+        recycled_from = None
+        if norm_symbol is not None:
+            inactive_holders = [
+                row for row in self._by_symbol_all.get(norm_symbol, []) if not row.is_active
+            ]
+            if len(inactive_holders) == 1:
+                recycled_from = inactive_holders[0].id
         return ResolutionResult(
             security_id=-1,
             resolution_type="NEW",
@@ -315,6 +326,7 @@ class SecurityIdentityResolver:
             matched_field="",
             is_rename=False,
             is_recycle=False,
+            recycled_from=recycled_from,
         )
 
     @staticmethod

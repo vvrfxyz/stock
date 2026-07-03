@@ -135,7 +135,17 @@ def main(argv: list[str] | None = None) -> int:
         with db_manager.get_session() as session:
             resolver = SecurityIdentityResolver(session)
 
-        rename_rows, recycle_rows, normal_rows, _ = _classify_incoming(resolver, upsert_rows)
+        rename_rows, recycle_rows, normal_rows, results = _classify_incoming(resolver, upsert_rows)
+
+        # 死票回收：NEW 上市但 symbol 仍挂在某 inactive 行名下。新行照常插入
+        # （normal 路径），这里先留 RECYCLE 审计事件——2026-07 的 gogl/lazr/
+        # pinc/spcx/opi/fusd 事故正是这条路径静默通过、按 symbol 回填吞掉了
+        # 旧身份两年的历史数据。
+        dead_ticker_recycles = [
+            (row, result)
+            for row, result in zip(upsert_rows, results)
+            if result.resolution_type == "NEW" and result.recycled_from is not None
+        ]
 
         # 1) 处理改名：先按批内依赖排序（new_symbol 被本批另一条 rename 释放的
         #    排其后），再逐条执行 symbol 更新 + history + 事件。
@@ -225,6 +235,34 @@ def main(argv: list[str] | None = None) -> int:
         if recycle_rows:
             logger.warning("跳过 {} 条疑似 ticker 回收的 securities upsert。", len(recycle_rows))
 
+        # 2b) 死票回收：写 RECYCLE 事件（新行尚未插入，security_id 暂指旧身份，
+        #     related_security_id 同值以便审计检索；details 里标明 pending_new_row）。
+        for row, result in dead_ticker_recycles:
+            identity_events.append({
+                "security_id": result.recycled_from,
+                "event_type": "RECYCLE",
+                "old_symbol": row["symbol"],
+                "new_symbol": row["symbol"],
+                "related_security_id": result.recycled_from,
+                "resolution_source": "AUTO",
+                "confidence": "HIGH",
+                "details": json.dumps({
+                    "kind": "DEAD_TICKER_RECYCLE",
+                    "action": "new listing reuses symbol of inactive security; new row inserted normally",
+                    "incoming_figi": row.get("composite_figi"),
+                    "incoming_cik": row.get("cik"),
+                    "incoming_name": row.get("name"),
+                    "incoming_list_date": str(row.get("list_date")) if row.get("list_date") else None,
+                }, ensure_ascii=False),
+            })
+            logger.warning(
+                "symbol={} 为死票回收：新上市复用 inactive security_id={} 的代码"
+                "（incoming figi={} cik={} name={}），已写 RECYCLE 事件；"
+                "价格回填将被 clamp 到新证券 list_date。",
+                row["symbol"], result.recycled_from,
+                row.get("composite_figi"), row.get("cik"), row.get("name"),
+            )
+
         # 3) 写身份事件
         if identity_events:
             db_manager.insert_identity_events(identity_events)
@@ -253,12 +291,13 @@ def main(argv: list[str] | None = None) -> int:
                 marked_inactive = result.rowcount or 0
 
         logger.success(
-            "Massive universe 同步完成: fetched={} upserted={} renamed={} rename_skipped={} recycled={} marked_inactive={}",
+            "Massive universe 同步完成: fetched={} upserted={} renamed={} rename_skipped={} recycled={} dead_ticker_recycled={} marked_inactive={}",
             len(upsert_rows),
             changed,
             len(rename_rows) - len(skipped_renames),
             len(skipped_renames),
             len(recycle_rows),
+            len(dead_ticker_recycles),
             marked_inactive,
         )
         if skipped_renames:
