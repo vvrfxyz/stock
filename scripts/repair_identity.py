@@ -209,14 +209,14 @@ def apply_merge(db_manager, plan: dict) -> int:
                 "(SELECT max(date) FROM daily_prices WHERE security_id = :old) "
                 "WHERE id = :old"
             ), {"old": merge_id})
+            conn.execute(text(
+                "UPDATE securities SET is_active = false WHERE id = :old"
+            ), {"old": merge_id})
         conn.execute(text(
             "UPDATE securities SET price_data_latest_date = "
             "(SELECT max(date) FROM daily_prices WHERE security_id = :keep) "
             "WHERE id = :keep AND price_data_latest_date IS NOT NULL"
         ), {"keep": keep_id})
-            conn.execute(text(
-                "UPDATE securities SET is_active = false WHERE id = :old"
-            ), {"old": merge_id})
         conn.commit()
 
     with db_manager.get_session() as session:
