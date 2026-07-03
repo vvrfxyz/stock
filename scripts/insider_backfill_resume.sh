@@ -7,7 +7,8 @@ DRY=0
 TS_NOW() { date -u '+%Y-%m-%d %H:%M:%S UTC'; }
 DEADLINE=$(( $(date +%s) + 4*3600 ))
 sched_running() {
-  ps -eo args= | awk '/^\.venv\/bin\/python main\.py scheduled_update/ {found=1} END{exit !found}'
+  # scheduled_update 由 systemd 以绝对路径 python 启动,老的 ^\.venv 前缀永远匹配不上(潜在 bug)
+  ps -eo args= | awk '/^[^ ]*python main\.py scheduled_update/ {found=1} END{exit !found}'
 }
 while sched_running; do
   if [ "$(date +%s)" -gt "$DEADLINE" ]; then
@@ -18,15 +19,15 @@ while sched_running; do
   [ "$DRY" = 1 ] && break
   sleep 60
 done
-PIDS=$(ps -eo pid=,args= | awk '/^[ ]*[0-9]+ \.venv\/bin\/python main\.py update_insider_transactions/ {print $1}' | tr '\n' ' ')
+PIDS=$(ps -eo pid=,args= | awk '/^[ ]*[0-9]+ [^ ]*python main\.py update_(insider_transactions|institutional_holdings)/ {print $1}' | tr '\n' ' ')
 PIDS=$(echo "$PIDS" | xargs)
 if [ -z "$PIDS" ]; then
-  echo "$(TS_NOW) insider backfill process gone — no CONT needed"
+  echo "$(TS_NOW) SEC backfill process gone — no CONT needed"
   exit 0
 fi
 if [ "$DRY" = 1 ]; then
   echo "$(TS_NOW) DRY-RUN would CONT pid(s): $PIDS"
 else
   for pid in $PIDS; do kill -CONT "$pid"; done
-  echo "$(TS_NOW) CONTINUED insider backfill pid(s): $PIDS"
+  echo "$(TS_NOW) CONTINUED SEC backfill pid(s): $PIDS"
 fi

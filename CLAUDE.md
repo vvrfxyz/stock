@@ -100,6 +100,7 @@ python main.py update_sec_filings aapl              # SEC filing 索引；--all 
 python main.py update_sec_fundamentals aapl         # XBRL 基本面；--all --since 增量 / --bulk-zip 全量回填
 python main.py update_insider_transactions aapl     # Form 3/4/5 明细；--all 处理全部待解析 filing
 python main.py update_institutional_holdings --since 2026-06-01   # 13F 持仓；--quarter 2026Q1 季度回填
+python scripts/backfill_13f_quarters.py --oldest 2013Q2           # 13F 历史回填编排器（新→旧逐季、幂等续传、磁盘/daily-run 护栏；台账 logs/manual_backfill/13f_backfill_ledger.tsv）；2013Q2 前无 XML 信息表
 python main.py update_fx_rates                      # ECB 参考汇率；非 USD 分红折算依赖
 python main.py update_risk_free_rates               # FRED DTB3 无风险利率；评估层超额收益依赖
 
