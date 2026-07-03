@@ -373,8 +373,11 @@ def run_scheduled_update(args):
         if db_for_tracking:
             try:
                 task_run_id = db_for_tracking.start_task_run(run_id, step.name)
-            except Exception:
-                pass
+            except Exception as exc:
+                # 记录失败不阻断调度，但必须留痕——2026-07-03 首跑第 1 步的
+                # start_task_run 瞬时失败被裸 pass 吞掉，事后无从排查。
+                logger.warning("start_task_run({}) 失败，跳过本步记录: {}: {}",
+                               step.name, type(exc).__name__, exc)
         exit_code = 0
         error_msg = None
         stats = None
@@ -397,8 +400,9 @@ def run_scheduled_update(args):
                 db_for_tracking.finish_task_run(
                     task_run_id, exit_code=exit_code, error_sample=error_msg, stats=stats
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("finish_task_run({}) 失败: {}: {}",
+                               step.name, type(exc).__name__, exc)
 
     if db_for_tracking:
         try:

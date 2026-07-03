@@ -115,9 +115,11 @@ def test_apply_merge_migrates_nonconflicting_rows_and_is_idempotent(pg_db):
     husk 全部历史（bk→bny 10502 行日线）静默滞留。"""
     with pg_db.get_session() as s:
         s.add(Security(id=1, symbol="bny", current_symbol="bny", market="US", type="CS",
-                       is_active=True, full_refresh_interval=30, composite_figi="BBG-X"))
+                       is_active=True, full_refresh_interval=30, composite_figi="BBG-X",
+                       price_data_latest_date=date(2026, 6, 1)))
         s.add(Security(id=2, symbol="bk", current_symbol="bk", market="US", type="CS",
-                       is_active=False, full_refresh_interval=30, composite_figi="BBG-X"))
+                       is_active=False, full_refresh_interval=30, composite_figi="BBG-X",
+                       price_data_latest_date=date(2026, 6, 2)))
         # keep 已有 6-02；husk 有 6-01（可迁）+ 6-02（冲突，应留守）
         s.add(DailyPrice(security_id=1, date=date(2026, 6, 2), close=10))
         s.add(DailyPrice(security_id=2, date=date(2026, 6, 1), close=9))
@@ -136,9 +138,15 @@ def test_apply_merge_migrates_nonconflicting_rows_and_is_idempotent(pg_db):
         events = conn.execute(text(
             "SELECT count(*) FROM security_identity_events WHERE event_type = 'MERGE'"
         )).scalar()
+        watermarks = {r.id: r.price_data_latest_date for r in conn.execute(text(
+            "SELECT id, price_data_latest_date FROM securities ORDER BY id"))}
     assert keep_dates == [date(2026, 6, 1), date(2026, 6, 2)]
     assert husk_dates == [date(2026, 6, 2)]  # 冲突行留守
     assert events == 1
+    # 水位线随迁移同步（2026-07-03 首跑事故回归锁）：
+    # husk 按剩余行重算；keep 非 NULL 时对齐真实 max
+    assert watermarks[2] == date(2026, 6, 2)
+    assert watermarks[1] == date(2026, 6, 2)
 
     # 重跑：0 行迁移、事件不重复
     assert apply_merge(pg_db, plan) == 0

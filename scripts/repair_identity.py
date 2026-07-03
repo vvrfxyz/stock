@@ -184,7 +184,10 @@ def apply_merge(db_manager, plan: dict) -> int:
 
     与 generate_merge_sql 同一套守卫 SQL：键冲突行留在 husk 侧不迁移。
     savepoint 仅作意外兜底（如迁移期间的漂移 schema）。重复执行幂等：
-    已写过的 MERGE 事件不重复落库。"""
+    已写过的 MERGE 事件不重复落库。迁移后同步双方 price_data_latest_date
+    （2026-07-03 首跑事故：日线迁走后 husk 水位线悬空，integrity 检查报
+    BLOCKING）——husk 按剩余行重算（可回落 NULL，inactive 不参与增量选取）；
+    keep 仅在水位线已非 NULL 时对齐（保持 NULL=待全量回填 的语义）。"""
     keep_id = plan["keep_id"]
     rows_migrated = 0
     with db_manager.engine.connect() as conn:
@@ -201,6 +204,16 @@ def apply_merge(db_manager, plan: dict) -> int:
                         "合并 {} -> {}: {} 表迁移跳过（{}）: {}",
                         merge_id, keep_id, table, type(exc).__name__, exc,
                     )
+            conn.execute(text(
+                "UPDATE securities SET price_data_latest_date = "
+                "(SELECT max(date) FROM daily_prices WHERE security_id = :old) "
+                "WHERE id = :old"
+            ), {"old": merge_id})
+        conn.execute(text(
+            "UPDATE securities SET price_data_latest_date = "
+            "(SELECT max(date) FROM daily_prices WHERE security_id = :keep) "
+            "WHERE id = :keep AND price_data_latest_date IS NOT NULL"
+        ), {"keep": keep_id})
             conn.execute(text(
                 "UPDATE securities SET is_active = false WHERE id = :old"
             ), {"old": merge_id})
