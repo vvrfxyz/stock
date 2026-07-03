@@ -16,6 +16,7 @@ import time
 from datetime import date, timedelta
 from pathlib import Path
 
+import requests
 from loguru import logger
 from sqlalchemy import text
 from tqdm import tqdm
@@ -136,7 +137,15 @@ def process_filing(
     db_manager: DatabaseManager,
     cusip_map: dict[str, int],
 ) -> tuple[str, int]:
-    submission_text = source.fetch_full_submission(ref["file_path"])
+    try:
+        submission_text = source.fetch_full_submission(ref["file_path"])
+    except requests.HTTPError as e:
+        # form.idx 里存在但 EDGAR 已删除的"幽灵" filing（撤回件）：永久 404，
+        # 视为跳过而非失败——否则历史回填中每个幽灵都会把所在季度标 FAILED。
+        if e.response is not None and e.response.status_code == 404:
+            logger.warning("[{}] EDGAR 已删除该 filing（404），跳过。", ref["accession_number"])
+            return "SKIPPED_GONE", 0
+        raise
     rows = parse_thirteenf_submission(submission_text, ref["accession_number"])
     if not rows:
         return "SUCCESS_EMPTY", 0

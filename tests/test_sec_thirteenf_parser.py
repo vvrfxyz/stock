@@ -233,6 +233,32 @@ class TestProcessFiling:
             process_filing(_ref(), source, db, {})
         db.upsert_institutional_holdings.assert_not_called()
 
+    def test_gone_filing_404_skipped_not_failed(self):
+        # form.idx 里的"幽灵" filing（EDGAR 已删除）：永久 404 应跳过而非抛错，
+        # 否则历史回填中每个幽灵把所在季度永远标 FAILED。
+        import requests
+
+        source = MagicMock()
+        response = MagicMock()
+        response.status_code = 404
+        source.fetch_full_submission.side_effect = requests.HTTPError(response=response)
+        db = MagicMock()
+        status, written = process_filing(_ref(), source, db, {})
+        assert status == "SKIPPED_GONE"
+        assert written == 0
+        db.upsert_institutional_holdings.assert_not_called()
+
+    def test_non_404_http_error_still_raises(self):
+        import requests
+
+        source = MagicMock()
+        response = MagicMock()
+        response.status_code = 503
+        source.fetch_full_submission.side_effect = requests.HTTPError(response=response)
+        db = MagicMock()
+        with pytest.raises(requests.HTTPError):
+            process_filing(_ref(), source, db, {})
+
     def test_period_backfilled_rows_written_with_cusip_map(self):
         source = MagicMock()
         source.fetch_full_submission.return_value = BROKEN_PRIMARY_WITH_HEADER
