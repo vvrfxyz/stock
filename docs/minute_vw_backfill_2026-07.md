@@ -77,4 +77,80 @@ ORDER BY (security_id, ts)，ZSTD 压缩；`security_id` 仍是全局锚点。
 
 ## 上线记录
 
-（执行后回填）
+### 导入前审计（2026-07-06，5 路并行 + 裁决，双 go-with-conditions）
+
+- **daily_vw 同血统实锤**：三个抽样月 299,715 对 join，close **位级一致 99.7357%**，
+  其余 0.26% 全部溯源到 40 个改名/回收 symbol 的裸 join 假象（任期归属正好消除）。
+  volume/transactions 有 37.5% 行不同但**严格单向**（daily_vw ≥ prod，中位 +0.43% /
+  +2 笔）——daily_vw 是同一 SIP 汇总的更晚切片，只嫁接 vw 不动 volume/tc。
+  vw∈[low,high] 含率 97.3%（越界中位仅 0.13%，盘前盘后/碎股纳入所致）。
+- **覆盖**：主树 2003-09-10 ~ 2026-04-22 共 47.3M 行；2021 缺 1-2 月、2022/2023 缺
+  1 月、2026 年 1-2 月——全部由 补缺 件补齐（补缺是超集，85% 行与主树重复，
+  处理顺序主树在前使重复自然落 already_has_vwap 桶）。补齐后零缺口。
+- **回填模拟（2014-03 基线）**：updatable 86,686 / already 538 / yfinance 2,312 /
+  no_pg_row 69,961（43.9% 的 daily_vw 行是 OTC/后缀类，PG 本就无 bar，只计数）。
+- **分钟线质量**：三个月 6705 万行抽样，OHLC 合法率 99.99975%（167 行零价，
+  与日线 sub-penny 下溢同类，装载时过滤），**(symbol, datetime) 零重复**；
+  ET 时段 04:00-20:00（2003 年代无 04:00 盘前，盘后占比随年代升至 6.2%）；
+  AAPL 常规时段重构日线 **O/H/L 15/15 精确命中** prod 原始价（未复权确认过
+  2014 年 7:1 拆分前后价位）；close 与官方收盘竞价差 $0.00-0.16、volume 低
+  1.8%-23.3%（竞价与合并量不在分钟条内）——**永远禁止用分钟加总回填日线**。
+- **总量估算**：~65 亿行 ±15%。
+- **映射率**：现 symbol 直配下 2003 年代 66.8% 行 / 81.9% 美元成交额，2024 年代
+  88.0% / 95.5%；任期归属会进一步提高 2003 年代（死票在 history 里的部分）。
+- 裁决的两个 "blocking" 前提已被实测推翻：253 实际空闲 288G（30G 硬约束是
+  13F 时代旧状态）；stock-clickhouse 容器健在（24.12，2026-06 只删了代码层）。
+
+### 条件落实
+
+- A1 同实体守卫：UPDATE 谓词加 `dp.close = t.close`（列精度 cast），归属错误行
+  落 entity_mismatch 桶绝不写入——审计证明同实体 close 位级相等，零覆盖损失。
+- A2 已普查：全库 137,488 行 pre-2023H2 的 vwap（6,306 只，最早 1993）是早期
+  Massive 抓取的 vwap 在 day-aggs 重导时被"保留既有 vwap"的 upsert 语义留下的
+  真 vendor 值，保留；守卫使其落 already_has_vwap 桶。
+- A3 指纹口径与导入同 commit 更新（CLAUDE.md）；代码依赖仅 import_day_aggs 两处，
+  一处被 era_start 钳制、一处只认双 NULL，均不受影响。
+- B5 日期普查内置装载台账（每月记 ET 日期数），装载完与 trading_calendars 对账，
+  有洞如实报告（补数据另立项）。
+- B7 验收门：每年抽样重构 O/H/L 精确比对 daily_prices（close/volume 明确除外）。
+- B8 零价过滤 + tz 处理（CH 原生读 tz-aware UTC parquet，无 pandas 双重 localize 风险）。
+
+### 执行记录
+
+**Part A（2026-07-06 完成，26 分 40 秒）**：输入 56,286,400 行（含补缺件），
+实际 UPDATE **22,313,394 行** vwap；flat 时代 vwap NULL 由 22,680,574 降至
+367,180（**覆盖率 98.4%**），残余为 daily_vw 缺 bar / vw 无效（148,845）/
+同实体守卫挡下的可疑归属（entity_mismatch 8,307，零写入）。
+yfinance_untouchable = 0 是正确结果——day-aggs 导入时的 --purge-remnants 已把
+重叠的 yfinance 幽灵行清掉，审计模拟里的 2,312 行是其裸 symbol join 的假象。
+补缺重叠段在 live 下按序落 already_has_vwap 桶（5.70M vs dry-run 1.59M），
+幂等性即由此验证。
+
+**Part B（2026-07-06 完成，全程约 2 小时 45 分）**：24 个年包逐年流水线
+（scp 预取与装载并行，单年 4-12 分钟），272 个月分区全部入库：
+
+- `stock.minute_bars`：**5,056,578,492 行 / 76.4 GiB**（ZSTD 后 16.2 B/行），
+  17,006 只证券，2003-09-10 ~ 2026-04-23。
+- 台账逐月记账全平：staged 7,354,678,604 = inserted 5,056,578,492 +
+  suffix 71,521,428 + unmapped 2,226,569,870 + zero_price 8,814。
+  unmapped（30%）以 2003 年代死票身份缺口为主（审计预告：行占比高、
+  美元成交额占比 2003 年代仅 ~18%、2024 年代 ~4.5%），源 parquet 保留在
+  Mac `~/Documents/WithVW/`，身份修复扩展后可回收。
+- B5 日期普查：分钟数据 distinct ET 日 5,691，对照 daily_prices 5,710——
+  差异 19 天全部是节假日（元旦/MLK/感恩节/圣诞、2012-10-29/30 飓风 Sandy
+  休市）上 daily 侧的 yfinance 双 NULL 幽灵行（每天 1-3 行）。
+  **分钟数据零缺日**；trading_calendars 只覆盖 2010+，不作基准。
+- B7 验收门：AAPL(2003)/MSFT(2010)/SPY(2016)/TSLA(2021)/NVDA(2024) 各 5 天
+  常规时段重构 O/H/L vs daily_prices：**19/20 位级命中**。唯一差异为
+  NVDA 2024-06-10（10:1 拆分生效首日）daily 侧 high=195.95 在当日
+  117-123 区间中是脏数据（拆分日污染），分钟侧 123.10 正确——
+  待修：将该行 high 订正或走 vendor 复核（记 follow-up）。
+
+发现与遗留：
+
+- daily_prices 在 19 个节假日上共 ~30 行 yfinance 幽灵 bar（双 NULL 指纹
+  可过滤，暂不清理）。
+- NVDA 2024-06-10 high 脏值（daily 侧，vendor 数据），follow-up 订正。
+- 编排器中途发现两处环境问题并已修复：wenruifeng 无 docker 组权限 →
+  装载器全面改走 ClickHouse HTTP（8123，与读取层一致，无 docker 依赖）；
+  DDL 解析对注释开头语句块的过滤 bug。

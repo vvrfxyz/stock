@@ -21,13 +21,15 @@
 编排（本机推年包、逐年调用）见 scripts/run_minute_backfill.sh。
 """
 import argparse
-import subprocess
+import os
+import shutil
 import sys
 import tarfile
 import time
 from datetime import date, timedelta
 from pathlib import Path
 
+import requests
 from loguru import logger
 
 project_root = Path(__file__).resolve().parents[1]
@@ -36,9 +38,12 @@ if str(project_root) not in sys.path:
 
 from utils.script_logging import setup_logging as configure_script_logging
 
-CLICKHOUSE_CONTAINER = "stock-clickhouse"
 LEDGER_PATH = "logs/manual_backfill/minute_bars_ledger.tsv"
 TICKER_RE = "^[A-Z][A-Z0-9.]*$"
+
+
+def clickhouse_http() -> str:
+    return (os.environ.get("CLICKHOUSE_URL") or "http://localhost:8123").rstrip("/")
 
 TRANSFORM_SQL = f"""
 INSERT INTO stock.minute_bars
@@ -94,17 +99,18 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def ch(query: str, *, input_file: Path | None = None) -> str:
-    """docker exec clickhouse-client；input_file 走 stdin（FORMAT Parquet 灌数）。"""
-    cmd = ["docker", "exec", "-i", CLICKHOUSE_CONTAINER, "clickhouse-client", "-q", query]
+def ch(query: str, *, input_file: Path | None = None, input_bytes: bytes | None = None) -> str:
+    """ClickHouse HTTP 接口（8123）；input_file/input_bytes 作 INSERT 数据体流式上传。"""
     if input_file is not None:
         with input_file.open("rb") as f:
-            result = subprocess.run(cmd, stdin=f, capture_output=True, text=False, check=False)
+            response = requests.post(clickhouse_http(), params={"query": query}, data=f, timeout=3600)
+    elif input_bytes is not None:
+        response = requests.post(clickhouse_http(), params={"query": query}, data=input_bytes, timeout=3600)
     else:
-        result = subprocess.run(cmd, capture_output=True, text=False, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"clickhouse-client 失败: {result.stderr.decode()[:500]}")
-    return result.stdout.decode()
+        response = requests.post(clickhouse_http(), data=query.encode(), timeout=3600)
+    if response.status_code != 200:
+        raise RuntimeError(f"clickhouse HTTP 失败: {response.text[:500]}")
+    return response.text
 
 
 def non_overlapping_tenures() -> list[tuple[str, int, date, date]]:
@@ -151,12 +157,7 @@ def refresh_tenures() -> int:
     rows = non_overlapping_tenures()
     payload = "".join(f"{s}\t{sid}\t{ps.isoformat()}\t{pe.isoformat()}\n" for s, sid, ps, pe in rows)
     ch("TRUNCATE TABLE stock.symbol_tenures")
-    proc = subprocess.run(
-        ["docker", "exec", "-i", CLICKHOUSE_CONTAINER, "clickhouse-client",
-         "-q", "INSERT INTO stock.symbol_tenures FORMAT TabSeparated"],
-        input=payload.encode(), capture_output=True, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(f"tenure 上传失败: {proc.stderr.decode()[:500]}")
+    ch("INSERT INTO stock.symbol_tenures FORMAT TabSeparated", input_bytes=payload.encode())
     count = ch("SELECT count() FROM stock.symbol_tenures").strip()
     logger.info("symbol_tenures 已刷新：{} 段（消解重叠后）。", count)
     return 0
@@ -197,19 +198,25 @@ def load_year(tar_path: Path, workdir: Path, ledger_rows: list[str]) -> None:
         month = next(p for p in parquet_path.parts if p.startswith("month=")).split("=")[1]
         load_month(parquet_path, f"{year}{month}", ledger_rows)
         parquet_path.unlink()
-    subprocess.run(["rm", "-rf", str(workdir / "US")], check=False)
+    shutil.rmtree(workdir / "US", ignore_errors=True)
 
 
 def main(argv: list[str] | None = None) -> int:
     start_time = time.monotonic()
     configure_script_logging("import_minute_bars_clickhouse")
+    from dotenv import load_dotenv
+    load_dotenv()
     args = create_parser().parse_args(argv)
 
     try:
         if args.init_ddl:
             ddl = (project_root / "sql/clickhouse/minute_bars.sql").read_text()
-            for statement in [s.strip() for s in ddl.split(";") if s.strip() and not s.strip().startswith("--")]:
-                ch(statement)
+            for chunk in ddl.split(";"):
+                statement = "\n".join(
+                    line for line in chunk.splitlines() if not line.strip().startswith("--")
+                ).strip()
+                if statement:
+                    ch(statement)
             logger.success("minute_bars DDL 已执行。")
             return 0
         if args.refresh_tenures:
