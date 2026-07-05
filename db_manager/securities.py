@@ -405,13 +405,14 @@ class SecuritiesMixin:
             security_id, old_symbol, new_symbol,
         )
 
-    def insert_backfilled_securities(self, rows_data: list[dict]) -> list[tuple[int, str]]:
-        """纯插入退市补录证券行（sync_delisted_universe 专用），返回 [(id, symbol)]。
+    def insert_backfilled_securities(self, rows_data: list[dict]) -> list[tuple[int, str, date]]:
+        """纯插入退市补录证券行（sync_delisted_universe 专用），返回 [(id, symbol, delist_date)]。
 
         与 upsert_securities_by_symbol 隔离：那条路径以 symbol 为冲突键，会把
         同 symbol 的退市补录行错误合并到现任持有者上。这里只插不改，且强制
         is_active=False——symbol 的部分唯一索引只约束活跃行，退市行同 symbol
-        多条合法（车牌历任持有者各占一行）。
+        多条合法（车牌历任持有者各占一行）。返回值带 delist_date 是因为
+        symbol 在死票之间也可能重复，(symbol, delist_date) 才是本批唯一键。
         """
         rows = [_clean_for_model(Security, row) for row in rows_data]
         rows = [row for row in rows if row.get("symbol") and row.get("delist_date")]
@@ -420,15 +421,16 @@ class SecuritiesMixin:
         for row in rows:
             row["is_active"] = False
             row.setdefault("current_symbol", row["symbol"])
-        inserted: list[tuple[int, str]] = []
+        inserted: list[tuple[int, str, date]] = []
         with self.engine.connect() as conn:
             self._lock_model_sequence_sync(conn, Security)
             self._sync_model_id_sequence(conn, Security)
             for group in _group_rows_by_key_set(rows):
                 result = conn.execute(
-                    pg_insert(Security).values(group).returning(Security.id, Security.symbol)
+                    pg_insert(Security).values(group)
+                    .returning(Security.id, Security.symbol, Security.delist_date)
                 )
-                inserted.extend((r.id, r.symbol) for r in result)
+                inserted.extend((r.id, r.symbol, r.delist_date) for r in result)
             conn.commit()
         return inserted
 

@@ -3,12 +3,14 @@
 背景：securities 此前只收活跃 universe（+覆盖期内退市的 ~700 只），20 年日线
 flat files 里的大量退市 ticker 无行可挂。本脚本分两阶段补齐：
 
-阶段 A（名单同步，~90 个 API 请求）：
+阶段 A（名单同步，~30 个 API 请求 + 无类型鉴定每条 1 请求）：
   拉取 /v3/reference/tickers?active=false（注意：该查询带 sort 参数会返回空，
-  适配器已规避），过滤 US CS/ETF，与既有 securities 按 FIGI→CIK+symbol→
+  适配器已规避），过滤 US，与既有 securities 按 FIGI→CIK+symbol→
   symbol+退市日邻近 匹配；匹配到活跃行的是改名幽灵（如 FB→META 后 vendor 把
   FB 记作 delisted，FIGI 同 META），跳过；匹配到退市行的做 NULL 字段补齐；
-  无匹配的插入新退市行（is_active=False，list_date 先置 NULL）。
+  无匹配的 CS/ETF 条目插入新退市行（is_active=False，list_date 先置 NULL）。
+  vendor 约 29% 的退市条目缺 type：这些先调时点详情鉴定身份与类型，确认
+  CS/ETF 才插入（该响应自带 list_date，等于免费做了阶段 B）。
 
 阶段 B（时点详情富化，每只 1 个请求）：
   对 list_date IS NULL 的退市行调 /v3/reference/tickers/{T}?date=退市日，
@@ -140,7 +142,8 @@ def classify_entries(entries: list[dict], existing_rows) -> tuple[list, list, Co
     return to_insert, to_fill, stats
 
 
-def _fetch_entries(args: argparse.Namespace, source: MassiveSource) -> tuple[list[dict], Counter]:
+def _fetch_entries(args: argparse.Namespace, source: MassiveSource) -> tuple[list[dict], list[dict], Counter]:
+    """拉取/读取退市名单 -> (CS/ETF 条目, 无类型待鉴定条目, 统计)。"""
     stats: Counter = Counter()
     if args.delisted_json:
         with open(args.delisted_json) as f:
@@ -150,18 +153,25 @@ def _fetch_entries(args: argparse.Namespace, source: MassiveSource) -> tuple[lis
         raw = source.list_delisted_tickers()
     stats["vendor_us_total"] = len(raw)
     typed = [r for r in raw if (r.get("type") or "").upper() in SUPPORTED_TYPES]
-    stats["vendor_untyped_or_other"] = len(raw) - len(typed)
+    untyped_raw = [r for r in raw if not (r.get("type") or "").strip()]
+    stats["vendor_untyped"] = len(untyped_raw)
+    stats["vendor_other_type"] = len(raw) - len(typed) - len(untyped_raw)
     typed = _dedupe_entries(typed)
+    untyped_raw = _dedupe_entries(untyped_raw)
     stats["vendor_cs_etf_deduped"] = len(typed)
-    entries = []
-    for item in typed:
-        payload = source._build_reference_payload(item)
-        if not payload.get("delist_date"):
-            stats["vendor_no_delist_date"] += 1
-            continue
-        payload["is_active"] = False
-        entries.append(payload)
-    return entries, stats
+
+    def _payloads(items: list[dict], drop_counter: str) -> list[dict]:
+        out = []
+        for item in items:
+            payload = source._build_reference_payload(item)
+            if not payload.get("delist_date"):
+                stats[drop_counter] += 1
+                continue
+            payload["is_active"] = False
+            out.append(payload)
+        return out
+
+    return _payloads(typed, "vendor_no_delist_date"), _payloads(untyped_raw, "untyped_no_delist_date"), stats
 
 
 def _load_existing(db_manager: DatabaseManager):
@@ -205,19 +215,67 @@ def _enrich_population(db_manager: DatabaseManager, limit: int):
     return rows[:limit] if limit > 0 else rows
 
 
-def enrich_check_identity(sec, overview: dict) -> bool:
-    """时点详情与本行身份是否一致：FIGI/CIK 任一双边存在且不同 → 错位。"""
-    figi = overview.get("composite_figi")
-    if figi and sec.composite_figi and figi != sec.composite_figi:
+def _overview_matches(figi, cik, delist_date, overview: dict) -> bool:
+    """时点详情与目标身份是否一致：FIGI/CIK 任一双边存在且不同 → 错位；
+    双方都无强标识时要求退市日一致才敢认。"""
+    o_figi = overview.get("composite_figi")
+    if o_figi and figi and o_figi != figi:
         return False
-    cik = overview.get("cik")
-    if cik and sec.cik and str(cik) != str(sec.cik):
+    o_cik = overview.get("cik")
+    if o_cik and cik and str(o_cik) != str(cik):
         return False
-    if not (sec.composite_figi or sec.cik):
-        # 双方都无强标识：要求退市日一致才敢认
+    if not (figi or cik):
         vendor_delist = overview.get("delisted_utc") or ""
-        return vendor_delist[:10] == sec.delist_date.isoformat()
+        return vendor_delist[:10] == delist_date.isoformat()
     return True
+
+
+def enrich_check_identity(sec, overview: dict) -> bool:
+    return _overview_matches(sec.composite_figi, sec.cik, sec.delist_date, overview)
+
+
+def _type_check_untyped(candidates: list[dict], source: MassiveSource,
+                        args: argparse.Namespace, stats: Counter) -> list[dict]:
+    """无类型退市条目的时点身份鉴定：确认为 CS/ETF 的返回可插入 payload
+    （详情响应顺带提供 list_date，省去阶段 B 再查一次）。"""
+    if not candidates:
+        return []
+    logger.info("无类型条目鉴定：{} 条待查（时点详情，每条 1 请求）。", len(candidates))
+    confirmed: list[dict] = []
+
+    def worker(entry):
+        overview = source.get_ticker_overview(entry["symbol"], lookup_date=entry["delist_date"], allow_missing=True)
+        if not overview:
+            return ("untyped_no_data", None)
+        if not _overview_matches(entry.get("composite_figi"), entry.get("cik"), entry["delist_date"], overview):
+            return ("untyped_identity_mismatch", None)
+        sec_type = (overview.get("type") or "").upper()
+        if sec_type not in SUPPORTED_TYPES:
+            return ("untyped_other_type", None)
+        payload = source._build_overview_payload(entry["symbol"], overview)
+        payload["is_active"] = False
+        payload.setdefault("delist_date", entry["delist_date"])
+        payload.setdefault("market", entry.get("market") or "US")
+        return ("untyped_confirmed_cs_etf", payload)
+
+    class _Item(dict):
+        # run_concurrently 的标签取 .symbol；给 dict 套个壳
+        @property
+        def symbol(self):
+            return self["symbol"]
+
+    outputs, counter = run_concurrently(
+        [_Item(e) for e in candidates], worker,
+        max_workers=args.enrich_workers, desc="鉴定无类型退市条目")
+    stats["untyped_fatal_error"] = counter.get("FATAL_ERROR", 0)
+    for result in outputs:
+        if result is None:
+            continue
+        status, payload = result
+        stats[status] += 1
+        if payload is not None:
+            confirmed.append(payload)
+    return confirmed
 
 
 def _run_enrich(args, source: MassiveSource, db_manager: DatabaseManager, stats: Counter) -> None:
@@ -267,17 +325,42 @@ def _run_enrich(args, source: MassiveSource, db_manager: DatabaseManager, stats:
 
 
 def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseManager) -> tuple[int, dict]:
-    entries, stats = _fetch_entries(args, source)
+    typed_entries, untyped_entries, stats = _fetch_entries(args, source)
     existing = _load_existing(db_manager)
-    to_insert, to_fill, cls_stats = classify_entries(entries, existing)
+    to_insert, to_fill, cls_stats = classify_entries(typed_entries, existing)
     stats.update(cls_stats)
 
+    # 无类型条目：能匹配上既有行的直接补 NULL 字段；匹配不上的走时点鉴定
+    u_insert, u_fill, u_stats = classify_entries(untyped_entries, existing)
+    for key, value in u_stats.items():
+        stats[f"untyped_{key}"] += value
+    to_fill.extend(u_fill)
+
     if args.dry_run:
+        stats["untyped_pending_type_check"] = len(u_insert)
         logger.info("[dry-run] 统计: {}", dict(stats))
         return 0, dict(stats)
 
+    confirmed = _type_check_untyped(u_insert, source, args, stats)
+    seen_keys = {(row["symbol"], row["delist_date"]) for row in to_insert}
+    for row in confirmed:
+        if (row["symbol"], row["delist_date"]) in seen_keys:
+            stats["untyped_dup_of_typed"] += 1
+            continue
+        to_insert.append(row)
+
     if to_fill:
         stats["filled_rows"] = _apply_fills(db_manager, to_fill)
+    deduped_insert = []
+    ins_seen = set()
+    for row in to_insert:
+        key = (row["symbol"], row["delist_date"])
+        if key in ins_seen:
+            stats["insert_key_collision_dropped"] += 1
+            continue
+        ins_seen.add(key)
+        deduped_insert.append(row)
+    to_insert = deduped_insert
     if to_insert:
         inserted = db_manager.insert_backfilled_securities(to_insert)
         stats["inserted_rows"] = len(inserted)
@@ -288,15 +371,16 @@ def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseMan
             "resolution_source": "AUTO",
             "confidence": "HIGH",
             "details": json.dumps({"origin": "massive_delisted_backfill"}),
-        } for sec_id, symbol in inserted]
+        } for sec_id, symbol, _ in inserted]
         db_manager.insert_identity_events(events)
-        symbol_to_id = dict((s, i) for i, s in inserted)
+        key_to_id = {(s, d): i for i, s, d in inserted}
         cik_rows = [{
-            "security_id": symbol_to_id[item["symbol"]],
+            "security_id": key_to_id[(item["symbol"], item["delist_date"])],
             "id_type": "CIK",
             "id_value": item["cik"],
             "source": "MASSIVE",
-        } for item in to_insert if item.get("cik") and item["symbol"] in symbol_to_id]
+        } for item in to_insert
+            if item.get("cik") and (item["symbol"], item["delist_date"]) in key_to_id]
         stats["cik_identifier_rows"] = db_manager.insert_missing_security_identifiers(cik_rows)
 
     if not args.skip_enrich:
