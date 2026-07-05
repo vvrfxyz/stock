@@ -16,9 +16,12 @@
   list_date NULL 但有 delist_date）例外：生成开口起点段，按同 symbol 链式推断
   起点（= 前任终点，无前任取 2003-01-01 地板），终点被更晚起跑的显式段截断；
   推断段与显式段重叠的日子由 ambiguous 守卫跳过。
-- 覆盖策略：只保护带 vwap 的行（vwap 是 Massive API 独有字段，flat files 与
-  yfinance 都没有）——每只证券以其最早 vwap 行为界，之前的 flat file 行一律
-  upsert 覆盖（yfinance 旧行被替换为 SIP 级数据）。--cutoff 仅作可选全局上界。
+- 覆盖策略（"Massive 时代按 2023 年底"口径）：有 vwap 行的证券，保护边界 =
+  max(其最早 vwap 日, --massive-era-start 默认 2024-01-01)——2023-12-31 及以前
+  一律以 flat files 为准（含 2023 下半年已有 Massive 行的日子：upsert 只换
+  OHLCV/trade_count，既有 vwap 保留），2024 起归 Massive；从未被 Massive 覆盖
+  的证券（2024 后退市、退市补录行）无上界，flat 数据收到任期终点，否则该段
+  永远无源可补。--cutoff 仅作可选全局上界。
 - --purge-remnants：写入后删除"本次已覆盖证券"在导入日期范围内残留的
   yfinance 行（vwap 与 trade_count 双 NULL 指纹）——它们是 SIP 无成交的幽灵
   bar 或任期外错挂行；未映射证券的 yfinance 数据保留不动。
@@ -64,6 +67,9 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cutoff", default=None,
                         help="可选全局上界：只导入早于该日期(YYYY-MM-DD)的 bar；默认不设，"
                              "以每只证券自身的现有最早 bar 为边界。")
+    parser.add_argument("--massive-era-start", default="2024-01-01",
+                        help="Massive 时代起点(YYYY-MM-DD)：有 vwap 行的证券在该日前的行"
+                             "一律用 flat files 覆盖；默认 2024-01-01。")
     parser.add_argument("--dry-run", action="store_true", help="只做映射统计，不写库。")
     parser.add_argument("--purge-remnants", action="store_true",
                         help="写入后删除已覆盖证券在导入日期范围内的 yfinance 残留行。")
@@ -249,12 +255,15 @@ def main(argv: list[str] | None = None) -> int:
         db_manager = DatabaseManager()
         from sqlalchemy import text
         cutoff = date.fromisoformat(args.cutoff) if args.cutoff else FAR_FUTURE
+        era_start = date.fromisoformat(args.massive_era_start)
         with db_manager.get_session() as session:
             massive_min = dict(session.execute(text(
                 "SELECT security_id, MIN(date) FROM daily_prices WHERE vwap IS NOT NULL GROUP BY security_id"
             )).all())
-        logger.info("Massive 保护边界: {} 只证券有 vwap 行；全局上界: {}；归档 {} 个: {} .. {}",
-                    len(massive_min), cutoff if cutoff != FAR_FUTURE else "无",
+        logger.info("Massive 保护边界: {} 只证券有 vwap 行（各自边界 = max(最早 vwap 日, {})）；"
+                    "全局上界: {}；归档 {} 个: {} .. {}",
+                    len(massive_min), era_start,
+                    cutoff if cutoff != FAR_FUTURE else "无",
                     len(archives), archives[0].name, archives[-1].name)
 
         tenures = load_tenures(db_manager)
@@ -278,8 +287,8 @@ def main(argv: list[str] | None = None) -> int:
                     if sid is None:
                         continue
                     mm = massive_min.get(sid)
-                    if mm is not None and file_date >= mm:
-                        # Massive API 时代的行（带 vwap）是最鲜数据源，不碰
+                    if mm is not None and file_date >= max(mm, era_start):
+                        # 2024 起（或该证券更晚的 vwap 起点起）归 Massive 时代，不碰
                         stats["skipped_massive_window"] += 1
                         continue
                     batch.append({
