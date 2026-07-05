@@ -1,8 +1,26 @@
-"""sync_delisted_universe 纯逻辑单元测试：名单去重 + 既有行匹配分类。"""
+"""sync_delisted_universe 纯逻辑单元测试：名单去重 + 既有行匹配分类 + 时点身份核对。"""
 from datetime import date
 from types import SimpleNamespace
 
-from scripts.sync_delisted_universe import _dedupe_entries, classify_entries
+from scripts.sync_delisted_universe import _dedupe_entries, _overview_matches, classify_entries
+
+
+class TestOverviewMatches:
+    def test_strong_id_mismatch_rejected(self):
+        assert not _overview_matches("BBG1", None, date(2015, 6, 1), {"composite_figi": "BBG2"})
+        assert not _overview_matches(None, "0001", date(2015, 6, 1), {"cik": "0002"})
+
+    def test_strong_id_agreement_accepted(self):
+        assert _overview_matches("BBG1", None, date(2015, 6, 1), {"composite_figi": "BBG1"})
+
+    def test_no_strong_id_pit_active_view_accepted(self):
+        # 查退市前一天时 vendor 视图仍是活跃态（无 delisted_utc）：时点语义保证同一实体
+        assert _overview_matches(None, None, date(2015, 6, 1), {"type": "CS", "active": True})
+
+    def test_no_strong_id_conflicting_delist_rejected(self):
+        assert not _overview_matches(None, None, date(2015, 6, 1),
+                                     {"delisted_utc": "2009-03-02T05:00:00Z"})
+
 
 
 def _row(id, symbol, *, is_active=False, list_date=None, delist_date=None,
