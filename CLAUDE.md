@@ -144,7 +144,7 @@ python -m pytest tests/ -q -m "not integration"  # 仅纯单元测试
 
 ## Data Integrity Notes
 
-- `daily_prices` 有三个来源，靠字段指纹区分（详见 `docs/day_aggs_backfill_2026-07.md`）：flat files (SIP) = vwap NULL + trade_count 有（2003-09-10 ~ 2023 年底主体）；Massive = vwap 有（2024 起）；yfinance 遗留 = 双 NULL（2003 前深历史 + OTC 填缝，读取层可按指纹过滤）。退市证券 universe 已补齐（含 2003 年以来 7,500 只退市 CS/ETF）。
+- `daily_prices` 有三个来源（详见 `docs/day_aggs_backfill_2026-07.md` 与 `docs/minute_vw_backfill_2026-07.md`）：flat files (SIP) = trade_count 有 + date < 2024（其 vwap 2026-07 起由 daily_vw 归档回填补齐，回填带同实体守卫 close 位级相等；另有 13.7 万行 pre-2023H2 的早期 Massive vwap 在 day-aggs 重导时被保留）；Massive = vwap 有（2023H2 起为主）；yfinance 遗留 = vwap/trade_count 双 NULL（2003 前深历史 + OTC 填缝，读取层可按双 NULL 指纹过滤，该指纹不受回填影响）。退市证券 universe 已补齐（含 2003 年以来 7,500 只退市 CS/ETF）。分钟线（2003+，含盘前盘后，未复权）在 ClickHouse `stock.minute_bars`，读取走 `research/minute_bars.py`；绝不用分钟加总回填日线 close/volume（收盘竞价与合并成交量在分钟条之外）。
 - Price scripts should update only through the most recent completed trading session.
 - Massive is symbol-keyed: history fetched for a recycled ticker belongs to whichever entity held the symbol then. Price/actions/short-data backfills are therefore clamped to `securities.list_date`, `sync_massive_universe` writes a `DEAD_TICKER_RECYCLE` RECYCLE event when a NEW listing reuses an inactive security's symbol, and `check_data_integrity` blocks on same-symbol securities with overlapping daily-price spans (2026-07 gogl/lazr/pinc/spcx/opi/fusd incident).
 - `securities.price_data_latest_date` should match `daily_prices.max(date)`.
