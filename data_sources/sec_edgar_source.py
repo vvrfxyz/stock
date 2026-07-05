@@ -712,34 +712,42 @@ def parse_thirteenf_submission(submission_text: str, accession_number: str) -> l
 
     rows = []
     entry_index = 0
+
+    def _clamp(value, width):
+        # 极个别 filing 的自由文本字段超列宽（如 2017Q1 0001398344-17-001911），
+        # 截断入库好过整个 filing 被 StringDataRightTruncation 拒收
+        if value is not None and len(value) > width:
+            return value[:width]
+        return value
+
     for node in info_root.iter():
         if _strip_ns(node.tag) != "infoTable":
             continue
         shrs = _find_ns(node, "shrsOrPrnAmt")
         voting = _find_ns(node, "votingAuthority")
-        other_managers_text = _text_ns(node, "otherManager")
+        other_managers_text = _clamp(_text_ns(node, "otherManager"), 255)
         rows.append(
             {
                 "source": "SEC_EDGAR",
                 "accession_number": accession_number,
                 "source_row_hash": _row_hash([accession_number, entry_index]),
                 "filer_cik": filer_cik,
-                "form_type": form_type,
+                "form_type": _clamp(form_type, 20),
                 "period": period,
-                "issuer_name": _text_ns(node, "nameOfIssuer"),
-                "title_of_class": _text_ns(node, "titleOfClass"),
-                "cusip": _text_ns(node, "cusip"),
+                "issuer_name": _clamp(_text_ns(node, "nameOfIssuer"), 255),
+                "title_of_class": _clamp(_text_ns(node, "titleOfClass"), 100),
+                "cusip": _clamp(_text_ns(node, "cusip"), 20),
                 "market_value": _parse_decimal(_text_ns(node, "value")),
                 "shares_or_principal_amount": _parse_decimal(_text_ns(shrs, "sshPrnamt")),
-                "shares_or_principal_type": _text_ns(shrs, "sshPrnamtType"),
-                "put_call": _text_ns(node, "putCall"),
-                "investment_discretion": _text_ns(node, "investmentDiscretion"),
+                "shares_or_principal_type": _clamp(_text_ns(shrs, "sshPrnamtType"), 10),
+                "put_call": _clamp(_text_ns(node, "putCall"), 10),
+                "investment_discretion": _clamp(_text_ns(node, "investmentDiscretion"), 20),
                 "other_managers": [other_managers_text] if other_managers_text else None,
                 "voting_authority_sole": _parse_decimal(_text_ns(voting, "Sole")),
                 "voting_authority_shared": _parse_decimal(_text_ns(voting, "Shared")),
                 "voting_authority_none": _parse_decimal(_text_ns(voting, "None")),
-                "file_number": file_number,
-                "filer_name": filer_name,
+                "file_number": _clamp(file_number, 50) if file_number else file_number,
+                "filer_name": _clamp(filer_name, 255),
             }
         )
         entry_index += 1

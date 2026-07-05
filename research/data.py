@@ -176,12 +176,19 @@ def securities_with_uncovered_events(
     end: date,
     methodology_version: str = DEFAULT_METHODOLOGY_VERSION,
 ) -> list[int]:
-    """窗口内存在 corporate_actions 事件但无对应因子行的证券。
+    """窗口内存在 corporate_actions 事件但无对应因子覆盖的证券。
 
     主要是因子构建曾只跑 is_active=True 导致的退市股缺口，以及外币分红缺 FX 汇率
     被构建跳过的事件；缺因子的拆股/分红会在价格序列里留下假跳空，这些证券必须从
-    横截面样本中剔除。匹配按 source_event_id 事件级对齐（同因子构建口径，只看
-    MASSIVE 来源），同日另一事件的因子行不会掩盖被跳过的事件。
+    横截面样本中剔除。两个分支：
+
+    - MASSIVE 事件按 source_event_id 事件级对齐（同因子构建口径），同日另一事件的
+      因子行不会掩盖被跳过的事件。
+    - 非 MASSIVE 事件（POLYGON legacy 合成行等）不参与因子构建：同日存在同类型
+      MASSIVE 行即视为已被 vendor 事件接管（其因子覆盖由上一分支把关）；没有
+      MASSIVE 对应行的孤行就是复权链上的洞——2003 归档导入的值冲突挂起
+      （import_corporate_actions_archive R13）、未确认保留的合成行、归档漏抓的
+      证券都靠这个分支机器剔除，人工裁决落库后本函数自动放行。
     """
     sql = text(
         """
@@ -189,12 +196,22 @@ def securities_with_uncovered_events(
         from corporate_actions ca
         where ca.ex_date between :start and :end
           and ca.action_type in ('SPLIT', 'DIVIDEND')
-          and upper(ca.source) = 'MASSIVE'
-          and not exists (
-            select 1 from computed_adjustment_factors f
-            where f.security_id = ca.security_id
-              and f.source_event_id = ca.source_event_id
-              and f.methodology_version = :mv)
+          and (
+            (upper(ca.source) = 'MASSIVE'
+             and not exists (
+               select 1 from computed_adjustment_factors f
+               where f.security_id = ca.security_id
+                 and f.source_event_id = ca.source_event_id
+                 and f.methodology_version = :mv))
+            or
+            (upper(ca.source) <> 'MASSIVE'
+             and not exists (
+               select 1 from corporate_actions m
+               where m.security_id = ca.security_id
+                 and m.action_type = ca.action_type
+                 and m.ex_date = ca.ex_date
+                 and upper(m.source) = 'MASSIVE'))
+          )
         """
     )
     with engine.connect() as conn:

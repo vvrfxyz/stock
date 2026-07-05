@@ -93,7 +93,7 @@ def test_uncovered_events_matches_at_event_level(pg_db):
     day = date(2024, 6, 3)
     mv = "raw_actions_v1"
     with pg_db.get_session() as session:
-        for sid in (1, 2, 3, 4):
+        for sid in (1, 2, 3, 4, 5):
             session.add(
                 Security(
                     id=sid,
@@ -154,7 +154,9 @@ def test_uncovered_events_matches_at_event_level(pg_db):
                 split_from=Decimal("1"), split_to=Decimal("10"),
             )
         )
-        # 证券 4：非 MASSIVE 来源不参与因子构建，不应剔除
+        # 证券 4：非 MASSIVE 孤行（无同日 MASSIVE 对应行）= 复权链上的洞，须剔除
+        # （2003 归档导入后 POLYGON 孤行是真实事件的唯一记录：R13 值冲突挂起、
+        #  未确认保留的合成行、归档漏抓都落在这个形态）
         session.add(
             CorporateAction(
                 security_id=4, action_type="DIVIDEND", ex_date=day,
@@ -162,9 +164,32 @@ def test_uncovered_events_matches_at_event_level(pg_db):
                 cash_amount=Decimal("1.0"), currency="USD",
             )
         )
+        # 证券 5：非 MASSIVE 行有同日同类型 MASSIVE 行接管（其因子已建），不剔除
+        session.add(
+            CorporateAction(
+                security_id=5, action_type="DIVIDEND", ex_date=day,
+                source="POLYGON", source_event_id="massive-dividend:5:legacy",
+                cash_amount=Decimal("0.3"), currency="USD",
+            )
+        )
+        session.add(
+            CorporateAction(
+                security_id=5, action_type="DIVIDEND", ex_date=day,
+                source="MASSIVE", source_event_id="ev-div-5",
+                cash_amount=Decimal("0.3"), currency="USD",
+            )
+        )
+        session.add(
+            ComputedAdjustmentFactor(
+                security_id=5, date=day, methodology_version=mv,
+                factor_type="historical_adjustment", factor_key="dividend:ev-div-5",
+                source_event_id="ev-div-5", action_type="DIVIDEND",
+                cumulative_factor=Decimal("0.95"), event_hash="h5",
+            )
+        )
         session.commit()
 
     got = securities_with_uncovered_events(
         pg_db.engine, start=date(2024, 6, 1), end=date(2024, 6, 30)
     )
-    assert sorted(got) == [1, 3]
+    assert sorted(got) == [1, 3, 4]
