@@ -297,6 +297,10 @@ def main(argv: list[str] | None = None) -> int:
                         # 2024 起（或该证券更晚的 vwap 起点起）归 Massive 时代，不碰
                         stats["skipped_massive_window"] += 1
                         continue
+                    if float(r["open"]) <= 0 or float(r["high"]) <= 0 or float(r["low"]) <= 0 or float(r["close"]) <= 0:
+                        # sub-penny 精度下溢出的零价 bar：无信息量且毒害收益率计算
+                        stats["skipped_zero_price"] += 1
+                        continue
                     batch.append({
                         "security_id": sid,
                         "date": file_date,
