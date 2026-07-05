@@ -13,9 +13,12 @@
   多个记 ambiguous，都跳过并计数。
 - list_date 为 NULL 的证券不参与（任期起点无从界定，宁缺毋滥——先跑
   update_massive_details --all 补齐）。
-- 逐证券边界：每只证券只导入早于其现有最早 bar（live_min）的行——已有深历史
-  （付费档回填到 2001 年等）的证券一根不动；只有 730 天窗口的补齐 2003 起的
-  缺口。--cutoff 仅作为可选的全局上界（默认不设）。
+- 覆盖策略：只保护带 vwap 的行（vwap 是 Massive API 独有字段，flat files 与
+  yfinance 都没有）——每只证券以其最早 vwap 行为界，之前的 flat file 行一律
+  upsert 覆盖（yfinance 旧行被替换为 SIP 级数据）。--cutoff 仅作可选全局上界。
+- --purge-remnants：写入后删除"本次已覆盖证券"在导入日期范围内残留的
+  yfinance 行（vwap 与 trade_count 双 NULL 指纹）——它们是 SIP 无成交的幽灵
+  bar 或任期外错挂行；未映射证券的 yfinance 数据保留不动。
 - 幂等：upsert 冲突键 (security_id, date)，重跑安全。
 
 用法（253 上）：
@@ -57,6 +60,8 @@ def create_parser() -> argparse.ArgumentParser:
                         help="可选全局上界：只导入早于该日期(YYYY-MM-DD)的 bar；默认不设，"
                              "以每只证券自身的现有最早 bar 为边界。")
     parser.add_argument("--dry-run", action="store_true", help="只做映射统计，不写库。")
+    parser.add_argument("--purge-remnants", action="store_true",
+                        help="写入后删除已覆盖证券在导入日期范围内的 yfinance 残留行。")
     parser.add_argument("--unmapped-report", default="logs/manual_backfill/day_aggs_unmapped.tsv",
                         help="未映射 ticker 汇总输出路径（相对项目根）。")
     return parser
@@ -209,17 +214,18 @@ def main(argv: list[str] | None = None) -> int:
         from sqlalchemy import text
         cutoff = date.fromisoformat(args.cutoff) if args.cutoff else FAR_FUTURE
         with db_manager.get_session() as session:
-            live_min = dict(session.execute(text(
-                "SELECT security_id, MIN(date) FROM daily_prices GROUP BY security_id"
+            massive_min = dict(session.execute(text(
+                "SELECT security_id, MIN(date) FROM daily_prices WHERE vwap IS NOT NULL GROUP BY security_id"
             )).all())
-        logger.info("逐证券边界: {} 只证券已有价格覆盖；全局上界: {}；归档 {} 个: {} .. {}",
-                    len(live_min), cutoff if cutoff != FAR_FUTURE else "无",
+        logger.info("Massive 保护边界: {} 只证券有 vwap 行；全局上界: {}；归档 {} 个: {} .. {}",
+                    len(massive_min), cutoff if cutoff != FAR_FUTURE else "无",
                     len(archives), archives[0].name, archives[-1].name)
 
         tenures = load_tenures(db_manager)
         stats: Counter = Counter()
         unmapped: Counter = Counter()
         touched_ids: set[int] = set()
+        imported_range: list = [None, None]  # [min_date, max_date] 本次实际写入范围
 
         for tgz_path in archives:
             year_written = 0
@@ -235,10 +241,10 @@ def main(argv: list[str] | None = None) -> int:
                     sid = mapping.get(r["ticker"])
                     if sid is None:
                         continue
-                    lm = live_min.get(sid)
-                    if lm is not None and file_date >= lm:
-                        # 该证券此日期起已有覆盖（在线管道或更早的深度回填），不碰
-                        stats["skipped_live_window"] += 1
+                    mm = massive_min.get(sid)
+                    if mm is not None and file_date >= mm:
+                        # Massive API 时代的行（带 vwap）是最鲜数据源，不碰
+                        stats["skipped_massive_window"] += 1
                         continue
                     batch.append({
                         "security_id": sid,
@@ -251,6 +257,10 @@ def main(argv: list[str] | None = None) -> int:
                 if batch and not args.dry_run:
                     year_written += db_manager.upsert_daily_prices(batch)
                     touched_ids.update(row["security_id"] for row in batch)
+                    if imported_range[0] is None or file_date < imported_range[0]:
+                        imported_range[0] = file_date
+                    if imported_range[1] is None or file_date > imported_range[1]:
+                        imported_range[1] = file_date
                 year_files += 1
             logger.info("[{}] 处理 {} 个交易日，写入 {} 行。", tgz_path.name, year_files, year_written)
             stats["rows_written"] += year_written
@@ -266,6 +276,22 @@ def main(argv: list[str] | None = None) -> int:
             for ticker, n in unmapped.most_common():
                 f.write(f"{ticker}\t{n}\n")
         logger.info("未映射 ticker 报告: {}（{} 个）", report_path, len(unmapped))
+
+        # yfinance 残留清理：只针对本次被覆盖过的证券、只在本次导入的日期范围内。
+        # 残留 = flat files 没有对应行的 yfinance bar（SIP 无成交的幽灵日、或
+        # 任期外错挂），双 NULL 指纹（vwap、trade_count）不会误伤 flat file 行
+        # （其 trade_count 非空）与 Massive 行（其 vwap 非空）。
+        if args.purge_remnants and not args.dry_run and touched_ids and imported_range[0]:
+            with db_manager.get_session() as session:
+                purged = session.execute(text("""
+                    DELETE FROM daily_prices
+                    WHERE security_id = ANY(:ids)
+                      AND date >= :lo AND date <= :hi
+                      AND vwap IS NULL AND trade_count IS NULL
+                """), {"ids": list(touched_ids), "lo": imported_range[0], "hi": imported_range[1]})
+                session.commit()
+                logger.info("yfinance 残留清理: 删除 {} 行（{} 只证券，{} ~ {}）。",
+                            purged.rowcount or 0, len(touched_ids), imported_range[0], imported_range[1])
 
         # 水位线自愈：导入历史 bar 一般不会推高 MAX(date)，但个别证券
         # （水位曾为空/滞后）可能变化，统一按事实重算，保住 integrity 检查。
