@@ -40,6 +40,7 @@ SUPPORTED_TYPES = {"CS", "ETF"}
 # symbol 兜底匹配时，vendor 退市日与库内 delist_date 允许的最大偏差
 DELIST_MATCH_TOLERANCE = timedelta(days=35)
 FILLABLE_FIELDS = ("delist_date", "cik", "composite_figi", "share_class_figi", "name", "exchange")
+ENRICH_COMMIT_BATCH = 500
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -239,25 +240,30 @@ def _run_enrich(args, source: MassiveSource, db_manager: DatabaseManager, stats:
             return (sec.id, "enrich_vendor_no_list_date", None)
         return (sec.id, "enriched", fills)
 
-    outputs, counter = run_concurrently(
-        population, worker, max_workers=args.enrich_workers, desc="富化退市证券")
-    stats["enrich_fatal_error"] = counter.get("FATAL_ERROR", 0)
-
     from sqlalchemy import text
-    with db_manager.get_session() as session:
-        for result in outputs:
-            if result is None:
-                continue
-            sec_id, status, fills = result
-            stats[status] += 1
-            if status != "enriched":
-                continue
-            sets = ", ".join(f"{col} = COALESCE({col}, :{col})" for col in fills)
-            session.execute(
-                text(f"UPDATE securities SET {sets} WHERE id = :sec_id"),
-                {**fills, "sec_id": sec_id},
-            )
-        session.commit()
+    # 分批跑+批间落库：几小时的任务中途被杀时已完成的批次不丢
+    for lo in range(0, len(population), ENRICH_COMMIT_BATCH):
+        chunk = population[lo:lo + ENRICH_COMMIT_BATCH]
+        outputs, counter = run_concurrently(
+            chunk, worker, max_workers=args.enrich_workers,
+            desc=f"富化退市证券 {lo + 1}-{lo + len(chunk)}/{len(population)}")
+        stats["enrich_fatal_error"] += counter.get("FATAL_ERROR", 0)
+        with db_manager.get_session() as session:
+            for result in outputs:
+                if result is None:
+                    continue
+                sec_id, status, fills = result
+                stats[status] += 1
+                if status != "enriched":
+                    continue
+                sets = ", ".join(f"{col} = COALESCE({col}, :{col})" for col in fills)
+                session.execute(
+                    text(f"UPDATE securities SET {sets} WHERE id = :sec_id"),
+                    {**fills, "sec_id": sec_id},
+                )
+            session.commit()
+        logger.info("阶段 B 进度 {}/{}: {}", min(lo + ENRICH_COMMIT_BATCH, len(population)),
+                    len(population), {k: v for k, v in stats.items() if k.startswith("enrich")})
 
 
 def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseManager) -> tuple[int, dict]:
