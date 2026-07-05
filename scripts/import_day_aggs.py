@@ -208,19 +208,25 @@ def resolve_file_map(
 
 
 def iter_day_files(tgz_path: Path):
-    """流式迭代年包内的 (file_date, csv_bytes)，不落盘解包。"""
-    with tarfile.open(tgz_path, "r:gz") as tar:
+    """流式迭代年包内的 (file_date, csv_bytes)，不落盘解包。
+
+    年包实际是"未压缩 tar 内嵌逐日 csv.gz"（macOS 拷贝还塞了 ._AppleDouble
+    垃圾成员），故用 r:* 自动探测外层压缩、显式跳过 ._ 成员、内层按 gzip
+    魔数决定是否解压。
+    """
+    with tarfile.open(tgz_path, "r:*") as tar:
         for member in tar:
-            if not member.isfile() or not member.name.endswith(".csv.gz"):
+            name = Path(member.name).name
+            if not member.isfile() or name.startswith("._") or not name.endswith(".csv.gz"):
                 continue
-            day_str = Path(member.name).name.removesuffix(".csv.gz")
+            day_str = name.removesuffix(".csv.gz")
             try:
                 file_date = date.fromisoformat(day_str)
             except ValueError:
                 logger.warning("[{}] 无法从文件名解析日期，跳过: {}", tgz_path.name, member.name)
                 continue
             raw = tar.extractfile(member).read()
-            yield file_date, gzip.decompress(raw)
+            yield file_date, gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw
 
 
 def parse_rows(csv_bytes: bytes, tgz_name: str, file_date: date) -> list[dict]:
