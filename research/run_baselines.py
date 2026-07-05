@@ -1,13 +1,12 @@
 """技术分析基线回测入口。
 
-数据现实约束（2026-06 时点）：
-- computed_adjustment_factors 只覆盖 ex_date >= 2024-05-14 的事件（Massive 免费档
-  730 天可信窗口；因子构建只对该窗口做 vendor 对账）。更早的拆股/分红没有因子，
-  所以 **2024-05-14 之前的"复权价"并未真正复权**，绝不能用于回测。
-- 因此默认面板从 2024-05-14 开始；带长 warmup 的策略（12-1 动量、SMA200）
-  指标评估从 --eval-start（默认 2025-06-01）起算。
-- 窗口内有 SPLIT 事件但无因子行的证券（因子构建只跑 active，退市股有缺口）
-  会被整体剔除，避免假跳空污染横截面。
+数据现实约束（2026-07 时点，corporate-actions 20 年回填后）：
+- computed_adjustment_factors 覆盖 ex_date >= 2003-01-01 的 MASSIVE 源事件
+  （2026-07 归档导入，见 docs/corp_actions_archive_2026-07.md）；2003 前无价格
+  也无事件，仍是硬地板。pre-2024-05-14 的链没有 vendor reference 可对账，
+  只能靠价格跳变抽验兜底。
+- 存在无因子覆盖事件的证券（值冲突挂起、POLYGON 孤行、归档漏抓、退市缺口）
+  由 securities_with_uncovered_events 整体剔除，避免假跳空污染横截面。
 
 用法（连 253 生产库，只读）：
     RESEARCH_DATABASE_URL=postgresql://...@192.168.1.253:5432/stock \
@@ -36,12 +35,13 @@ from research.strategies import momentum_12_1, short_term_reversal, sma_trend
 from research.universe import build_universe_mask
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
-FACTOR_TRUST_FLOOR = date(2024, 5, 14)
+FACTOR_TRUST_FLOOR = date(2003, 1, 1)
+DEFAULT_PANEL_START = date(2024, 5, 14)  # 基线默认沿用原窗口；20 年面板显式传 --start
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="技术分析基线回测")
-    parser.add_argument("--start", type=date.fromisoformat, default=FACTOR_TRUST_FLOOR)
+    parser.add_argument("--start", type=date.fromisoformat, default=DEFAULT_PANEL_START)
     parser.add_argument("--end", type=date.fromisoformat, default=date(2026, 6, 10))
     parser.add_argument("--eval-start", type=date.fromisoformat, default=date(2025, 6, 1),
                         help="指标起算日（之前为 warmup，不计入收益统计）")

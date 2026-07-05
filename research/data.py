@@ -18,7 +18,9 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 DEFAULT_METHODOLOGY_VERSION = "raw_actions_v1"
-FACTOR_TRUST_FLOOR = date(2024, 5, 14)
+# 2026-07 corporate-actions 20 年回填后（docs/corp_actions_archive_2026-07.md），
+# MASSIVE 源事件与因子链覆盖到 2003；更早无价格、无事件，仍是硬地板。
+FACTOR_TRUST_FLOOR = date(2003, 1, 1)
 
 
 def research_engine(database_url: str | None = None) -> Engine:

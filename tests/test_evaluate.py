@@ -460,8 +460,9 @@ def test_params_hash_excludes_note():
 
 
 def test_parse_args_rejects_start_before_trust_floor():
+    # 2026-07 归档回填后 trust floor = 2003-01-01（价格与事件的共同硬地板）
     with pytest.raises(SystemExit) as exc_info:
-        parse_args(["--factors", "size", "--start", "2024-05-13"])
+        parse_args(["--factors", "size", "--start", "2002-12-31"])
 
     assert exc_info.value.code == 2
 

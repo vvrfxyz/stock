@@ -35,6 +35,9 @@ from utils.trading_calendar import shift_trading_date
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 DEFAULT_TRIALS_PATH = OUTPUT_DIR / "trials.parquet"
 DEFAULT_HORIZONS = (1, 5, 10, 21)
+# 因子链已覆盖 2003+（FACTOR_TRUST_FLOOR），但 20 年全市场面板内存/耗时大，
+# 默认评估窗口仍取原 2024-05-14；长窗口评估显式传 --start。
+DEFAULT_EVAL_PANEL_START = date(2024, 5, 14)
 NOISE_THRESHOLD = 3.0
 MIN_OBS = 60
 
@@ -913,7 +916,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--factors", help="逗号分隔因子名")
     group.add_argument("--all", action="store_true", help="评估所有注册因子")
-    parser.add_argument("--start", type=date.fromisoformat, default=FACTOR_TRUST_FLOOR)
+    parser.add_argument("--start", type=date.fromisoformat, default=DEFAULT_EVAL_PANEL_START)
     parser.add_argument("--end", type=date.fromisoformat, default=date.today())
     parser.add_argument("--as-of", type=date.fromisoformat, default=None)
     parser.add_argument("--eval-start", type=date.fromisoformat, default=None)

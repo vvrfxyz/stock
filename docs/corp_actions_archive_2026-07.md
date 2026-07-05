@@ -109,24 +109,46 @@ rtol 1e-6），落实 CLAUDE.md"真 vendor id 出现时清理合成 id"规则；
   EUR 申报 vs USD 折算 8 条、FBL 2023 疑似 59 倍错值——3 只证券待人工裁决）
 - 与审计独立预测精确吻合：2,176 / 27 / 352 / 156 / 缺币种 5
 
-## 上线步骤（apply runbook）
+## 上线记录（2026-07-06 执行完毕）
 
-1. 同步代码到 253；scp 两个 parquet 到 `/home/wenruifeng/data/fundamentals/corporate_actions/US/`。
-2. 253 上 `--dry-run` 复核计数与本地基线一致；备份库（备份保留 7 天，磁盘 30G 硬约束注意）。
-3. 正式导入（预期 +243,107 行 corporate_actions：239,770 分红 + 3,337 拆股）。
-4. `--retire-synthetic`（预期删除 ~165k POLYGON 合成行；先 dry-run 看计数）。
-5. GOOGL 2014-04-03 MANUAL 拆股事件人工补录（1:2.002，Class C 分发）。
-6. 值冲突 3 只证券（CVI/CNHI/FBL）人工裁决：把正确值落库（更正/删除 POLYGON 行
-   或补录正确 MASSIVE 事件）后 `securities_with_uncovered_events` 自动放行；
-   裁决前这些证券被 gate 自动剔出研究面板，不阻塞整体上线。
-7. `update_adjustment_factors --all`（methodology_version 仍为 raw_actions_v1：
-   输入事件集本身变了，因子全量重算；pre-2024 无 vendor reference 属预期，
-   对账状态为 SUCCESS_NO_VENDOR_REFERENCE）。
-8. 移动研究层数据边界：`research/data.py` 的 2024-05-14 面板下限 → 2003-01-01，
-   重算 `securities_with_uncovered_events`；跑 `check_data_integrity`、
-   `health_report`、全量 pytest（含复权一致性测试）。
-9. 抽样验证 ~50 只证券的重建因子链 vs ex-date 前后价格跳变比例
-   （pre-2024 唯一可用的独立验证）。
+按 runbook 全流程完成，生产库最终状态：
+
+- corporate_actions：MASSIVE 307,411 行（64,303 live + 243,107 归档 + 1 人工裁决），
+  POLYGON 剩 28,487 行孤行（2,168 只证券，gate 自动剔除，待身份修复项目回收）；
+  retire-synthetic 删除 142,927 行位级确认的合成行；导入前表备份
+  `/home/wenruifeng/backups/corporate_actions_pre_archive_20260706.dump`。
+- computed_adjustment_factors：303,741 行 / 10,872 只证券（此前 64,248 行 / 6,750 只），
+  日期 2003-01-09 起；全量重建 6 分 58 秒。
+- 幂等实证：导入后重跑，243,107 行全部 skipped_existing_id，写入 0。
+- vendor 对账：mismatch 177 vs 导入前周末全量基线 162-169——增量可忽略。
+- 抽验：50 只大比例 pre-2024 拆股，36 只两侧有价可测，34/36（94%）价格跳变
+  与拆分比例在 30% 容差内吻合，2 只离群为 OTC 稀疏价格。
+- check_data_integrity 通过；health_report P0=0、P1 由 13 降至 10。
+
+三只值冲突裁决结果：
+
+- **CNHI**：归档 EUR 申报名义值胜出（0.20 EUR ≈ prod 存量 USD 折算 0.2120，
+  归档才是正确 PIT 口径，FX 由因子层折算）。删 8 条 POLYGON USD 行、导入 8 条
+  EUR 行；另发现并清除 1 条 2003 年拆股污染行（早于 2013-09-30 上市日十年，
+  ticker 回收残留）。
+- **CVI 2021-06-11**：不是冲突，是双成分特别分红（SEC 8-K：$492M = 现金 $2.40 +
+  Delek 股票分配 ≈ $2.49/股；价格跳变 -4.38 印证总额）。两行均已入库（2.49 按
+  vendor id 手工放行）。
+- **FBL 2023-12-27**：挂起判对了，0.674 那行**不该导**——该 vendor id 在 prod 里
+  已被 live sync 挂到 2025-12-29（vendor 事后把 id 挪给了 2025 年的分配）；
+  40.02 巨额分配本身是真的（杠杆 ETF 年末资本利得，价格 118.51→78.90 印证）。
+  结构性只插入防线在生产环境真实拦截了一次"快照旧值覆盖 live 修订"。
+
+后续项目（不阻塞）：
+
+- **Alphabet 价格断层**：GOOGL/GOOG 价格都只从 2015-10-06 起——2015 年重组前的
+  Google 时代（ticker GOOG，2004-2014）在 day-aggs 导入时因 symbol history 无任期
+  而整段 unmapped。GOOGL 2014 拆分补录在价格补齐前无意义（审计 C5 就此关闭）。
+  需要：修 775/797 的 symbol history 任期 → 重导 GOOG 2004-2015 day-aggs 行 →
+  补 2014-04-03 拆分事件 → 重建两只因子。
+- POLYGON 孤行回收：2,168 只证券的 28,487 行（out_of_tenure 归档行 + 归档缺漏），
+  按 repair_identity 流程逐步裁决。
+- 每周严格模式（--fail-on-vendor-mismatch）阈值如告警可将基线由 ~165 调至 ~180。
 
 ## 残余风险（审计原文摘要）
 
