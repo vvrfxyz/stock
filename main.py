@@ -32,6 +32,7 @@ from scripts.update_institutional_holdings import main as update_institutional_h
 from scripts.update_fx_rates import main as update_fx_rates_main
 from scripts.update_risk_free_rates import main as update_risk_free_rates_main
 from scripts.sync_cusip_identifiers import main as sync_cusip_identifiers_main
+from scripts.sync_delisted_universe import main as sync_delisted_universe_main
 from scripts.sync_openfigi_identifiers import main as sync_openfigi_identifiers_main
 from scripts.update_massive_shares import main as update_massive_shares_main
 from scripts.update_massive_events import main as update_massive_events_main
@@ -624,6 +625,21 @@ def run_update_risk_free_rates(args):
     execute_script(update_risk_free_rates_main, cli_args)
 
 
+def run_sync_delisted_universe(args):
+    logger.info("执行: 同步 Massive 退市名单（20 年 universe 补齐）")
+    cli_args = []
+    if args.dry_run:
+        cli_args.append('--dry-run')
+    if args.delisted_json:
+        cli_args.extend(['--delisted-json', args.delisted_json])
+    if args.skip_enrich:
+        cli_args.append('--skip-enrich')
+    if args.enrich_limit:
+        cli_args.extend(['--enrich-limit', str(args.enrich_limit)])
+    cli_args.extend(['--enrich-workers', str(args.enrich_workers)])
+    execute_script(sync_delisted_universe_main, cli_args)
+
+
 def run_sync_cusip_identifiers(args):
     logger.info("执行: 同步 FTD CUSIP 身份映射")
     cli_args = ['--market', args.market, '--months', str(args.months)]
@@ -786,6 +802,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync_universe.add_argument('--limit', type=int, default=0, help="限制处理数量。")
     p_sync_universe.add_argument('--skip-mark-missing-inactive', action='store_true', help="跳过 inactive 标记。")
     p_sync_universe.set_defaults(func=run_sync_massive_universe)
+
+    p_sync_delisted = subparsers.add_parser('sync_delisted_universe', help="同步 Massive 退市 CS/ETF 名单（20 年 universe 补齐）")
+    p_sync_delisted.add_argument('--dry-run', action='store_true', help="只统计不写库。")
+    p_sync_delisted.add_argument('--delisted-json', type=str, default=None, help="调试：从本地 JSON 读取退市名单。")
+    p_sync_delisted.add_argument('--skip-enrich', action='store_true', help="跳过时点详情富化阶段。")
+    p_sync_delisted.add_argument('--enrich-limit', type=int, default=0, help="富化阶段最多处理多少只（0=不限）。")
+    p_sync_delisted.add_argument('--enrich-workers', type=int, default=8, help="富化阶段并发线程数。")
+    p_sync_delisted.set_defaults(func=run_sync_delisted_universe)
 
     p_sec_ids = subparsers.add_parser('sync_sec_identifiers', help="同步 SEC ticker->CIK 身份映射")
     p_sec_ids.add_argument('--market', type=str, default='US', help="当前仅支持 US。")

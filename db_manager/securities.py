@@ -405,6 +405,33 @@ class SecuritiesMixin:
             security_id, old_symbol, new_symbol,
         )
 
+    def insert_backfilled_securities(self, rows_data: list[dict]) -> list[tuple[int, str]]:
+        """纯插入退市补录证券行（sync_delisted_universe 专用），返回 [(id, symbol)]。
+
+        与 upsert_securities_by_symbol 隔离：那条路径以 symbol 为冲突键，会把
+        同 symbol 的退市补录行错误合并到现任持有者上。这里只插不改，且强制
+        is_active=False——symbol 的部分唯一索引只约束活跃行，退市行同 symbol
+        多条合法（车牌历任持有者各占一行）。
+        """
+        rows = [_clean_for_model(Security, row) for row in rows_data]
+        rows = [row for row in rows if row.get("symbol") and row.get("delist_date")]
+        if not rows:
+            return []
+        for row in rows:
+            row["is_active"] = False
+            row.setdefault("current_symbol", row["symbol"])
+        inserted: list[tuple[int, str]] = []
+        with self.engine.connect() as conn:
+            self._lock_model_sequence_sync(conn, Security)
+            self._sync_model_id_sequence(conn, Security)
+            for group in _group_rows_by_key_set(rows):
+                result = conn.execute(
+                    pg_insert(Security).values(group).returning(Security.id, Security.symbol)
+                )
+                inserted.extend((r.id, r.symbol) for r in result)
+            conn.commit()
+        return inserted
+
     def insert_identity_events(self, events: list[dict]) -> int:
         """批量写入身份变更事件（纯追加，不做 upsert）。"""
         rows = [_clean_for_model(SecurityIdentityEvent, e) for e in events]

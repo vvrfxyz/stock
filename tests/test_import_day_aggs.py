@@ -3,7 +3,7 @@ from collections import Counter
 from datetime import date
 from types import SimpleNamespace
 
-from scripts.import_day_aggs import FAR_FUTURE, build_tenures, resolve_file_map
+from scripts.import_day_aggs import FAR_FUTURE, OPEN_START_FLOOR, build_tenures, resolve_file_map
 
 
 def _sec(id, symbol, *, list_date, delist_date=None, is_active=True, max_bar=None):
@@ -31,6 +31,58 @@ class TestBuildTenures:
     def test_null_list_date_excluded(self):
         tenures, skipped = build_tenures([_sec(1, "aapl", list_date=None)], [])
         assert skipped == 1 and tenures == {}
+
+    def test_delisted_backfill_open_start_uses_floor(self):
+        # 退市补录行（list_date NULL + delist_date）：无前任时起点取地板
+        secs = [_sec(50, "dead1", list_date=None, delist_date=date(2011, 6, 3), is_active=False)]
+        tenures, skipped = build_tenures(secs, [])
+        assert skipped == 0
+        assert tenures["dead1"] == [(50, OPEN_START_FLOOR, date(2011, 6, 4))]
+
+    def test_delisted_backfill_inactive_without_delist_still_excluded(self):
+        secs = [_sec(51, "dead2", list_date=None, is_active=False)]
+        tenures, skipped = build_tenures(secs, [])
+        assert skipped == 1 and tenures == {}
+
+    def test_dead_chain_two_holders_split_at_prior_delist(self):
+        # 同 symbol 两只退市补录：后任起点 = 前任终点（链式推断）
+        secs = [
+            _sec(60, "reuse", list_date=None, delist_date=date(2008, 5, 9), is_active=False),
+            _sec(61, "reuse", list_date=None, delist_date=date(2019, 2, 1), is_active=False),
+        ]
+        tenures, _ = build_tenures(secs, [])
+        segs = sorted(tenures["reuse"])
+        assert segs[0] == (60, OPEN_START_FLOOR, date(2008, 5, 10))
+        assert segs[1] == (61, date(2008, 5, 10), date(2019, 2, 2))
+
+    def test_dead_chain_clipped_by_active_recycler(self):
+        # 死代码被现役公司回收（有 list_date）：开口段终点被现役起点截断
+        secs = [
+            _sec(70, "recyc", list_date=None, delist_date=date(2015, 3, 20), is_active=False),
+            _sec(71, "recyc", list_date=date(2021, 9, 1)),
+        ]
+        tenures, _ = build_tenures(secs, [])
+        segs = sorted(tenures["recyc"])
+        assert segs[0] == (70, OPEN_START_FLOOR, date(2015, 3, 21))  # 2021 起点在终点之后，不截
+        assert segs[1] == (71, date(2021, 9, 1), FAR_FUTURE)
+        # 反向：现役起点早于死者终点 → 死者段被截到现役起点，重叠日归现役
+        secs2 = [
+            _sec(72, "clash", list_date=None, delist_date=date(2015, 3, 20), is_active=False),
+            _sec(73, "clash", list_date=date(2010, 1, 4)),
+        ]
+        tenures2, _ = build_tenures(secs2, [])
+        segs2 = sorted(tenures2["clash"])
+        assert segs2[0] == (72, OPEN_START_FLOOR, date(2010, 1, 4))
+        assert segs2[1] == (73, date(2010, 1, 4), FAR_FUTURE)
+
+    def test_dead_chain_fully_covered_open_segment_dropped(self):
+        # 前任终点晚于本段终点：零长度开口段直接丢弃，不产生负区间
+        secs = [
+            _sec(80, "cover", list_date=date(2004, 1, 2), delist_date=date(2018, 7, 6), is_active=False),
+            _sec(81, "cover", list_date=None, delist_date=date(2018, 7, 6), is_active=False),
+        ]
+        tenures, _ = build_tenures(secs, [])
+        assert tenures["cover"] == [(80, date(2004, 1, 2), date(2018, 7, 7))]
 
     def test_rename_timeline_splits_tenures(self):
         # FB(2012-05-18) -> META(2022-06-09)：老代码任期止于改名日（半开）

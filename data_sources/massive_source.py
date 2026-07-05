@@ -407,6 +407,24 @@ class MassiveSource(DataSourceInterface):
             return results
         return [item for item in results if is_supported_us_security_type(item.get("type")) and (item.get("type") or "").upper() in allowed]
 
+    def list_delisted_tickers(
+        self,
+        market: str = "stocks",
+        limit: int = 1000,
+        locale: Optional[str] = "us",
+    ) -> list[dict[str, Any]]:
+        # active=false 与 sort 参数组合会返回空结果（vendor 行为），退市名单不能排序
+        params = {
+            "market": market,
+            "active": "false",
+            "limit": min(limit, 1000),
+        }
+        results = self._paginate_results("/v3/reference/tickers", params=params)
+        if locale:
+            locale_upper = locale.upper()
+            results = [item for item in results if (item.get("locale") or "").upper() == locale_upper]
+        return results
+
     def get_ticker_overview(self, symbol: str, lookup_date: Optional[Any] = None, allow_missing: bool = False) -> Optional[dict[str, Any]]:
         params: dict[str, Any] = {}
         lookup_date_str = _normalize_lookup_date(lookup_date)

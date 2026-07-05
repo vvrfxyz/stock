@@ -84,6 +84,7 @@ python main.py update --market US
 python main.py update AAPL
 
 python main.py sync_massive_universe --market US
+python main.py sync_delisted_universe --dry-run     # Massive 退市 CS/ETF 名单补齐（20 年 universe）；富化阶段每只 1 请求回填 list_date，--skip-enrich 可跳过
 python main.py update_massive_details AAPL --force
 python main.py update_massive_actions AAPL --force
 python main.py update_massive_prices AAPL --full-refresh

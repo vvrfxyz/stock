@@ -11,8 +11,11 @@
   的 ticker_change 事件（start_date=该代码生效日）+ 现行 symbol 构成，整体裁剪到
   [list_date, 退市上界]；date 落在恰好一个任期内才写入，0 个记 unmapped、
   多个记 ambiguous，都跳过并计数。
-- list_date 为 NULL 的证券不参与（任期起点无从界定，宁缺毋滥——先跑
-  update_massive_details --all 补齐）。
+- list_date 为 NULL 的活跃证券不参与（任期起点无从界定，宁缺毋滥——先跑
+  update_massive_details --all 补齐）。退市补录行（sync_delisted_universe 产物，
+  list_date NULL 但有 delist_date）例外：生成开口起点段，按同 symbol 链式推断
+  起点（= 前任终点，无前任取 2003-01-01 地板），终点被更晚起跑的显式段截断；
+  推断段与显式段重叠的日子由 ambiguous 守卫跳过。
 - 覆盖策略：只保护带 vwap 的行（vwap 是 Massive API 独有字段，flat files 与
   yfinance 都没有）——每只证券以其最早 vwap 行为界，之前的 flat file 行一律
   upsert 覆盖（yfinance 旧行被替换为 SIP 级数据）。--cutoff 仅作可选全局上界。
@@ -49,6 +52,8 @@ from utils.script_logging import setup_logging as configure_script_logging
 
 IMPORTABLE_TICKER = re.compile(r"^[A-Z][A-Z0-9.]*$")
 FAR_FUTURE = date(9999, 1, 1)
+# 开口起点段（退市补录行无 list_date）链式推断的下界；flat files 始于 2003-09-10
+OPEN_START_FLOOR = date(2003, 1, 1)
 EXPECTED_HEADER = ["ticker", "volume", "open", "close", "high", "low", "window_start", "transactions"]
 
 
@@ -74,6 +79,11 @@ def build_tenures(secs, hist) -> tuple[dict[str, list[tuple[int, date, date]]], 
     hist: 可迭代对象，元素含 security_id/symbol(已小写)/start_date/end_date。
     返回 (tenures, skipped_no_list_date)。区间为半开 [start, end)；显式
     end_date（人工修复行）按闭区间语义 +1 天；退市上界日当天的 bar 仍归属该证券。
+
+    list_date 为 NULL 的退市补录行（sync_delisted_universe 产物，vendor 不提供
+    退市证券的上市日）生成"开口起点"段，收尾后按同 symbol 链式推断：起点 =
+    同 symbol 中结束不晚于本段的最近一段的终点，无前任则取 OPEN_START_FLOOR。
+    推断出的重叠不在这里消解——映射层的 ambiguous 守卫会跳过重叠日的 bar。
     """
     hist_by_sec: dict[int, list] = defaultdict(list)
     for row in hist:
@@ -82,7 +92,7 @@ def build_tenures(secs, hist) -> tuple[dict[str, list[tuple[int, date, date]]], 
     tenures: dict[str, list[tuple[int, date, date]]] = defaultdict(list)
     skipped_no_list_date = 0
     for sec in secs:
-        if sec.list_date is None:
+        if sec.list_date is None and (sec.is_active or sec.delist_date is None):
             skipped_no_list_date += 1
             continue
         if sec.delist_date is not None:
@@ -105,12 +115,36 @@ def build_tenures(secs, hist) -> tuple[dict[str, list[tuple[int, date, date]]], 
                 end_exclusive = events[i + 1][0]
             else:
                 end_exclusive = upper_exclusive
-            seg_start = max(start, sec.list_date)
+            if start is None:
+                seg_start = None  # 开口起点：收尾后按同 symbol 链式推断
+            elif sec.list_date is not None:
+                seg_start = max(start, sec.list_date)
+            else:
+                seg_start = start
             seg_end = min(end_exclusive, upper_exclusive)
-            if seg_start >= seg_end:
+            if seg_start is not None and seg_start >= seg_end:
                 continue
             tenures[symbol].append((sec.id, seg_start, seg_end))
-    return dict(tenures), skipped_no_list_date
+
+    # 链式推断：开口段起点 = 同 symbol 中结束不晚于本段终点的最近一段的终点；
+    # 终点被更晚起跑的显式段截断（那些日子归显式持有者，宁缺毋滥）。
+    resolved: dict[str, list[tuple[int, date, date]]] = {}
+    for symbol, segs in tenures.items():
+        opens = [s for s in segs if s[1] is None]
+        if not opens:
+            resolved[symbol] = segs
+            continue
+        closed = [s for s in segs if s[1] is not None]
+        for sid, _, end in sorted(opens, key=lambda t: (t[2], t[0])):
+            prior_ends = [c[2] for c in closed if c[2] <= end]
+            start = max([OPEN_START_FLOOR, *prior_ends])
+            later_starts = [c[1] for c in closed if c[1] > start]
+            clipped_end = min([end, *later_starts])
+            if start >= clipped_end:
+                continue  # 前任/后任已覆盖整段：零长度，丢弃
+            closed.append((sid, start, clipped_end))
+        resolved[symbol] = closed
+    return resolved, skipped_no_list_date
 
 
 def load_tenures(db_manager: DatabaseManager) -> dict[str, list[tuple[int, date, date]]]:
@@ -130,7 +164,9 @@ def load_tenures(db_manager: DatabaseManager) -> dict[str, list[tuple[int, date,
             WHERE start_date IS NOT NULL
         """)).all()
     tenures, skipped = build_tenures(secs, hist)
-    logger.info("任期索引: {} 个 symbol，{} 只证券因 list_date 缺失未参与。", len(tenures), skipped)
+    inferred = sum(1 for s in secs if s.list_date is None and not s.is_active and s.delist_date is not None)
+    logger.info("任期索引: {} 个 symbol，{} 只证券因 list_date 缺失未参与，{} 只退市补录行走链式推断。",
+                len(tenures), skipped, inferred)
     return tenures
 
 
