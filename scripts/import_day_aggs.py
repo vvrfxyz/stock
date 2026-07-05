@@ -13,8 +13,9 @@
   多个记 ambiguous，都跳过并计数。
 - list_date 为 NULL 的证券不参与（任期起点无从界定，宁缺毋滥——先跑
   update_massive_details --all 补齐）。
-- 只导入 date < cutoff（默认取 daily_prices 全局 MIN(date)，即 Massive 在线管道
-  的水位下界）；重叠区归在线管道管辖（在线行带 vwap，flat files 无）。
+- 逐证券边界：每只证券只导入早于其现有最早 bar（live_min）的行——已有深历史
+  （付费档回填到 2001 年等）的证券一根不动；只有 730 天窗口的补齐 2003 起的
+  缺口。--cutoff 仅作为可选的全局上界（默认不设）。
 - 幂等：upsert 冲突键 (security_id, date)，重跑安全。
 
 用法（253 上）：
@@ -53,7 +54,8 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dir", required=True, help="存放 day_aggs_v1_YYYY.tgz 的目录。")
     parser.add_argument("--years", default=None, help="年份范围，如 2003-2013 或 2015；默认全部。")
     parser.add_argument("--cutoff", default=None,
-                        help="只导入早于该日期(YYYY-MM-DD)的 bar；默认取 daily_prices 全局最早日期。")
+                        help="可选全局上界：只导入早于该日期(YYYY-MM-DD)的 bar；默认不设，"
+                             "以每只证券自身的现有最早 bar 为边界。")
     parser.add_argument("--dry-run", action="store_true", help="只做映射统计，不写库。")
     parser.add_argument("--unmapped-report", default="logs/manual_backfill/day_aggs_unmapped.tsv",
                         help="未映射 ticker 汇总输出路径（相对项目根）。")
@@ -205,15 +207,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         db_manager = DatabaseManager()
         from sqlalchemy import text
-        if args.cutoff:
-            cutoff = date.fromisoformat(args.cutoff)
-        else:
-            with db_manager.get_session() as session:
-                cutoff = session.execute(text("SELECT MIN(date) FROM daily_prices")).scalar()
-            if cutoff is None:
-                cutoff = FAR_FUTURE
-        logger.info("导入截止（不含）: {}；归档 {} 个: {} .. {}",
-                    cutoff, len(archives), archives[0].name, archives[-1].name)
+        cutoff = date.fromisoformat(args.cutoff) if args.cutoff else FAR_FUTURE
+        with db_manager.get_session() as session:
+            live_min = dict(session.execute(text(
+                "SELECT security_id, MIN(date) FROM daily_prices GROUP BY security_id"
+            )).all())
+        logger.info("逐证券边界: {} 只证券已有价格覆盖；全局上界: {}；归档 {} 个: {} .. {}",
+                    len(live_min), cutoff if cutoff != FAR_FUTURE else "无",
+                    len(archives), archives[0].name, archives[-1].name)
 
         tenures = load_tenures(db_manager)
         stats: Counter = Counter()
@@ -229,13 +230,15 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 rows_raw = parse_rows(csv_bytes, tgz_path.name, file_date)
                 mapping = resolve_file_map([r["ticker"] for r in rows_raw], file_date, tenures, stats, unmapped)
-                if args.dry_run:
-                    year_files += 1
-                    continue
                 batch = []
                 for r in rows_raw:
                     sid = mapping.get(r["ticker"])
                     if sid is None:
+                        continue
+                    lm = live_min.get(sid)
+                    if lm is not None and file_date >= lm:
+                        # 该证券此日期起已有覆盖（在线管道或更早的深度回填），不碰
+                        stats["skipped_live_window"] += 1
                         continue
                     batch.append({
                         "security_id": sid,
@@ -244,7 +247,8 @@ def main(argv: list[str] | None = None) -> int:
                         "volume": int(float(r["volume"])),
                         "trade_count": int(float(r["transactions"])) if r["transactions"] else None,
                     })
-                if batch:
+                stats["rows_to_write"] += len(batch)
+                if batch and not args.dry_run:
                     year_written += db_manager.upsert_daily_prices(batch)
                     touched_ids.update(row["security_id"] for row in batch)
                 year_files += 1
