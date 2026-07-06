@@ -244,3 +244,42 @@ def test_fund_closure_par_respects_latest_episode_semantics(pg_db):
     ])
 
     assert load_delisting_returns(pg_db.engine).empty
+
+
+def _redemption_event(security_id, delist_date, *, final_price, evidence, delisting_return=None):
+    return {
+        "security_id": security_id,
+        "delist_date": delist_date,
+        "reason_code": "LIQUIDATION",
+        "reason_confidence": "HIGH",
+        "final_price": final_price,
+        "final_price_date": delist_date if final_price is not None else None,
+        "delisting_return": delisting_return,
+        "source": "FORM25",
+        "evidence": evidence,
+    }
+
+
+@pytest.mark.integration
+def test_redemption_par_synthesizes_zero_for_spac_redemptions(pg_db):
+    """SPAC 赎回清算 par：LIQUIDATION + redemption_provision 证据 + final_price
+    在场 → 读取时合成 0.0（与 ETF 清盘 par 同构）；无该证据的真清算不合成。"""
+    from research.data import load_delisting_returns
+
+    for sid, sym in [(1, "spac"), (2, "liqd"), (3, "nopx")]:
+        _insert_security(pg_db, sid, sym)
+    pg_db.upsert_delisting_events([
+        _redemption_event(1, date(2023, 4, 14), final_price=Decimal("10.02"),
+                          evidence="form25_rule=12d2-2(a)(1)|redemption_provision"),
+        # 无 redemption_provision 标记的 LIQUIDATION（真清算）：不合成
+        _redemption_event(2, date(2023, 4, 14), final_price=Decimal("3.10"),
+                          evidence="form25_rule=12d2-2(a)(2)"),
+        # 有标记但无 final_price：无锚点，不合成
+        _redemption_event(3, date(2023, 4, 14), final_price=None,
+                          evidence="form25_rule=12d2-2(a)(1)|redemption_provision"),
+    ])
+
+    got = load_delisting_returns(pg_db.engine)
+    assert got.to_dict() == {1: 0.0}
+    # 单独关 redemption par：spac 行消失
+    assert load_delisting_returns(pg_db.engine, redemption_par=False).empty

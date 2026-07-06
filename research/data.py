@@ -229,7 +229,12 @@ def load_symbol_map(engine: Engine) -> pd.Series:
     return df.set_index("id")["symbol"]
 
 
-def load_delisting_returns(engine: Engine, *, fund_closure_par: bool = True) -> pd.Series:
+def load_delisting_returns(
+    engine: Engine,
+    *,
+    fund_closure_par: bool = True,
+    redemption_par: bool = True,
+) -> pd.Series:
     """逐证券实测退市收益（index=security_id int, values=float）。
 
     来源 delisting_events.delisting_return（docs/todo_crsp_grade_2026-07.md 任务 1）。
@@ -245,12 +250,26 @@ def load_delisting_returns(engine: Engine, *, fund_closure_par: bool = True) -> 
     事实表遵循"无实据不写数值"纪律，经验值只活在读取层——这正是那条经验值。
     实测值（含恰为 0.0 的实测）永远优先，不会被合成值覆盖。纯粹主义者可
     fund_closure_par=False 关闭，只拿实测行。
+
+    redemption_par=True（默认）：SPAC 全类赎回清算（reason_code='LIQUIDATION'
+    且 evidence 带 Form 25 12d2-2(a)(1)/(a)(2) 的 redemption_provision 标记）
+    且 final_price 在场时同样合成 0.0——机制与 ETF 清盘 par 同构：赎回价 =
+    信托账户固定金额，终价已收敛到赎回价，持有人按信托价平价退出。只认
+    redemption_provision 证据行（真清算/破产式 LIQUIDATION 不带该标记，不合成）。
     """
+    par_cases: list[str] = []
     if fund_closure_par:
+        par_cases.append(
+            "when reason_code = 'FUND_CLOSURE' and final_price is not null then 0.0"
+        )
+    if redemption_par:
+        par_cases.append(
+            "when reason_code = 'LIQUIDATION' and final_price is not null "
+            "and evidence like '%redemption_provision%' then 0.0"
+        )
+    if par_cases:
         value_expr = (
-            "coalesce(delisting_return, "
-            "case when reason_code = 'FUND_CLOSURE' and final_price is not null "
-            "then 0.0 end)"
+            "coalesce(delisting_return, case " + " ".join(par_cases) + " end)"
         )
     else:
         value_expr = "delisting_return"
@@ -259,7 +278,7 @@ def load_delisting_returns(engine: Engine, *, fund_closure_par: bool = True) -> 
         select security_id, ({value_expr})::float8 as delisting_return
         from (
             select distinct on (security_id)
-                   security_id, delisting_return, reason_code, final_price
+                   security_id, delisting_return, reason_code, final_price, evidence
             from delisting_events
             order by security_id, delist_date desc
         ) latest

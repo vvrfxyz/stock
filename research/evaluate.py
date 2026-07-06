@@ -813,7 +813,8 @@ def run_evaluation(
     # 退市终局收益（口径同 run_baselines）：优先 delisting_events 逐证券实测，
     # CLI 标量降级为未覆盖证券的 fallback；opt-out / 表空时只用标量（旧口径）。
     realized = (
-        load_delisting_returns(engine, fund_closure_par=fund_closure_par)
+        load_delisting_returns(engine, fund_closure_par=fund_closure_par,
+                               redemption_par=fund_closure_par)
         if use_delisting_returns
         else pd.Series(dtype="float64")
     )
@@ -877,6 +878,8 @@ def run_evaluation(
         **_terminal_return_config(resolved_terminal, resolved_fallback),
         # fund_closure_par 只在实测口径下起作用；其余口径归一为 None 避免无谓的 hash 分裂。
         "fund_closure_par": fund_closure_par if isinstance(resolved_terminal, pd.Series) else None,
+        # redemption_par 与 fund_closure_par 同旗标控制（读取层 par 合成一体开关）
+        "redemption_par": fund_closure_par if isinstance(resolved_terminal, pd.Series) else None,
         "run_id": run_id,
         "note": note,
     }
@@ -1093,8 +1096,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="不读 delisting_events 的逐证券实测退市收益，只用 --terminal-return "
                              "全局假设（复现旧口径运行）。")
     parser.add_argument("--no-fund-closure-par", action="store_true",
-                        help="关闭 ETF 清盘平价合成（FUND_CLOSURE + final_price 在场的 NULL 实测行"
-                             "读取时合成 0.0），只用纯实测行。")
+                        help="关闭读取层 par 合成（ETF 清盘 FUND_CLOSURE 与 SPAC 赎回 LIQUIDATION+"
+                             "redemption_provision 的 NULL 实测行合成 0.0），只用纯实测行。")
     persist_group = parser.add_mutually_exclusive_group()
     persist_group.add_argument("--trials-path", type=Path, default=None)
     persist_group.add_argument("--no-persist", action="store_true")

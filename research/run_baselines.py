@@ -63,8 +63,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="实测 Series 口径下未覆盖证券的兜底收益（float，或 none=显式不兜底）。"
                              "缺省沿用 --terminal-return 标量作兜底（现状语义）；显式给出时覆盖之。")
     parser.add_argument("--no-fund-closure-par", action="store_true",
-                        help="关闭 ETF 清盘平价合成（FUND_CLOSURE + final_price 在场的 NULL 实测行"
-                             "读取时合成 0.0），只用纯实测行。")
+                        help="关闭读取层 par 合成（ETF 清盘 FUND_CLOSURE 与 SPAC 赎回 LIQUIDATION+"
+                             "redemption_provision 的 NULL 实测行合成 0.0），只用纯实测行。")
     args = parser.parse_args(argv)
     # 退市终局强制显式化：长窗口面板含 6,000+ 退市股，默认"退市赚 0%"会系统性
     # 高估做多策略（评估 hard truth）。短窗口沿旧口径不变。
@@ -134,7 +134,8 @@ def main(argv: list[str] | None = None) -> int:
     # 退市终局收益：优先 delisting_events 的逐证券实测 delisting_return，
     # 查无（表未填充 / --no-delisting-returns）再落回全局 CLI 假设（旧口径不变）。
     realized = (pd.Series(dtype="float64") if args.no_delisting_returns
-                else load_delisting_returns(engine, fund_closure_par=not args.no_fund_closure_par))
+                else load_delisting_returns(engine, fund_closure_par=not args.no_fund_closure_par,
+                                            redemption_par=not args.no_fund_closure_par))
     terminal_return, terminal_fallback = resolve_terminal_returns(
         realized, args.terminal_return, use_realized=not args.no_delisting_returns
     )

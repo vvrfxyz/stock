@@ -107,7 +107,7 @@ def _wire(monkeypatch, *, realized: pd.Series, expect_par_kwarg: list | None = N
         "dollar_volume": pd.DataFrame(10_000_000.0, index=dates, columns=universe),
     }
 
-    def fake_load_delisting(engine, *, fund_closure_par=True):
+    def fake_load_delisting(engine, *, fund_closure_par=True, redemption_par=True):
         if expect_par_kwarg is not None:
             expect_par_kwarg.append(fund_closure_par)
         return realized
