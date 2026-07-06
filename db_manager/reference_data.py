@@ -115,8 +115,12 @@ class ReferenceDataMixin:
             for group in _group_rows_by_key_set(rows):
                 stmt = pg_insert(SecFiling).values(group)
                 update_keys = set(group[0].keys())
+                # update SET 覆盖行内提供的全部非保护字段——含 items（8-K item codes）：
+                # EDGAR 重拉时 items 以 vendor 当前值原位刷新（含刷成 NULL）。
+                # 注意必须用 excluded[key] 索引访问：excluded.items 是 ColumnCollection
+                # 的字典方法（同理 keys/values），getattr 拿到的是 bound method 而非列。
                 update_columns = {
-                    key: getattr(stmt.excluded, key)
+                    key: stmt.excluded[key]
                     for key in update_keys
                     if key not in {"id", "source", "accession_number", "created_at", "available_at"}
                 }

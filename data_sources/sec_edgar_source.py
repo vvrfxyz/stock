@@ -81,6 +81,17 @@ def _parse_datetime(value: Any) -> datetime | None:
         return None
 
 
+def _clean_items(value: Any) -> str | None:
+    """8-K item codes（如 '2.01,9.01'）——非 8-K 表单为空串，归一化为 None；
+    防御性截断到 sec_filings.items 的 255 列宽。"""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text[:255]
+
+
 def _is_sec_rate_limited(response: requests.Response) -> bool:
     """403 响应体是否为 SEC 限流封禁页（区别于 UA 不合规等永久性 403）。"""
     try:
@@ -225,6 +236,7 @@ class SecEdgarSource:
                 "filing_date": filing_date,
                 "accepted_at": _parse_datetime(get("acceptanceDateTime", i)),
                 "period_of_report": _parse_date(get("reportDate", i)),
+                "items": _clean_items(get("items", i)),
                 "filing_url": f"{_ARCHIVES_BASE}/{cik_int}/{accession_clean}/{accession}-index.htm",
                 "primary_document_url": (
                     f"{_ARCHIVES_BASE}/{cik_int}/{accession_clean}/{primary_doc}" if primary_doc else None

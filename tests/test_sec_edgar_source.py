@@ -200,6 +200,46 @@ class FetchFilingsTests(unittest.TestCase):
         self.assertEqual([r["form_type"] for r in recent_only], ["4"])
 
 
+class ItemsExtractionTests(unittest.TestCase):
+    """sec_filings.items：8-K item codes 提取、空值归一化与 255 防御性截断。"""
+
+    def _payload(self, items):
+        block = {
+            "accessionNumber": ["0000320193-26-000050", "0000320193-26-000051"],
+            "form": ["8-K", "10-Q"],
+            "filingDate": ["2026-06-15", "2026-05-01"],
+            "reportDate": ["2026-06-15", "2026-03-28"],
+            "acceptanceDateTime": ["2026-06-15T12:00:00.000Z", "2026-05-01T18:00:00.000Z"],
+            "primaryDocument": ["aapl-8k.htm", "aapl-10q.htm"],
+        }
+        if items is not None:
+            block["items"] = items
+        return {"name": "Apple Inc.", "filings": {"recent": block, "files": []}}
+
+    def test_items_extracted_for_8k_and_empty_normalized_to_none(self):
+        payload = self._payload(["2.01,9.01", ""])
+        rows = _source({"CIK0000320193.json": payload}).fetch_filings("320193")
+
+        by_form = {r["form_type"]: r for r in rows}
+        self.assertEqual(by_form["8-K"]["items"], "2.01,9.01")
+        # 非 8-K 表单 items 为空串——归一化为 None，不入库噪音
+        self.assertIsNone(by_form["10-Q"]["items"])
+
+    def test_block_without_items_key_yields_none(self):
+        # 老历史分页文件可能整块不带 items 列
+        rows = _source({"CIK0000320193.json": self._payload(None)}).fetch_filings("320193")
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r["items"] is None for r in rows))
+
+    def test_overlong_items_truncated_to_255(self):
+        long_items = ",".join(["9.01"] * 100)  # 499 字符 > 列宽 255
+        rows = _source({"CIK0000320193.json": self._payload([long_items, ""])}).fetch_filings("320193")
+
+        eight_k = next(r for r in rows if r["form_type"] == "8-K")
+        self.assertEqual(len(eight_k["items"]), 255)
+        self.assertEqual(eight_k["items"], long_items[:255])
+
+
 class ParseCompanyFactsTests(unittest.TestCase):
     PAYLOAD = {
         "facts": {

@@ -6,10 +6,16 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from data_models.models import (
     ComputedAdjustmentFactor,
     CorporateAction,
+    DelistingEvent,
     VendorAdjustmentFactor,
 )
 
-from .helpers import ACTION_SOURCE_MASSIVE, _clean_for_model, _dedupe_rows_by_key, _format_action_decimal
+from .helpers import (
+    ACTION_SOURCE_MASSIVE,
+    _clean_for_model,
+    _dedupe_rows_by_key,
+    _format_action_decimal,
+)
 
 
 class CorporateActionsMixin:
@@ -187,6 +193,30 @@ class CorporateActionsMixin:
             )
             conn.commit()
             return result.rowcount or 0
+
+    def upsert_delisting_events(self, rows_data: list[dict]) -> int:
+        """写退市结局事实。冲突键 (security_id, delist_date)。
+
+        分类器（build_delisting_events）是幂等全量重建：每行归一化为全部
+        payload 列，冲突时全列以本批为准原位覆盖——行内未提供的字段就是 NULL
+        （证据降级/撤销同样生效，不残留旧证据）；只有 id/created_at 受保护。"""
+        rows = [_clean_for_model(DelistingEvent, row) for row in rows_data]
+        rows = [row for row in rows if row.get('security_id') and row.get('delist_date')]
+        if not rows:
+            return 0
+
+        payload_columns = [
+            column.name
+            for column in DelistingEvent.__table__.columns
+            if column.name not in {'id', 'created_at', 'updated_at'}
+        ]
+        rows = [{column: row.get(column) for column in payload_columns} for row in rows]
+        return self._batch_upsert(
+            DelistingEvent,
+            rows,
+            ['security_id', 'delist_date'],
+            update_on_conflict=True,
+        )
 
     def upsert_vendor_adjustment_factors(self, rows_data: list[dict]) -> int:
         rows = [_clean_for_model(VendorAdjustmentFactor, row) for row in rows_data]

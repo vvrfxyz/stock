@@ -388,6 +388,115 @@ class TestCorporateActions:
         assert _scalar(pg_db, "SELECT cash_amount FROM corporate_actions") == Decimal("0.2700000000")
 
 
+class TestDelistingEvents:
+    def _row(self, **extra):
+        return {
+            "security_id": 1,
+            "delist_date": date(2026, 5, 29),
+            "reason_code": "UNKNOWN",
+            "reason_confidence": "LOW",
+            "final_price": Decimal("9.98"),
+            "final_price_date": date(2026, 5, 28),
+            "source": "PRICE_INFERRED",
+            "evidence": "terminal price stable near integer",
+            **extra,
+        }
+
+    def test_insert_then_conflict_updates_payload_preserving_created_at(self, pg_db):
+        _insert_security(pg_db)
+        assert pg_db.upsert_delisting_events([self._row()]) == 1
+        created = _scalar(pg_db, "SELECT created_at FROM delisting_events")
+
+        # 分类器重跑证据升级：同 (security_id, delist_date) 原位覆盖
+        pg_db.upsert_delisting_events([self._row(
+            reason_code="ACQUISITION_CASH", reason_confidence="HIGH",
+            final_price=Decimal("10.00"), source="8K",
+            acquirer_name="Acme Corp", consideration_cash=Decimal("10.00"),
+            delisting_return=Decimal("0.002"),
+        )])
+
+        assert _scalar(pg_db, "SELECT count(*) FROM delisting_events") == 1
+        assert _scalar(pg_db, "SELECT reason_code FROM delisting_events") == "ACQUISITION_CASH"
+        assert _scalar(pg_db, "SELECT final_price FROM delisting_events") == Decimal("10.000000")
+        assert _scalar(pg_db, "SELECT acquirer_name FROM delisting_events") == "Acme Corp"
+        assert _scalar(pg_db, "SELECT delisting_return FROM delisting_events") == Decimal("0.00200000")
+        assert _scalar(pg_db, "SELECT created_at FROM delisting_events") == created
+
+    def test_full_rebuild_clears_omitted_fields_to_null(self, pg_db):
+        """幂等全量重建语义：证据撤销后重跑，未再给出的字段清成 NULL（不残留旧证据）。"""
+        _insert_security(pg_db)
+        pg_db.upsert_delisting_events([self._row(acquirer_name="Acme Corp")])
+        pg_db.upsert_delisting_events([{
+            "security_id": 1, "delist_date": date(2026, 5, 29), "reason_code": "UNKNOWN",
+        }])
+        assert _scalar(pg_db, "SELECT count(*) FROM delisting_events") == 1
+        assert _scalar(pg_db, "SELECT reason_code FROM delisting_events") == "UNKNOWN"
+        assert _scalar(pg_db, "SELECT acquirer_name FROM delisting_events") is None
+        assert _scalar(pg_db, "SELECT final_price FROM delisting_events") is None
+
+    def test_distinct_delist_dates_create_separate_rows(self, pg_db):
+        """同一证券多次退市（重新上市后再退）是不同结局，各存一行。"""
+        _insert_security(pg_db)
+        pg_db.upsert_delisting_events([
+            self._row(),
+            self._row(delist_date=date(2020, 3, 2), reason_code="EXCHANGE_DROP"),
+        ])
+        assert _scalar(pg_db, "SELECT count(*) FROM delisting_events") == 2
+
+    def test_missing_required_keys_and_batch_duplicates(self, pg_db):
+        _insert_security(pg_db)
+        written = pg_db.upsert_delisting_events([
+            {"security_id": 1},                       # 缺 delist_date
+            {"delist_date": date(2026, 5, 29)},       # 缺 security_id
+            self._row(reason_code="VOLUNTARY"),
+            self._row(reason_code="MERGER"),           # 批内同键——后行胜出
+        ])
+        assert written == 1
+        assert _scalar(pg_db, "SELECT count(*) FROM delisting_events") == 1
+        assert _scalar(pg_db, "SELECT reason_code FROM delisting_events") == "MERGER"
+
+
+class TestCompanies:
+    def test_upsert_by_cik_insert_then_name_refresh(self, pg_db):
+        assert pg_db.upsert_companies([{"cik": "0000320193", "name": "Apple Computer"}]) == 1
+        created = _scalar(pg_db, "SELECT created_at FROM companies")
+
+        pg_db.upsert_companies([{"cik": "0000320193", "name": "Apple Inc."}])
+        assert _scalar(pg_db, "SELECT count(*) FROM companies") == 1
+        assert _scalar(pg_db, "SELECT name FROM companies") == "Apple Inc."
+        assert _scalar(pg_db, "SELECT created_at FROM companies") == created
+
+    def test_null_cik_rows_skipped(self, pg_db):
+        """cik 唯一约束对 NULL 永不触发冲突——NULL cik 行必须拒收，否则重复运行无限插入。"""
+        assert pg_db.upsert_companies([{"cik": None, "name": "ETF Trust"}, {"name": "No CIK"}]) == 0
+        assert _scalar(pg_db, "SELECT count(*) FROM companies") == 0
+
+    def test_batch_duplicate_cik_last_row_wins(self, pg_db):
+        pg_db.upsert_companies([
+            {"cik": "0000320193", "name": "first"},
+            {"cik": "0000320193", "name": "second"},
+        ])
+        assert _scalar(pg_db, "SELECT count(*) FROM companies") == 1
+        assert _scalar(pg_db, "SELECT name FROM companies") == "second"
+
+    def test_conflict_without_name_does_not_null_existing(self, pg_db):
+        pg_db.upsert_companies([{"cik": "0000320193", "name": "Apple Inc."}])
+        pg_db.upsert_companies([{"cik": "0000320193"}])
+        assert _scalar(pg_db, "SELECT name FROM companies") == "Apple Inc."
+
+    def test_get_company_id_by_cik(self, pg_db):
+        pg_db.upsert_companies([{"cik": "0000320193", "name": "Apple Inc."}])
+        assert pg_db.get_company_id_by_cik("0000320193") is not None
+        assert pg_db.get_company_id_by_cik("0000999999") is None
+        assert pg_db.get_company_id_by_cik(None) is None
+
+    def test_security_company_id_fk_roundtrip(self, pg_db):
+        pg_db.upsert_companies([{"cik": "0000320193", "name": "Apple Inc."}])
+        company_id = pg_db.get_company_id_by_cik("0000320193")
+        _insert_security(pg_db, 1, "aapl", company_id=company_id)
+        assert _scalar(pg_db, "SELECT company_id FROM securities WHERE id=1") == company_id
+
+
 class TestAdjustmentFactors:
     def test_vendor_factor_upsert_by_factor_key(self, pg_db):
         _insert_security(pg_db)
@@ -585,6 +694,34 @@ class TestSecFilings:
         # 冲突时更新元数据
         pg_db.upsert_sec_filings([{**row, "issuer_name": "Apple Inc."}])
         assert _scalar(pg_db, "SELECT count(*) FROM sec_filings") == 1
+        assert _scalar(pg_db, "SELECT issuer_name FROM sec_filings") == "Apple Inc."
+
+    def test_items_passthrough_and_conflict_refresh(self, pg_db):
+        """8-K item codes 原样入库；重拉时以 vendor 当前值原位刷新（含刷成 NULL）。"""
+        row = {
+            "source": "SEC", "accession_number": "0001-26-000002", "form_type": "8-K",
+            "filing_date": date(2026, 2, 10), "cik": "0000320193", "items": "2.01,9.01",
+        }
+        pg_db.upsert_sec_filings([row])
+        assert _scalar(pg_db, "SELECT items FROM sec_filings") == "2.01,9.01"
+
+        pg_db.upsert_sec_filings([{**row, "items": "2.01"}])
+        assert _scalar(pg_db, "SELECT count(*) FROM sec_filings") == 1
+        assert _scalar(pg_db, "SELECT items FROM sec_filings") == "2.01"
+
+        pg_db.upsert_sec_filings([{**row, "items": None}])
+        assert _scalar(pg_db, "SELECT items FROM sec_filings") is None
+
+    def test_row_without_items_key_preserves_existing_items(self, pg_db):
+        """不带 items 键的写入（非 EDGAR submissions 通道）不得抹掉已有值。"""
+        row = {
+            "source": "SEC", "accession_number": "0001-26-000003", "form_type": "8-K",
+            "filing_date": date(2026, 2, 10), "items": "5.02",
+        }
+        pg_db.upsert_sec_filings([row])
+        no_items = {key: value for key, value in row.items() if key != "items"}
+        pg_db.upsert_sec_filings([{**no_items, "issuer_name": "Apple Inc."}])
+        assert _scalar(pg_db, "SELECT items FROM sec_filings") == "5.02"
         assert _scalar(pg_db, "SELECT issuer_name FROM sec_filings") == "Apple Inc."
 
 

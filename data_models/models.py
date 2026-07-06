@@ -50,6 +50,17 @@ class Exchange(Base):
     updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
+class Company(Base):
+    """公司实体（PERMCO 等价物）。id 永不回收；主锚是 CIK（可 NULL：
+    无 SEC 申报的 ETF 发行主体不建）。归组只认 CIK 与人工确认，绝不做名字模糊匹配。"""
+    __tablename__ = 'companies'
+    id = Column(BigInteger, primary_key=True)
+    cik = Column(String(20), unique=True, nullable=True, comment="SEC CIK 主锚；无 SEC 申报实体为 NULL")
+    name = Column(String(255), nullable=True, comment="公司名称")
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
 class Security(Base):
     __tablename__ = 'securities'
     id = Column(BigInteger, primary_key=True)
@@ -78,6 +89,8 @@ class Security(Base):
     locale = Column(String(10), nullable=True, index=True, comment="Massive locale 字段，例如 us/global")
     # --- Massive 提供的详细信息 ---
     cik = Column(String(20), nullable=True, index=True, comment="SEC CIK 中央索引码")
+    company_id = Column(BigInteger, ForeignKey('companies.id'), nullable=True, index=True,
+                        comment="所属公司实体（companies.id，PERMCO 等价物）；按 CIK 归组，未归组为 NULL")
     composite_figi = Column(String(30), nullable=True, index=True, comment="复合金融工具全球标识符 (FIGI)")
     share_class_figi = Column(String(20), nullable=True, index=True, comment="股份类别FIGI标识符")
     ticker_root = Column(String(30), nullable=True, index=True, comment="Ticker root，例如 BRK.A 的 BRK")
@@ -128,6 +141,7 @@ class Security(Base):
     full_refresh_interval = Column(Integer, nullable=False, default=lambda: py_random.randint(25, 40),
                                    comment="自动全量刷新的随机周期(天)")
     # --- 数据库约束 ---
+    company = relationship("Company")
     __table_args__ = (
         Index(
             '_active_symbol_uc',
@@ -214,6 +228,40 @@ class CorporateAction(Base):
     security = relationship("Security")
     __table_args__ = (
         UniqueConstraint('security_id', 'action_type', 'source', 'source_event_id', name='_corporate_action_source_event_uc'),
+    )
+
+
+class DelistingEvent(Base):
+    """退市结局事实——每只退市证券为什么退市、持有人最后拿到了什么。
+
+    口径：记录"交易所退市时点结局"（delist_date 不等于价值归零日，LEHMQ 类
+    OTC 尾巴见 evidence）。delisting_return 只在有实据时写，绝不填经验值——
+    经验假设是读取层（research/backtest.py terminal_return）的事。
+    由 scripts/build_delisting_events.py 幂等全量重建。
+    """
+    __tablename__ = 'delisting_events'
+    id = Column(BigInteger, primary_key=True)
+    security_id = Column(BigInteger, ForeignKey('securities.id'), nullable=False, index=True)
+    delist_date = Column(Date, nullable=False, index=True)
+    reason_code = Column(String(20), nullable=True,
+                         comment="MERGER / ACQUISITION_CASH / ACQUISITION_STOCK / BANKRUPTCY / "
+                                 "LIQUIDATION / EXCHANGE_DROP / VOLUNTARY / FUND_CLOSURE / UNKNOWN")
+    reason_confidence = Column(String(10), nullable=True, comment="HIGH / MEDIUM / LOW（由分类证据强度决定）")
+    acquirer_name = Column(String(255), nullable=True, comment="并购类：收购方名称")
+    consideration_cash = Column(Numeric(20, 6), nullable=True, comment="每股现金对价")
+    consideration_stock_ratio = Column(Numeric(20, 10), nullable=True, comment="换股比（对价含股票时）")
+    final_price = Column(Numeric(19, 6), nullable=True, comment="退市前最后可靠成交价（含 OTC 尾巴）")
+    final_price_date = Column(Date, nullable=True)
+    delisting_return = Column(Numeric(12, 8), nullable=True,
+                              comment="实测退市收益 = (实际所得-final_price)/final_price；无实据时 NULL")
+    source = Column(String(30), nullable=True, comment="FORM25 / 8K / TICKER_EVENT / PRICE_INFERRED / MANUAL")
+    evidence = Column(Text, nullable=True, comment="accession number / 事件 id / 推断依据")
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    security = relationship("Security")
+    __table_args__ = (
+        UniqueConstraint('security_id', 'delist_date', name='_delisting_event_security_date_uc'),
     )
 
 
@@ -321,6 +369,8 @@ class SecFiling(Base):
     filing_date = Column(Date, nullable=False, index=True)
     accepted_at = Column(TIMESTAMP(timezone=True), nullable=True, index=True)
     period_of_report = Column(Date, nullable=True, index=True)
+    items = Column(String(255), nullable=True,
+                   comment="8-K item codes as reported, comma-separated e.g. 2.01,9.01")
     filing_url = Column(Text, nullable=True)
     primary_document_url = Column(Text, nullable=True)
     available_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False, index=True)

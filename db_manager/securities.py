@@ -7,9 +7,9 @@ from loguru import logger
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from data_models.models import Security, SecurityIdentityEvent, SecuritySymbolHistory
+from data_models.models import Company, Security, SecurityIdentityEvent, SecuritySymbolHistory
 
-from .helpers import _clean_for_model, _group_rows_by_key_set
+from .helpers import _clean_for_model, _dedupe_rows_by_key, _group_rows_by_key_set
 
 
 def _norm_identifier(value) -> str | None:
@@ -29,6 +29,38 @@ def _is_identity_conflict(existing: dict, incoming: dict) -> tuple[bool, str]:
 
 
 class SecuritiesMixin:
+    def upsert_companies(self, rows_data: list[dict]) -> int:
+        """写公司实体（PERMCO 等价物）。冲突键 ['cik']。
+
+        cik 为 NULL 的行直接跳过：companies.cik 唯一约束在 PG 默认
+        NULLS DISTINCT 语义下对 NULL 永不触发冲突，重复运行会无限插入——
+        无 CIK 实体（ETF 发行主体等）不该经此通道建行。
+        冲突时刷新 name（公司改名以 vendor/SEC 最新为准）；id/created_at/cik 受保护。"""
+        rows = [_clean_for_model(Company, row) for row in rows_data]
+        rows = [row for row in rows if row.get('cik')]
+        if not rows:
+            return 0
+        rows = _dedupe_rows_by_key(rows, ['cik'])
+        written = 0
+        # 按键集分组：冲突时只更新该行明确提供的字段（缺 name 不覆盖成 NULL）。
+        for group in _group_rows_by_key_set(rows):
+            written += self._batch_upsert(
+                Company,
+                group,
+                ['cik'],
+                update_on_conflict=True,
+            )
+        return written
+
+    def get_company_id_by_cik(self, cik: str) -> int | None:
+        """按 CIK 查公司实体 id；无则 None。"""
+        if not cik:
+            return None
+        with self.engine.connect() as conn:
+            return conn.execute(
+                select(Company.id).where(Company.cik == cik)
+            ).scalar_one_or_none()
+
     def upsert_security_info(self, security_data: dict) -> None:
         """
         智能地更新或插入 Security 信息 (UPSERT)。

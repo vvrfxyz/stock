@@ -610,6 +610,8 @@ def run_update_sec_filings(args):
         cli_args.append('--all-forms')
     if getattr(args, 'include_older_pages', False):
         cli_args.append('--include-older-pages')
+    if getattr(args, 'include_inactive', False):
+        cli_args.append('--include-inactive')
     execute_script(update_sec_filings_main, cli_args)
 
 
@@ -878,6 +880,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sec_filings.add_argument('--forms', type=str, default=None, help="逗号分隔 form 列表覆盖默认集。")
     p_sec_filings.add_argument('--all-forms', action='store_true', help="不过滤 form type。")
     p_sec_filings.add_argument('--include-older-pages', action='store_true', help="追加历史分页（深回填）。")
+    p_sec_filings.add_argument('--include-inactive', action='store_true',
+                               help="无 symbols 时不再限定 is_active（退市证券 Form 25 回拉）。")
     p_sec_filings.set_defaults(func=run_update_sec_filings)
 
     p_sec_fund = subparsers.add_parser('update_sec_fundamentals', help="同步 SEC XBRL curated 基本面事实")

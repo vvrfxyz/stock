@@ -36,6 +36,7 @@ DEFAULT_FORMS = {
     "3", "4", "5", "3/A", "4/A", "5/A",
     "13F-HR", "13F-HR/A",
     "SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A",
+    "25", "25/A", "25-NSE", "25-NSE/A",
 }
 
 
@@ -52,6 +53,8 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--all-forms", action="store_true", help="不过滤 form type。")
     parser.add_argument("--include-older-pages", action="store_true",
                         help="追加抓取 submissions 历史分页（深回填用，多数公司不需要）。")
+    parser.add_argument("--include-inactive", action="store_true",
+                        help="无 symbols 时不再限定 is_active——退市证券也纳入（Form 25 回拉等场景）。")
     return parser
 
 
@@ -73,7 +76,7 @@ def get_target_securities(db_manager: DatabaseManager, args: argparse.Namespace)
         )
         if args.symbols:
             query = query.filter(Security.symbol.in_([s.lower() for s in args.symbols]))
-        else:
+        elif not getattr(args, "include_inactive", False):
             query = query.filter(Security.is_active == True)  # noqa: E712
         query = query.order_by(Security.id.asc())
         if args.limit > 0:

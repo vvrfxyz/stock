@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import MetaData, create_engine
 from sqlalchemy.orm import sessionmaker
 
-from data_models.models import Security
+from data_models.models import Company, Security
 
 import scripts.update_massive_actions as actions
 import scripts.update_massive_details as details
@@ -266,9 +266,12 @@ class TestGroupedDailySymbolMap:
         engine = create_engine("sqlite:///:memory:")
         # PG 上 symbol 唯一索引是 partial（仅 active 行）；sqlite 不识别 postgresql_where
         # 会退化成全表 unique，插不进 active+inactive 同 symbol，故去掉索引建表
-        table = Security.__table__.to_metadata(MetaData())
+        metadata = MetaData()
+        # securities.company_id 的 FK 需要 companies 同在一个 MetaData 里才能解析
+        Company.__table__.to_metadata(metadata)
+        table = Security.__table__.to_metadata(metadata)
         table.indexes.clear()
-        table.create(engine)
+        metadata.create_all(engine)
         session = sessionmaker(bind=engine)()
         yield session
         session.close()
@@ -622,3 +625,72 @@ class TestSharesRun:
         source.get_float_batch.return_value = []
 
         assert _exit_code(shares.run(shares.create_parser().parse_args([]), source, db)) == 1
+
+
+# ---------------------------------------------------------------------------
+# update_sec_filings 证券选择（--include-inactive / Form 25 默认集）
+# ---------------------------------------------------------------------------
+
+import scripts.update_sec_filings as sec_filings  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
+
+from data_models.models import SecurityIdentifier  # noqa: E402
+
+
+class _SecFilingsFakeDb:
+    """securities + security_identifiers 两张表的 sqlite 替身
+    （全 metadata 含 sqlite 不支持的 ARRAY 列，只建所需表）。"""
+
+    def __init__(self):
+        self.engine = create_engine("sqlite:///:memory:")
+        Security.__table__.create(self.engine)
+        SecurityIdentifier.__table__.create(self.engine)
+        self._factory = sessionmaker(bind=self.engine)
+
+    @contextmanager
+    def get_session(self):
+        session = self._factory()
+        try:
+            yield session
+        finally:
+            session.close()
+
+
+class TestSecFilingsTargetSelection:
+    @pytest.fixture()
+    def db(self):
+        manager = _SecFilingsFakeDb()
+        rows = [
+            # id, symbol, active, cik
+            (1, "aapl", True, "0000320193"),
+            (2, "dead", False, "0000000002"),   # 退市但有 CIK——Form 25 回拉目标
+            (3, "nocik", True, None),           # 无 CIK 不可处理
+        ]
+        with manager.get_session() as session:
+            for id_, symbol, active, cik in rows:
+                session.add(Security(
+                    id=id_, symbol=symbol, current_symbol=symbol, market="US",
+                    type="CS", is_active=active, cik=cik, full_refresh_interval=30,
+                ))
+            session.commit()
+        return manager
+
+    def _args(self, **overrides):
+        defaults = dict(symbols=[], limit=0, include_inactive=False)
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def test_default_excludes_inactive(self, db):
+        resolved = sec_filings.get_target_securities(db, self._args())
+        assert [s.symbol for s in resolved] == ["aapl"]
+
+    def test_include_inactive_lifts_active_filter(self, db):
+        resolved = sec_filings.get_target_securities(db, self._args(include_inactive=True))
+        assert [s.symbol for s in resolved] == ["aapl", "dead"]
+
+    def test_explicit_symbols_branch_ignores_active_filter(self, db):
+        resolved = sec_filings.get_target_securities(db, self._args(symbols=["dead"]))
+        assert [s.symbol for s in resolved] == ["dead"]
+
+    def test_default_forms_include_form_25_family(self):
+        assert {"25", "25/A", "25-NSE", "25-NSE/A"} <= sec_filings.DEFAULT_FORMS

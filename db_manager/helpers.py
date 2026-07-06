@@ -67,7 +67,9 @@ def _build_upsert_statement(
     protected = set(index_elements) | {"id", "created_at"} | (protected_columns or set())
     update_keys = set().union(*(row.keys() for row in data_list))
     update_columns = {
-        key: getattr(stmt.excluded, key)
+        # excluded[key] 索引访问：列名撞 ColumnCollection 字典方法（items/keys/values）
+        # 时 getattr 拿到的是 bound method 而非列，psycopg2 报 can't adapt type 'method'
+        key: stmt.excluded[key]
         for key in update_keys
         if key not in protected
     }
