@@ -148,8 +148,15 @@ yfinance_untouchable = 0 是正确结果——day-aggs 导入时的 --purge-remn
 
 发现与遗留：
 
-- daily_prices 在 19 个节假日上共 ~30 行 yfinance 幽灵 bar（双 NULL 指纹
-  可过滤，暂不清理）。
+- ~~daily_prices 在 19 个节假日上共 24 行 yfinance 幽灵 bar~~ **已清理（2026-07-06）**：
+  按"该日期全表只有双 NULL 行"识别 19 个休市日（含 2012 飓风 Sandy、2011-01-01
+  周六），删除 24 行并重算水位线；此后 daily_prices 与分钟线的日期宇宙精确一致
+  （2003-09-10 起同为 5,691 个交易日），全库周末/休市日行归零。
+- 其余 yfinance 双 NULL 行（264.7 万）**保留不删**：pre-2003 深历史 162 万行是
+  库内唯一的 2003 前日线；post-2003 的 101 万行是已覆盖证券的 OTC 填缝
+  （(security_id, date) 主键保证它们所在的日子没有任何其他来源的 bar，
+  vwap 回填实测零重叠）+ 27 只 yfinance-only 证券——删除等于丢失唯一数据，
+  不是去冗余。读取层按双 NULL 指纹过滤即可。
 - NVDA 2024-06-10 high 脏值（daily 侧，vendor 数据），follow-up 订正。
 - 编排器中途发现两处环境问题并已修复：wenruifeng 无 docker 组权限 →
   装载器全面改走 ClickHouse HTTP（8123，与读取层一致，无 docker 依赖）；
