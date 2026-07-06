@@ -49,7 +49,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-dollar-volume", type=float, default=2_000_000.0)
     parser.add_argument("--min-price", type=float, default=3.0)
     parser.add_argument("--benchmark", default="SPY")
-    return parser.parse_args(argv)
+    parser.add_argument("--terminal-return", default=None,
+                        help="退市持仓的终局收益假设（如 -1.0=归零、-0.3=CRSP 经验值、"
+                             "none=显式沿用旧口径即退市赚 0%%）。面板起点早于 2024-05-14 时必填。")
+    args = parser.parse_args(argv)
+    # 退市终局强制显式化：长窗口面板含 6,000+ 退市股，默认"退市赚 0%"会系统性
+    # 高估做多策略（评估 hard truth）。短窗口沿旧口径不变。
+    if args.start < date(2024, 5, 14) and args.terminal_return is None:
+        parser.error("--start 早于 2024-05-14 的长窗口回测必须显式给 --terminal-return"
+                     "（-1.0 归零 / -0.3 CRSP 经验 / none 沿用退市赚 0%% 旧口径）")
+    if isinstance(args.terminal_return, str):
+        args.terminal_return = None if args.terminal_return.lower() == "none" else float(args.terminal_return)
+    return args
 
 
 def trim(result: BacktestResult, eval_start: date) -> BacktestResult:
@@ -101,9 +112,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"平均可交易标的数: {eligible.sum(axis=1).mean():.0f}")
 
     results = [
-        run_backtest("momentum_12_1 (top10%, 月调)", momentum_12_1(adj_close, eligible), adj_close, cost_bps=args.cost_bps),
-        run_backtest("sma_50_200 趋势 (周调)", sma_trend(adj_close, eligible), adj_close, cost_bps=args.cost_bps),
-        run_backtest("5日反转 (bottom10%, 周调)", short_term_reversal(adj_close, eligible), adj_close, cost_bps=args.cost_bps),
+        run_backtest("momentum_12_1 (top10%, 月调)", momentum_12_1(adj_close, eligible), adj_close, cost_bps=args.cost_bps, terminal_return=args.terminal_return),
+        run_backtest("sma_50_200 趋势 (周调)", sma_trend(adj_close, eligible), adj_close, cost_bps=args.cost_bps, terminal_return=args.terminal_return),
+        run_backtest("5日反转 (bottom10%, 周调)", short_term_reversal(adj_close, eligible), adj_close, cost_bps=args.cost_bps, terminal_return=args.terminal_return),
     ]
 
     ew_weights = eligible.astype(float)

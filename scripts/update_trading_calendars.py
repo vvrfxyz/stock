@@ -45,7 +45,9 @@ def build_rows(start: date, end: date) -> list[dict]:
     import pandas as pd
 
     calendar = xc.get_calendar("XNYS", start=start.isoformat(), side="left")
-    sessions = calendar.sessions_in_range(pd.Timestamp(start), pd.Timestamp(end))
+    range_start = max(pd.Timestamp(start), calendar.first_session)
+    range_end = min(pd.Timestamp(end), calendar.last_session)
+    sessions = calendar.sessions_in_range(range_start, range_end)
     session_set = {s.date() for s in sessions}
 
     rows: list[dict] = []
