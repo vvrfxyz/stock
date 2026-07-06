@@ -19,11 +19,15 @@ from sqlalchemy.engine import Engine
 
 from research.backtest import eligibility_mask, hold_between_rebalances, run_backtest
 from research.data import FACTOR_TRUST_FLOOR, load_adjusted_panel, research_engine, securities_with_uncovered_events
+from research.factors.builtins import bar_geometry as _bar_geometry  # noqa: F401
+from research.factors.builtins import classic_price as _classic_price  # noqa: F401
 from research.factors.builtins import days_to_cover as _days_to_cover  # noqa: F401
 from research.factors.builtins import delta_institutional_ownership as _delta_inst_own  # noqa: F401
 from research.factors.builtins import earnings_yield as _earnings_yield  # noqa: F401
 from research.factors.builtins import insider_net_buy as _insider_net_buy  # noqa: F401
 from research.factors.builtins import institutional_breadth as _institutional_breadth  # noqa: F401
+from research.factors.builtins import intraday_flow as _intraday_flow  # noqa: F401
+from research.factors.builtins import intraday_moments as _intraday_moments  # noqa: F401
 from research.factors.builtins import ownership_concentration as _ownership_concentration  # noqa: F401
 from research.factors.builtins import short_interest as _short_interest  # noqa: F401
 from research.factors.builtins import short_volume as _short_volume  # noqa: F401
