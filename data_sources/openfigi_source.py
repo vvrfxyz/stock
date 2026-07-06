@@ -93,6 +93,26 @@ def _pick_unique_us_composite(candidates: list[Any]) -> dict[str, Any] | None:
     return us_rows[0]
 
 
+def _pick_unique_share_class(candidates: list[Any]) -> dict[str, Any] | None:
+    """二级消歧：全部候选共享唯一非空 shareClassFIGI -> 返回携带它的首行。
+
+    退市 ADR 的美国场所行会从 OpenFIGI 消失，只剩各国 venue composite——但同一
+    存托凭证的股份类 FIGI 跨场所不变。缺 shareClassFIGI 的候选行不投票（它们
+    本身构不成锚点）；出现第二个不同值 -> None（保持 AMBIGUOUS）。"""
+    values = {
+        candidate.get("shareClassFIGI")
+        for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("shareClassFIGI")
+    }
+    if len(values) != 1:
+        return None
+    anchor_value = next(iter(values))
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate.get("shareClassFIGI") == anchor_value:
+            return candidate
+    return None
+
+
 class OpenFigiSource:
     """OpenFIGI 只读适配器。线程安全的简单时间窗节流；批大小随有无 key 自动切换。"""
 
@@ -240,8 +260,17 @@ class OpenFigiSource:
             us_composite = _pick_unique_us_composite(candidates)
             if us_composite is not None:
                 return _matched_result(us_composite.get("compositeFIGI"), us_composite)
-            # 零个或多个不同 US composite：真歧义。figi/ticker 等字段全置 None，
-            # 仅保留第一条候选的 name 供人工诊断。
+            # US composite 命不中的退市旗舰 ADR（LFC/PTR：美国那只 ADR 已摘牌，
+            # OpenFIGI 不再返回 exchCode=US 行，只剩各国 composite）——若全部候选
+            # 共享唯一 shareClassFIGI，用它做锚点：securities 行的 share_class_figi
+            # 与之相等即挂链（resolve_links 的 by_share_class 回退路径消费）。
+            shared_scf = _pick_unique_share_class(candidates)
+            if shared_scf is not None:
+                anchor = _matched_result(None, shared_scf)
+                anchor["composite_figi"] = None  # 无可信 composite，仅凭 share class 挂链
+                return anchor
+            # 零个或多个不同 US composite 且无共享 share class：真歧义。figi/ticker
+            # 等字段全置 None，仅保留第一条候选的 name 供人工诊断。
             result = _empty_result("AMBIGUOUS")
             first = candidates[0] if isinstance(candidates[0], dict) else {}
             result["name"] = first.get("name")

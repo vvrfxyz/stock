@@ -396,3 +396,83 @@ def test_anonymous_when_env_unset(monkeypatch):
     source = OpenFigiSource(session=FakeSession([]))
 
     assert source.batch_size == 10
+
+
+def test_no_us_rows_shared_share_class_matches_via_share_class(sleep_calls):
+    # 退市旗舰 ADR（LFC/PTR 实测）：美国场所行从 OpenFIGI 消失，只剩各国
+    # venue composite，但全部候选共享唯一 shareClassFIGI -> 以股份类锚点 MATCHED，
+    # composite 置 None（resolve_links 走 by_share_class 回退挂链）。
+    session = FakeSession(
+        [
+            FakeResponse(
+                [
+                    {
+                        "data": [
+                            _candidate("BBG000CJ6BF7", exchCode="GM",
+                                       shareClassFIGI="BBG001SF0CS6", name="PETROCHINA CO LTD -ADR"),
+                            _candidate("BBG00JVBL443", exchCode="XB",
+                                       shareClassFIGI="BBG001SF0CS6", name="PETROCHINA CO LTD -ADR"),
+                            _candidate("BBG00YRY9T44", exchCode="X9",
+                                       shareClassFIGI="BBG001SF0CS6", name="PETROCHINA CO LTD -ADR"),
+                        ]
+                    }
+                ]
+            )
+        ]
+    )
+    source = OpenFigiSource(api_key="", session=session)
+
+    row = source.map_cusips(["71646E100"])["71646E100"]
+
+    assert row["status"] == "MATCHED"
+    assert row["composite_figi"] is None
+    assert row["share_class_figi"] == "BBG001SF0CS6"
+    assert row["name"] == "PETROCHINA CO LTD -ADR"
+
+
+def test_no_us_rows_distinct_share_classes_stay_ambiguous(sleep_calls):
+    session = FakeSession(
+        [
+            FakeResponse(
+                [
+                    {
+                        "data": [
+                            _candidate("BBG000AAAAA1", exchCode="GM", shareClassFIGI="BBG001SC0001"),
+                            _candidate("BBG000BBBBB2", exchCode="XB", shareClassFIGI="BBG001SC0002"),
+                        ]
+                    }
+                ]
+            )
+        ]
+    )
+    source = OpenFigiSource(api_key="", session=session)
+
+    row = source.map_cusips(["12345678X"])["12345678X"]
+
+    assert row["status"] == "AMBIGUOUS"
+    assert row["share_class_figi"] is None
+
+
+def test_us_composite_takes_precedence_over_share_class_anchor(sleep_calls):
+    # 同时满足两级判据时用一级（US composite）：composite 锚点信息量更大。
+    session = FakeSession(
+        [
+            FakeResponse(
+                [
+                    {
+                        "data": [
+                            _candidate("BBG000USUSU1", exchCode="US", shareClassFIGI="BBG001SCSAME"),
+                            _candidate("BBG000GERMN1", exchCode="GM", shareClassFIGI="BBG001SCSAME"),
+                        ]
+                    }
+                ]
+            )
+        ]
+    )
+    source = OpenFigiSource(api_key="", session=session)
+
+    row = source.map_cusips(["12345678X"])["12345678X"]
+
+    assert row["status"] == "MATCHED"
+    assert row["composite_figi"] == "BBG000USUSU1"
+    assert row["exch_code"] == "US"
