@@ -73,6 +73,23 @@
 - 新增实体层：`companies` 表（PERMCO 等价物）9,339 家、活跃 CS 覆盖 99.85%，
   公司级合并市值读取层就位（上市类之和口径）。
 
+### 差距地图更新（2026-07-07 CRSP 二期执行窗口，见 `todo_crsp_phase2_2026-07.md` 工程记录）
+
+- **delisting_return 对价抽取 → 落地**：8-K/DEFM14A 文档级抽取二期上线（股票腿
+  估值、破产三证 −1、现金正则扩充、DEFM14A 章节切片、8-K 1.01 签约公告源）；
+  表内实测 return 破千、读取层含 ETF 清盘 par + SPAC 赎回 par（LIQUIDATION +
+  redemption_provision 合成 0.0，新读取层经验值）。验收数字见二期工程记录。
+  full-rebuild 语义配了降级重建保险丝（缺 fetch 旗标或网络终端降级拒绝写库）。
+- **多类股基本面分母 → 收口**：earnings_yield 公司级分子/分母读取层 join，
+  goog/brk.b 可算；common-equity 判别升级 share_class_figi 结构化证据
+  （pfbc/unt 误伤翻正）。company_events 世系边表仍挂起（Alphabet 2015 断层）。
+- **securities 写路径债 → 阶段 1a 收口**：七个旁路收编 db_manager 三个新 API
+  （deactivate/enrich/recalculate），豁免清单三项（repair_identity/
+  build_companies 挂接腿/cleanup_unknown_figi）；82 只 'UNKNOWN' 字面量 FIGI
+  清 NULL + MANUAL 事件。
+- **评估层 → realized 口径全通**：evaluate 接实测退市收益（口径进 params_hash），
+  面板进程内缓存 + 列裁剪（长窗口 9 因子 wall-clock 与 RSS 大幅下降）。
+
 ## 路线图
 
 **本周（每项 <1 天）**：重启备份+异机副本+restore 演练（✅ 评估当晚已做，见下）；
