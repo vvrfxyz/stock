@@ -341,8 +341,15 @@ security_details    -- vendor 易变快照：name/address/branding/market_cap/
   - UNKNOWN 1,783 只清单在 `logs/manual_backfill/delisting_unknown_final3.csv`
     （其中 source=FORM25 的攥着证据定性不了——wrong_class 782 多为同 CIK 票据/
     优先股类 Form 25，indeterminate 257 为无勾选标记的老文档）。
-- **步骤 4 遗留**：20 年动量对比实验（`--terminal-return none --no-delisting-returns`
-  旧口径 vs 逐只实测新口径）待跑；backtest 引擎与 run_baselines 接线已就绪。
+- **步骤 4 的 20 年动量对比（验收实验，2026-07-06 晚完成）**：面板 2010-01-01~
+  2026-06-10（9,127 只，评估窗 2011-01-01 起，双边 10bps）。
+  旧口径（`--terminal-return none --no-delisting-returns`，退市持仓赚 0%）vs
+  实测口径（delisting_events 1,781 只，面板内 671 只，未覆盖仍沿旧口径）：
+  momentum_12_1 总收益 **733.4% → 714.0%**（CAGR 14.8%→14.6%，Sharpe
+  0.643→0.637），sma_50_200 428.9%→423.2%，5 日反转 30.3%→30.0%。方向与
+  Shumway 退市偏差一致——旧口径系统性高估；且本对比是**下界**（面板内实测仅
+  671 只、未覆盖者仍按 0% 处理，对价抽取覆盖扩大后修正会更大）。
+  momentum 的退市持仓日 4,057 天（0.53% 持仓日）。
 
 ### 任务 2（companies）——完成
 
@@ -360,7 +367,18 @@ security_details    -- vendor 易变快照：name/address/branding/market_cap/
   活跃优先（`is_active DESC, id ASC`），否则 26 个 CIK 的 1,290 万行事实会
   翻锚到低 id 退市证券、活跃 ticker 基本面变 NaN（已加锁定测试）。
 
-### 任务 3（PIT 股本）——完成（验收评估待 bulk-zip 收尾）
+### 任务 3（PIT 股本）——完成（验收评估 2026-07-06 晚收官）
+
+- **验收结果**：双源重叠期对拍中位相对误差 **0.00%**（2,001 只，p90 3.3%，>5% 者
+  9.2%）✓ 过 <2% 线；as-of 覆盖（当年年中当时活跃 CS）2012 62.6% / 2016 71.1% /
+  2020 79.0% / 2024 82.5%——**低于 ≥85% 线，如实记录**：缺口=ADR/IFRS 挂起缺口 +
+  信托/LP 误标 CS + pre-2009 退市物理无 XBRL（数据存在性天花板，非实现缺陷）；
+  vendor 段（2024-06-30+）覆盖接近全量。
+- **size 因子 2011-2026 评估**（`research/output/evaluate_size_2011-01-03_
+  2026-07-02.md`）：IC 0.015（1d）→0.030（21d），NW t 3.8-6.5，PIT 违规 0，
+  覆盖低分位 74%。**2024-06 接缝检查过**：IC 接缝前 6 月均值 0.094 vs 后 7 月
+  0.081（连续无断点）；覆盖数接缝处 +11.5%（3,934→4,386）系 vendor 段补上
+  无 XBRL 的 ETF/小报告方——覆盖改善而非口径断裂。
 
 - **假设订正 ×3**：(a) 6 个股本概念全部已在白名单且已入库（2009-04 起，dei 概念
   16.9 万行/4,459 家）——概念普查零工作量；(b) `research/market_cap.py` 已实现
