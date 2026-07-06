@@ -18,7 +18,14 @@ from loguru import logger
 from sqlalchemy.engine import Engine
 
 from research.backtest import eligibility_mask, hold_between_rebalances, run_backtest
-from research.data import FACTOR_TRUST_FLOOR, load_adjusted_panel, research_engine, securities_with_uncovered_events
+from research.data import (
+    FACTOR_TRUST_FLOOR,
+    load_adjusted_panel,
+    load_delisting_returns,
+    research_engine,
+    resolve_terminal_returns,
+    securities_with_uncovered_events,
+)
 from research.factors.builtins import bar_geometry as _bar_geometry  # noqa: F401
 from research.factors.builtins import classic_pillars as _classic_pillars  # noqa: F401
 from research.factors.builtins import classic_price as _classic_price  # noqa: F401
@@ -101,6 +108,31 @@ def _params_without_note(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def _params_hash(config: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(_params_without_note(config)).encode("utf-8")).hexdigest()
+
+
+def _terminal_return_config(
+    terminal_return: float | pd.Series | None,
+    terminal_return_fallback: float | None,
+) -> dict[str, Any]:
+    """退市终局口径的 config 快照（进 params_hash，区分 trials 新旧口径）。
+
+    Series 本身不可哈希进 config：mode 记 'realized_series'，标量值只在标量口径下记录。
+    run_evaluation 与 evaluate_factor 必须用同一个推导（config 覆盖合并时值须一致）。
+    """
+    if isinstance(terminal_return, pd.Series):
+        mode = "realized_series"
+        scalar = None
+    elif terminal_return is not None:
+        mode = "scalar"
+        scalar = float(terminal_return)
+    else:
+        mode = "none"
+        scalar = None
+    return {
+        "terminal_return_mode": mode,
+        "terminal_return_scalar": scalar,
+        "terminal_return_fallback": terminal_return_fallback,
+    }
 
 
 def _factor_params_snapshot(factor: Factor) -> dict[str, Any]:
@@ -293,6 +325,8 @@ def _quantile_metrics(
     n_quantiles: int,
     cost_bps: float,
     risk_free_returns: pd.Series | None = None,
+    terminal_return: float | pd.Series | None = None,
+    terminal_return_fallback: float | None = None,
 ) -> pd.DataFrame:
     columns = ["ann_return", "ann_vol", "sharpe_gross", "sharpe_net", "ann_turnover", "max_drawdown"]
     if adj_close is None:
@@ -321,9 +355,15 @@ def _quantile_metrics(
                 mat = mat.copy()
                 mat[before_first] = 0.0
             weights = pd.DataFrame(mat, index=adj_close.index, columns=factor.columns)
-            gross_result = run_backtest(f"{label}_h{horizon}_gross", weights, adj_close, cost_bps=0, hold_through_gaps=True)
+            # 退市终局收益注入 gross/net 两跑都要传；注意引擎只对多头持仓
+            # （held>0）注入——ls 组合空头腿的退市不注入（收益保守低估）。
+            gross_result = run_backtest(
+                f"{label}_h{horizon}_gross", weights, adj_close, cost_bps=0, hold_through_gaps=True,
+                terminal_return=terminal_return, terminal_return_fallback=terminal_return_fallback,
+            )
             net_result = run_backtest(
-                f"{label}_h{horizon}_net", weights, adj_close, cost_bps=cost_bps, hold_through_gaps=True
+                f"{label}_h{horizon}_net", weights, adj_close, cost_bps=cost_bps, hold_through_gaps=True,
+                terminal_return=terminal_return, terminal_return_fallback=terminal_return_fallback,
             )
             gross = gross_result.metrics()
             net = net_result.metrics()
@@ -571,6 +611,8 @@ def evaluate_factor(
     min_coverage: int = 50,
     factor_name: str = "anonymous",
     risk_free_returns: pd.Series | None = None,
+    terminal_return: float | pd.Series | None = None,
+    terminal_return_fallback: float | None = None,
 ) -> EvaluationResult:
     factor = factor_values.copy().astype("float64")
     factor.index = _normalize_dates(factor.index)
@@ -586,7 +628,7 @@ def evaluate_factor(
         "min_coverage": min_coverage,
         "noise_threshold": NOISE_THRESHOLD,
         "min_obs": MIN_OBS,
-    }
+    } | _terminal_return_config(terminal_return, terminal_return_fallback)
     as_of = factor.attrs.get("as_of")
     as_of_ts = pd.Timestamp(as_of) if as_of is not None else None
     # IC/IC-decay 与分位回测、coverage 共用可投资横截面：ineligible 名字上的
@@ -622,7 +664,10 @@ def evaluate_factor(
     ic_table = pd.DataFrame(ic_rows).set_index("horizon")
     ic_table["is_noisy"] = ic_table["is_noisy"].map(bool).astype(object)
     ic_decay = _ic_decay_table(investable_factor, aligned_returns, horizons, min_coverage)
-    q_metrics = _quantile_metrics(factor, eligibility, adj_close, horizons, n_quantiles, cost_bps, risk_free_returns)
+    q_metrics = _quantile_metrics(
+        factor, eligibility, adj_close, horizons, n_quantiles, cost_bps, risk_free_returns,
+        terminal_return=terminal_return, terminal_return_fallback=terminal_return_fallback,
+    )
     coverage = _coverage(factor, aligned_returns, eligibility, as_of_ts)
     non_nan_dates = factor.dropna(how="all").index
     freshness = (factor.index.max() - non_nan_dates.max()).days if len(non_nan_dates) else np.nan
@@ -743,6 +788,9 @@ def run_evaluation(
     run_id: str | None = None,
     risk_free_returns: pd.Series | None = None,
     risk_free_series: str | None = DEFAULT_RISK_FREE_SERIES,
+    terminal_return: float | None = None,
+    use_delisting_returns: bool = True,
+    fund_closure_par: bool = True,
 ) -> EvaluationResult:
     from research._trials_store import _git_meta, append_trial
 
@@ -760,6 +808,16 @@ def run_evaluation(
         min_price=min_price,
         min_median_dollar_volume=min_median_dollar_volume,
         window=eligibility_window,
+    )
+    # 退市终局收益（口径同 run_baselines）：优先 delisting_events 逐证券实测，
+    # CLI 标量降级为未覆盖证券的 fallback；opt-out / 表空时只用标量（旧口径）。
+    realized = (
+        load_delisting_returns(engine, fund_closure_par=fund_closure_par)
+        if use_delisting_returns
+        else pd.Series(dtype="float64")
+    )
+    resolved_terminal, resolved_fallback = resolve_terminal_returns(
+        realized, terminal_return, use_realized=use_delisting_returns
     )
     keep = eligible.any(axis=0)
     for key in panel:
@@ -813,6 +871,11 @@ def run_evaluation(
         "factor_lookback_days": getattr(factor_obj, "lookback_days", None),
         "factor_lag_days": getattr(factor_obj, "lag_days", None),
         "factor_pit_guarantee": getattr(factor_obj, "pit_guarantee", None),
+        # 退市终局口径进 params_hash：realized/scalar/none 三种口径的 trial 必须可区分，
+        # 否则 trials.parquet 里新旧口径互相顶替（latest_only 读取会拿错）。
+        **_terminal_return_config(resolved_terminal, resolved_fallback),
+        # fund_closure_par 只在实测口径下起作用；其余口径归一为 None 避免无谓的 hash 分裂。
+        "fund_closure_par": fund_closure_par if isinstance(resolved_terminal, pd.Series) else None,
         "run_id": run_id,
         "note": note,
     }
@@ -838,6 +901,8 @@ def run_evaluation(
         min_coverage=50,
         factor_name=factor_obj.name,
         risk_free_returns=risk_free_returns,
+        terminal_return=resolved_terminal,
+        terminal_return_fallback=resolved_fallback,
     )
     pit_diff, pit_presence = _pit_regression(factor_obj, factor_values, engine, eval_dates, universe)
     diagnostics = dict(result.diagnostics)
@@ -969,6 +1034,18 @@ def _write_markdown_report(result: EvaluationResult, output_dir: Path) -> Path:
     start = result.eval_dates.min().date() if len(result.eval_dates) else "empty"
     end = result.eval_dates.max().date() if len(result.eval_dates) else "empty"
     path = output_dir / f"evaluate_{result.factor_name}_{start}_{end}.md"
+    terminal_mode = str(result.config.get("terminal_return_mode", "none"))
+    notes = [
+        f"- Terminal-return mode: `{terminal_mode}`"
+        f" (scalar={result.config.get('terminal_return_scalar')},"
+        f" fallback={result.config.get('terminal_return_fallback')},"
+        f" fund_closure_par={result.config.get('fund_closure_par')}).",
+    ]
+    if terminal_mode != "none":
+        notes.append(
+            "- Terminal-return injection only covers long legs (held > 0): short-leg delistings in "
+            "`ls_*` portfolios are not injected, so long-short returns are conservatively understated."
+        )
     parts = [
         f"# Factor evaluation: {result.factor_name}",
         "",
@@ -985,6 +1062,9 @@ def _write_markdown_report(result: EvaluationResult, output_dir: Path) -> Path:
         "",
         "## PIT diagnostics",
         _markdown_table(pd.Series(result.diagnostics, name="value").to_frame()),
+        "",
+        "## Notes",
+        *notes,
     ]
     path.write_text("\n".join(parts), encoding="utf-8")
     return path
@@ -1004,6 +1084,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cost-bps", type=float, default=10.0)
     parser.add_argument("--risk-free-series", default=DEFAULT_RISK_FREE_SERIES, help="risk_free_rates series_id；默认 DTB3。")
     parser.add_argument("--no-risk-free", action="store_true", help="复现旧口径：Sharpe/IR 不扣 risk-free。")
+    parser.add_argument("--terminal-return", default=None,
+                        help="退市持仓的终局收益假设（如 -1.0=归零、-0.3=CRSP 经验值、"
+                             "none=显式旧口径即退市赚 0%%）。语义同 run_baselines：delisting_events "
+                             "有实测收益时它降级为未覆盖证券的 fallback。")
+    parser.add_argument("--no-delisting-returns", action="store_true",
+                        help="不读 delisting_events 的逐证券实测退市收益，只用 --terminal-return "
+                             "全局假设（复现旧口径运行）。")
+    parser.add_argument("--no-fund-closure-par", action="store_true",
+                        help="关闭 ETF 清盘平价合成（FUND_CLOSURE + final_price 在场的 NULL 实测行"
+                             "读取时合成 0.0），只用纯实测行。")
     persist_group = parser.add_mutually_exclusive_group()
     persist_group.add_argument("--trials-path", type=Path, default=None)
     persist_group.add_argument("--no-persist", action="store_true")
@@ -1012,6 +1102,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.start < FACTOR_TRUST_FLOOR:
         parser.error(f"--start must be >= {FACTOR_TRUST_FLOOR}")
+    if isinstance(args.terminal_return, str):
+        args.terminal_return = None if args.terminal_return.lower() == "none" else float(args.terminal_return)
     if args.trials_path is None and not args.no_persist:
         args.trials_path = DEFAULT_TRIALS_PATH
     return args
@@ -1035,6 +1127,9 @@ def main(argv: list[str] | None = None) -> int:
         n_quantiles=args.n_quantiles,
         cost_bps=args.cost_bps,
         risk_free_series=None if args.no_risk_free else args.risk_free_series,
+        terminal_return=args.terminal_return,
+        use_delisting_returns=not args.no_delisting_returns,
+        fund_closure_par=not args.no_fund_closure_par,
         trials_path=args.trials_path,
         note=args.note,
         strict=args.strict,

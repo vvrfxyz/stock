@@ -29,6 +29,7 @@ from research.data import (
     load_factor_events,
     load_price_long,
     research_engine,
+    resolve_terminal_returns,
     securities_with_uncovered_events,
     to_wide,
 )
@@ -38,6 +39,7 @@ from research.universe import build_universe_mask
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 FACTOR_TRUST_FLOOR = date(2003, 1, 1)
 DEFAULT_PANEL_START = date(2024, 5, 14)  # 基线默认沿用原窗口；20 年面板显式传 --start
+_FALLBACK_UNSET = object()  # --terminal-return-fallback 未提供时的哨兵（区分显式 none）
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -57,6 +59,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-delisting-returns", action="store_true",
                         help="不读 delisting_events 的逐证券实测退市收益，只用 --terminal-return "
                              "全局假设（复现旧口径运行）。")
+    parser.add_argument("--terminal-return-fallback", default=_FALLBACK_UNSET,
+                        help="实测 Series 口径下未覆盖证券的兜底收益（float，或 none=显式不兜底）。"
+                             "缺省沿用 --terminal-return 标量作兜底（现状语义）；显式给出时覆盖之。")
+    parser.add_argument("--no-fund-closure-par", action="store_true",
+                        help="关闭 ETF 清盘平价合成（FUND_CLOSURE + final_price 在场的 NULL 实测行"
+                             "读取时合成 0.0），只用纯实测行。")
     args = parser.parse_args(argv)
     # 退市终局强制显式化：长窗口面板含 6,000+ 退市股，默认"退市赚 0%"会系统性
     # 高估做多策略（评估 hard truth）。短窗口沿旧口径不变。
@@ -65,23 +73,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                      "（-1.0 归零 / -0.3 CRSP 经验 / none 沿用退市赚 0%% 旧口径）")
     if isinstance(args.terminal_return, str):
         args.terminal_return = None if args.terminal_return.lower() == "none" else float(args.terminal_return)
+    args.terminal_return_fallback_explicit = args.terminal_return_fallback is not _FALLBACK_UNSET
+    if isinstance(args.terminal_return_fallback, str):
+        args.terminal_return_fallback = (
+            None if args.terminal_return_fallback.lower() == "none" else float(args.terminal_return_fallback)
+        )
+    elif not args.terminal_return_fallback_explicit:
+        args.terminal_return_fallback = None
     return args
-
-
-def resolve_terminal_returns(
-    realized: pd.Series,
-    cli_value: float | None,
-    use_realized: bool = True,
-) -> tuple[float | pd.Series | None, float | None]:
-    """决定传给 run_backtest 的 (terminal_return, terminal_return_fallback)。
-
-    规则（docs/todo_crsp_grade_2026-07.md 任务 1 步骤 4）：优先逐证券实测
-    delisting_return（Series），CLI 标量降级为未覆盖证券的 fallback；实测为空
-    （表未填充）或显式 opt-out 时，行为与旧口径完全一致——只传 CLI 标量、无 fallback。
-    """
-    if not use_realized or realized.empty:
-        return cli_value, None
-    return realized, cli_value
 
 
 def trim(result: BacktestResult, eval_start: date) -> BacktestResult:
@@ -134,10 +133,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # 退市终局收益：优先 delisting_events 的逐证券实测 delisting_return，
     # 查无（表未填充 / --no-delisting-returns）再落回全局 CLI 假设（旧口径不变）。
-    realized = pd.Series(dtype="float64") if args.no_delisting_returns else load_delisting_returns(engine)
+    realized = (pd.Series(dtype="float64") if args.no_delisting_returns
+                else load_delisting_returns(engine, fund_closure_par=not args.no_fund_closure_par))
     terminal_return, terminal_fallback = resolve_terminal_returns(
         realized, args.terminal_return, use_realized=not args.no_delisting_returns
     )
+    if args.terminal_return_fallback_explicit and isinstance(terminal_return, pd.Series):
+        # 显式 --terminal-return-fallback 覆盖"CLI 标量降级为兜底"的缺省语义；
+        # 标量/None 口径下引擎不消费 fallback，不覆盖以保持打印口径一致。
+        terminal_fallback = args.terminal_return_fallback
     if isinstance(terminal_return, pd.Series):
         in_panel = int(terminal_return.index.isin(adj_close.columns).sum())
         fallback_desc = ("无（未覆盖的退市持仓沿旧口径赚 0%）" if terminal_fallback is None

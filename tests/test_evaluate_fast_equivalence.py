@@ -132,6 +132,19 @@ class TestRankIcEquivalence:
         ref = _rank_ic_series_reference(panels["factor"], panels["fwd"], min_coverage=210)
         pd.testing.assert_series_equal(new, ref, rtol=1e-12, atol=1e-14)
 
+    def test_ic_series_constant_rows_zero_variance(self, panels):
+        """整行常数（零方差）→ 两实现都必须给 NaN，而非 0 或除零告警。"""
+        factor = panels["factor"].copy()
+        fwd = panels["fwd"].copy()
+        factor.iloc[10] = 1.0            # 因子整行常数
+        fwd.iloc[20] = 0.05              # 收益整行常数
+        factor.iloc[21] = 1.0
+        fwd.iloc[21] = 0.05              # 双侧同时常数
+        new = _rank_ic_series(factor, fwd, min_coverage=50)
+        ref = _rank_ic_series_reference(factor, fwd, min_coverage=50)
+        pd.testing.assert_series_equal(new, ref, rtol=1e-12, atol=1e-14)
+        assert np.isnan(new.iloc[10]) and np.isnan(new.iloc[20]) and np.isnan(new.iloc[21])
+
 
 class TestDecayEquivalence:
     def test_decay_table(self, panels):

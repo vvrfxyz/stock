@@ -288,6 +288,7 @@ def test_factor_context_as_of_truncates_dates(monkeypatch):
     factor = RecordingFactor()
     monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
     monkeypatch.setattr(ev, "securities_with_uncovered_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ev, "load_delisting_returns", lambda *args, **kwargs: pd.Series(dtype="float64"))
     monkeypatch.setattr(ev, "_git_meta", lambda: (None, False), raising=False)
 
     ev.run_evaluation(
@@ -329,6 +330,7 @@ def test_run_evaluation_loads_risk_free_only_for_quantile_backtest_dates(monkeyp
 
     monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
     monkeypatch.setattr(ev, "securities_with_uncovered_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ev, "load_delisting_returns", lambda *args, **kwargs: pd.Series(dtype="float64"))
     monkeypatch.setattr(ev, "load_risk_free_daily_returns", fake_load_risk_free)
 
     ev.run_evaluation(
@@ -365,6 +367,7 @@ def test_uncovered_events_window_covers_forward_return_buffer(monkeypatch):
 
     monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
     monkeypatch.setattr(ev, "securities_with_uncovered_events", fake_uncovered)
+    monkeypatch.setattr(ev, "load_delisting_returns", lambda *args, **kwargs: pd.Series(dtype="float64"))
 
     ev.run_evaluation(
         RecordingFactor(),
@@ -395,6 +398,7 @@ def test_run_evaluation_requires_eval_start_for_short_default_warmup(monkeypatch
     }
     monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
     monkeypatch.setattr(ev, "securities_with_uncovered_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ev, "load_delisting_returns", lambda *args, **kwargs: pd.Series(dtype="float64"))
 
     with pytest.raises(FactorEvaluationError, match="252-day warmup"):
         ev.run_evaluation(
@@ -484,6 +488,7 @@ def test_run_evaluation_strict_persists_before_raise(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
     monkeypatch.setattr(ev, "securities_with_uncovered_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ev, "load_delisting_returns", lambda *args, **kwargs: pd.Series(dtype="float64"))
     monkeypatch.setattr(ev, "_pit_regression", lambda *args, **kwargs: (1.0, 0))
     monkeypatch.setattr("research._trials_store.append_trial", fake_append)
 
@@ -516,6 +521,7 @@ def test_run_evaluation_strict_fails_on_presence_violations(monkeypatch, tmp_pat
     }
     monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
     monkeypatch.setattr(ev, "securities_with_uncovered_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ev, "load_delisting_returns", lambda *args, **kwargs: pd.Series(dtype="float64"))
     # 值差为 NaN、仅 presence 违规：strict 仍须失败
     monkeypatch.setattr(ev, "_pit_regression", lambda *args, **kwargs: (np.nan, 3))
 
@@ -546,6 +552,7 @@ def test_run_evaluation_reports_presence_violations_in_diagnostics(monkeypatch):
     }
     monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
     monkeypatch.setattr(ev, "securities_with_uncovered_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ev, "load_delisting_returns", lambda *args, **kwargs: pd.Series(dtype="float64"))
     monkeypatch.setattr(ev, "_pit_regression", lambda *args, **kwargs: (np.nan, 7))
 
     result = ev.run_evaluation(
@@ -582,6 +589,7 @@ def test_run_evaluation_raises_when_trial_append_fails(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
     monkeypatch.setattr(ev, "securities_with_uncovered_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ev, "load_delisting_returns", lambda *args, **kwargs: pd.Series(dtype="float64"))
     monkeypatch.setattr(ev, "_pit_regression", lambda *args, **kwargs: (1.0, 0))
     monkeypatch.setattr("research._trials_store.append_trial", fake_append)
 

@@ -16,6 +16,16 @@ pytestmark = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _fresh_panel_cache():
+    """load_adjusted_panel 进程内缓存假设同 URL 数据不变；集成测试同库换数据，必须清。"""
+    from research.data import clear_panel_cache
+
+    clear_panel_cache()
+    yield
+    clear_panel_cache()
+
+
 def _insert_security(pg_db, security_id: int, symbol: str, *, is_active: bool = True, sec_type: str = "CS") -> None:
     with pg_db.engine.connect() as conn:
         conn.execute(

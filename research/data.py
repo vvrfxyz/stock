@@ -22,6 +22,22 @@ DEFAULT_METHODOLOGY_VERSION = "raw_actions_v1"
 # MASSIVE 源事件与因子链覆盖到 2003；更早无价格、无事件，仍是硬地板。
 FACTOR_TRUST_FLOOR = date(2003, 1, 1)
 
+# daily_prices 中允许研究层拉取的价格列白名单（列名内联进 COPY SQL，必须受控）。
+PRICE_COLUMNS = ("open", "close", "volume", "vwap")
+
+# 评估层面板进程内缓存（照 research/factors/price_cache.py 的 _PANEL_CACHE 模式）：
+# evaluate_all 逐因子调 run_evaluation，各自重新装载同一份 31M 行面板是长窗口
+# wall-clock 主项之一。缓存 4 张宽表，命中时返回**新 dict、同 DataFrame 对象**——
+# 调用方只 rebind dict 条目（drop/loc 都返回新 frame），从不原地改写宽表。
+# 注意：缓存假设窗口内历史数据在进程存活期不变（研究只读用法成立）；
+# 集成测试同 URL 换数据时须先 clear_panel_cache()。
+_ADJUSTED_PANEL_CACHE: dict[tuple, dict[str, pd.DataFrame]] = {}
+_ADJUSTED_PANEL_CACHE_MAX = 2  # 长窗口面板数 GB 级，最多驻留 2 个窗口（评估 + 对比窗口）
+
+
+def clear_panel_cache() -> None:
+    _ADJUSTED_PANEL_CACHE.clear()
+
 
 def research_engine(database_url: str | None = None) -> Engine:
     """优先 RESEARCH_DATABASE_URL（指向 253 生产库的只读连接），回退 DATABASE_URL。"""
@@ -39,6 +55,7 @@ def load_price_long(
     types: tuple[str, ...] = ("CS",),
     include_inactive: bool = True,
     security_ids: list[int] | None = None,
+    columns: tuple[str, ...] = PRICE_COLUMNS,
 ) -> pd.DataFrame:
     """拉取 [start, end] 的原始日线（长表）。
 
@@ -47,10 +64,17 @@ def load_price_long(
 
     2026-07 性能改造：走 PostgreSQL COPY csv 通道直接喂 pandas C 解析器——
     read_sql 逐行物化在 31M 行量级上慢 5-10 倍（wave-1 评估实测瓶颈）。
-    参数全部为内部受控值（date/内部 int id/白名单 type），内联安全。
+    参数全部为内部受控值（date/内部 int id/白名单 type/白名单列名），内联安全。
+    columns 可裁剪价格列（长窗口面板只需 close/volume 时省 ~50% csv 字节与解析）。
     """
     import io
 
+    unknown = set(columns) - set(PRICE_COLUMNS)
+    if unknown:
+        raise ValueError(f"不支持的价格列: {sorted(unknown)}；白名单 {PRICE_COLUMNS}")
+    if not columns:
+        raise ValueError("columns 不能为空")
+    select_cols = ", ".join(f"p.{c}::float8 as {c}" for c in columns)
     active_clause = "" if include_inactive else "and s.is_active"
     id_clause = ""
     if security_ids:
@@ -58,9 +82,7 @@ def load_price_long(
     type_list = ",".join(f"'{t}'" for t in types)
     copy_sql = f"""
         COPY (
-            select p.security_id, p.date,
-                   p.open::float8 as open, p.close::float8 as close,
-                   p.volume::float8 as volume, p.vwap::float8 as vwap
+            select p.security_id, p.date, {select_cols}
             from daily_prices p
             join securities s on s.id = p.security_id
             where p.date between '{start.isoformat()}' and '{end.isoformat()}'
@@ -77,8 +99,9 @@ def load_price_long(
         raw.close()
     buffer.seek(0)
     df = pd.read_csv(buffer, parse_dates=["date"])
+    del buffer  # csv 文本（长窗口 GB 级）与解析结果短暂共存，解析完立即释放
     if df.empty:
-        return pd.DataFrame(columns=["security_id", "date", "open", "close", "volume", "vwap"])
+        return pd.DataFrame(columns=["security_id", "date", *columns])
     df["security_id"] = df["security_id"].astype(np.int32)
     return df
 
@@ -141,8 +164,19 @@ def apply_adjustment(prices: pd.DataFrame, events: pd.DataFrame, *, as_of: date 
 
 
 def to_wide(prices: pd.DataFrame, column: str) -> pd.DataFrame:
-    """长表 -> 宽表（index=date, columns=security_id）。"""
-    return prices.pivot_table(index="date", columns="security_id", values=column, aggfunc="last")
+    """长表 -> 宽表（index=date, columns=security_id）。
+
+    (security_id, date) 是 daily_prices 的 PK，正常路径无重复键，直接 pivot——
+    pivot_table(aggfunc="last") 的 groupby 聚合在 31M 行量级是纯开销（2026-07 实测）。
+    仅在重复键（理论上不该发生）时回退旧的 pivot_table 聚合语义。
+    已知边界差异：某列全 NaN 的证券 pivot 保留全 NaN 列而 pivot_table 静默丢列；
+    生产 daily_prices 的 close/volume 无 NULL（2026-07 校验），保留列反而使
+    load_adjusted_panel 的 4 张宽表列集合恒等，更一致。
+    """
+    try:
+        return prices.pivot(index="date", columns="security_id", values=column)
+    except ValueError:
+        return prices.pivot_table(index="date", columns="security_id", values=column, aggfunc="last")
 
 
 def load_adjusted_panel(
@@ -154,23 +188,40 @@ def load_adjusted_panel(
     as_of: date | None = None,
     include_inactive: bool = True,
 ) -> dict[str, pd.DataFrame]:
-    """返回宽表字典：adj_close / close / volume / dollar_volume。"""
+    """返回宽表字典：adj_close / close / volume / dollar_volume。
+
+    进程内记忆化（见 _ADJUSTED_PANEL_CACHE 注释）：命中时返回新 dict、
+    同 DataFrame 对象；调用方约定只 rebind dict 条目、不原地改写宽表。
+    """
     if start < FACTOR_TRUST_FLOOR:
         raise ValueError(
             f"start={start} 早于因子可信窗口 {FACTOR_TRUST_FLOOR}；"
             "更早价格未保证复权，研究面板拒绝装载。"
         )
     effective_as_of = as_of or end
-    prices = load_price_long(engine, start=start, end=end, types=types, include_inactive=include_inactive)
+    cache_key = (str(engine.url), start, end, tuple(types), effective_as_of, include_inactive)
+    cached = _ADJUSTED_PANEL_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+    # adj_close 由 close 派生、dollar_volume = close×volume：只拉 2 列长表
+    prices = load_price_long(
+        engine, start=start, end=end, types=types,
+        include_inactive=include_inactive, columns=("close", "volume"),
+    )
     events = load_factor_events(engine, as_of=effective_as_of)
     prices = apply_adjustment(prices, events, as_of=effective_as_of)
     prices["dollar_volume"] = prices["close"] * prices["volume"]
-    return {
+    panel = {
         "adj_close": to_wide(prices, "adj_close"),
         "close": to_wide(prices, "close"),
         "volume": to_wide(prices, "volume"),
         "dollar_volume": to_wide(prices, "dollar_volume"),
     }
+    del prices, events  # 长表（长窗口 GB 级）在宽表建成后立即释放
+    while len(_ADJUSTED_PANEL_CACHE) >= _ADJUSTED_PANEL_CACHE_MAX:
+        _ADJUSTED_PANEL_CACHE.pop(next(iter(_ADJUSTED_PANEL_CACHE)))
+    _ADJUSTED_PANEL_CACHE[cache_key] = panel
+    return dict(panel)
 
 
 def load_symbol_map(engine: Engine) -> pd.Series:
@@ -219,6 +270,22 @@ def load_delisting_returns(engine: Engine, *, fund_closure_par: bool = True) -> 
     series = df.set_index("security_id")["delisting_return"].astype("float64")
     series.index = series.index.astype("int64")
     return series
+
+
+def resolve_terminal_returns(
+    realized: pd.Series,
+    cli_value: float | None,
+    use_realized: bool = True,
+) -> tuple[float | pd.Series | None, float | None]:
+    """决定传给 run_backtest 的 (terminal_return, terminal_return_fallback)。
+
+    规则（docs/todo_crsp_grade_2026-07.md 任务 1 步骤 4）：优先逐证券实测
+    delisting_return（Series），CLI 标量降级为未覆盖证券的 fallback；实测为空
+    （表未填充）或显式 opt-out 时，行为与旧口径完全一致——只传 CLI 标量、无 fallback。
+    """
+    if not use_realized or realized.empty:
+        return cli_value, None
+    return realized, cli_value
 
 
 def securities_with_uncovered_events(
