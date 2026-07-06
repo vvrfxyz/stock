@@ -31,6 +31,7 @@ from scripts.build_delisting_events import (
     Filing,
     MergeEvent,
     SecurityRef,
+    _acquirer_is_self,
     cash_within_sanity_gate,
     classify,
     classify_price_failure,
@@ -59,8 +60,10 @@ from scripts.build_delisting_events import (
 )
 
 
-def _security(security_id=1, symbol="dead", type_="CS", cik=None, delist=date(2025, 6, 30)):
-    return DelistedSecurity(id=security_id, symbol=symbol, type=type_, cik=cik, delist_date=delist)
+def _security(security_id=1, symbol="dead", type_="CS", cik=None, delist=date(2025, 6, 30),
+              name=None):
+    return DelistedSecurity(id=security_id, symbol=symbol, type=type_, cik=cik,
+                            delist_date=delist, name=name)
 
 
 def _filing(accession="0001-25-000001", form="25-NSE", filed=date(2025, 6, 25), doc_url=None):
@@ -687,6 +690,86 @@ class TestClassifyDecisionTable:
         assert row["consideration_stock_ratio"] == Decimal("0.1867")
         assert row["delisting_return"] is None
 
+    # --- S5: form25 并购规则通道的对价升级（与 8-K 2.01 分支同款）---
+
+    @pytest.mark.parametrize("rule", ["a", "a3", "a4"])
+    def test_form25_merger_rule_cash_only_upgrades_to_acquisition_cash(self, rule):
+        # form25 归并购族 + 现金独占 → ACQUISITION_CASH，写实测 return
+        row = self._classify(
+            evidence=Evidence(
+                form25=[_filing()], form25_rule=rule,
+                consideration=ConsiderationExtraction(cash=Decimal("10.05")),
+            ),
+            final_price=Decimal("10.00"),
+        )
+        assert row["reason_code"] == "ACQUISITION_CASH"
+        assert (row["reason_confidence"], row["source"]) == ("HIGH", "FORM25")
+        assert row["consideration_cash"] == Decimal("10.05")
+        assert row["delisting_return"] == Decimal("0.00500000")
+
+    def test_form25_merger_rule_stock_only_upgrades_to_acquisition_stock(self):
+        row = self._classify(
+            evidence=Evidence(
+                form25=[_filing()], form25_rule="a3",
+                consideration=ConsiderationExtraction(stock_ratio=Decimal("0.5")),
+            ),
+            final_price=Decimal("10.00"),
+        )
+        assert row["reason_code"] == "ACQUISITION_STOCK"
+        assert (row["reason_confidence"], row["source"]) == ("HIGH", "FORM25")
+
+    def test_form25_merger_rule_mixed_stays_merger(self):
+        row = self._classify(
+            evidence=Evidence(
+                form25=[_filing()], form25_rule="a3",
+                consideration=ConsiderationExtraction(
+                    cash=Decimal("2.50"), stock_ratio=Decimal("0.5")),
+            ),
+            final_price=Decimal("10.00"),
+        )
+        assert row["reason_code"] == "MERGER"
+        assert row["consideration_cash"] == Decimal("2.50")
+        assert row["consideration_stock_ratio"] == Decimal("0.5")
+
+    def test_form25_liquidation_rule_not_upgraded_by_consideration(self):
+        # (a)(1) 是 LIQUIDATION（非 MERGER 族）——即便抽出现金也绝不升级/不算 return
+        row = self._classify(
+            evidence=Evidence(
+                form25=[_filing()], form25_rule="a1",
+                consideration=ConsiderationExtraction(cash=Decimal("10.05")),
+            ),
+            final_price=Decimal("10.00"),
+        )
+        assert row["reason_code"] == "LIQUIDATION"
+        assert row["consideration_cash"] == Decimal("10.05")   # 证据仍记
+        assert row["delisting_return"] is None
+
+    def test_bankruptcy_subbranch_keeps_priority_over_upgrade(self):
+        # 破产三证子分支优先：form25_rule='b' 不属并购族，走 BANKRUPTCY 不被对价升级
+        row = self._classify(
+            evidence=Evidence(
+                form25=[_filing()], form25_rule="b",
+                eightk_103=[_filing(accession="0001-25-000103", form="8-K")],
+                consideration=ConsiderationExtraction(cash=Decimal("0.05")),
+            ),
+            final_price=Decimal("0.05"),
+        )
+        assert row["reason_code"] == "BANKRUPTCY"
+        assert row["delisting_return"] == Decimal("-1")
+
+    def test_etf_fund_closure_subbranch_keeps_priority_over_upgrade(self):
+        # ETF (a1) FUND_CLOSURE 子分支优先：不因对价升级成 ACQUISITION_CASH
+        row = self._classify(
+            security=_security(type_="ETF"),
+            evidence=Evidence(
+                form25=[_filing()], form25_rule="a1",
+                consideration=ConsiderationExtraction(cash=Decimal("10.05")),
+            ),
+            final_price=Decimal("10.00"),
+        )
+        assert row["reason_code"] == "FUND_CLOSURE"
+        assert row["delisting_return"] is None
+
     def test_cash_extraction_without_final_price_writes_consideration_but_no_return(self):
         row = self._classify(
             evidence=Evidence(
@@ -1271,7 +1354,7 @@ class TestExtractAcquirerNames:
 class TestExtractStockRatios:
     def test_clean_ratio_match(self):
         text_ = "0.7136 shares of Acquirer Inc. common stock for each share of Company common stock"
-        assert extract_stock_ratios(text_) == [Decimal("0.7136")]
+        assert extract_stock_ratios(text_) == [(Decimal("0.7136"), "Acquirer Inc.")]
 
     def test_integer_share_counts_not_matched(self):
         # 整数 "100 shares of" 是持仓/授权语境，换股比要求小数形态
@@ -1282,7 +1365,29 @@ class TestExtractStockRatios:
         text_ = ("the right to receive $3.50 per share in cash and 0.7136 shares of "
                  "Acquirer Inc. common stock for each share of Company Common Stock")
         assert extract_cash_amounts(text_) == [Decimal("3.50")]
-        assert extract_stock_ratios(text_) == [Decimal("0.7136")]
+        assert extract_stock_ratios(text_) == [(Decimal("0.7136"), "Acquirer Inc.")]
+
+    # --- S1: 换股句自带收购方（名字在前 / "common stock of" 语序 / 占位词剔除）---
+
+    def test_ratio_sentence_acquirer_name_first(self):
+        # 金样本：并购换股句里收购方名字在 "shares of" 之后、"common stock" 之前
+        text_ = ("each share was converted into 0.3163 shares of Apollo Endosurgery, Inc. "
+                 "common stock for each share held")
+        assert extract_stock_ratios(text_) == [(Decimal("0.3163"), "Apollo Endosurgery, Inc.")]
+
+    def test_ratio_sentence_common_stock_of_ordering(self):
+        # "common stock of <Name>" 语序：名字在 "of" 之后
+        text_ = "0.5000 shares of common stock of Acme Corp. for each share"
+        assert extract_stock_ratios(text_) == [(Decimal("0.5000"), "Acme Corp.")]
+
+    def test_ratio_sentence_capital_stock_of_ordering(self):
+        text_ = "0.2500 shares of capital stock of Beta Holdings, Inc. for each share"
+        assert extract_stock_ratios(text_) == [(Decimal("0.2500"), "Beta Holdings, Inc.")]
+
+    def test_ratio_sentence_parent_placeholder_rejected(self):
+        # 占位词 Parent 被 blocklist 拒绝——ratio 仍抽出，acquirer 为 None
+        text_ = "0.4000 shares of Parent common stock for each share"
+        assert extract_stock_ratios(text_) == [(Decimal("0.4000"), None)]
 
 
 # ---------------------------------------------------------------------------
@@ -1390,6 +1495,35 @@ class TestResolveAcquirerSecurity:
         ]
         ref, note = resolve_acquirer_security("Falcon Group", index)
         assert ref.id == 11 and note is None
+
+
+class TestAcquirerIsSelf:
+    """S2：自指守卫——完成 8-K 常写 "merger with <本壳自身>"，用壳自身价格估股票腿
+    会算出伪 return（lptn/Lpath 事故）。id 相同或名字归一相同即判自指。"""
+
+    def test_resolved_ref_same_id_is_self(self):
+        husk = _security(security_id=286871, name="Lpath, Inc.")
+        ref = _ref(286871, symbol="lptn")
+        assert _acquirer_is_self("Lpath", husk, ref) is True
+
+    def test_candidate_name_equals_husk_name_is_self(self):
+        # 名字侧：候选名归一后等于壳自身名字归一（ref 尚未解析，传 None）
+        husk = _security(security_id=1, name="Lpath, Inc.")
+        assert _acquirer_is_self("Lpath Incorporated", husk, None) is True
+
+    def test_different_acquirer_not_self(self):
+        husk = _security(security_id=1, name="Lpath, Inc.")
+        other = _ref(5, symbol="apen")
+        assert _acquirer_is_self("Apollo Endosurgery, Inc.", husk, other) is False
+
+    def test_empty_husk_name_no_false_self_on_name_channel(self):
+        # 壳无名字：名字侧不得因空键碰撞误判自指（id 侧仍可判）
+        husk = _security(security_id=1, name=None)
+        assert _acquirer_is_self("Apollo Endosurgery, Inc.", husk, None) is False
+
+    def test_none_candidate_and_ref_not_self(self):
+        husk = _security(security_id=1, name="Lpath, Inc.")
+        assert _acquirer_is_self(None, husk, None) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1536,11 +1670,34 @@ class TestExtractConsideration:
         assert got.cash is None
         assert "cash_gated_out" in got.note
 
+    # --- S1: 换股句自带收购方跨文档唯一性 ---
+
+    def test_stock_acquirer_unique_across_docs_set(self):
+        docs = [
+            _doc("A1", "0.5000 shares of Eagle Corp. common stock for each share"),
+            _doc("A2", "each holder got 0.5000 shares of Eagle Corp. common stock for each share"),
+        ]
+        got = extract_consideration(docs, None)
+        assert got.stock_acquirer == "Eagle Corp."
+        assert "ambiguous_stock_acquirers" not in (got.note or "")
+
+    def test_stock_acquirer_ambiguous_across_docs_noted(self):
+        docs = [
+            _doc("A1", "0.5000 shares of Eagle Corp. common stock for each share"),
+            _doc("A2", "0.5000 shares of Falcon Holdings, Inc. common stock for each share"),
+        ]
+        got = extract_consideration(docs, None)
+        assert got.stock_acquirer is None
+        assert "ambiguous_stock_acquirers=" in got.note
+        assert "Eagle Corp." in got.note and "Falcon Holdings, Inc." in got.note
+
 
 class TestPickMergerDocCandidates:
     DELIST = date(2025, 6, 30)
 
-    def test_prefers_201_then_301_then_defm14a_capped_at_three(self):
+    def test_prefers_201_then_defm14a_then_301_capped_at_three(self):
+        # 有 2.01：顺序 [2.01, DEFM14A, 1.01, 3.01]——完成 8-K 常不复述对价，DEFM14A
+        # 排在退市通知 3.01 之前
         evidence = Evidence(
             eightk_201=[
                 _filing(accession="A201-far", filed=self.DELIST + timedelta(days=20), doc_url="https://x/201far"),
@@ -1551,7 +1708,44 @@ class TestPickMergerDocCandidates:
                              filed=self.DELIST - timedelta(days=60), doc_url="https://x/def")],
         )
         picked = pick_merger_doc_candidates(evidence, self.DELIST)
-        assert [f.accession_number for f in picked] == ["A201-near", "A201-far", "A301"]
+        assert [f.accession_number for f in picked] == ["A201-near", "A201-far", "ADEF"]
+
+    def test_eightk_101_ordered_after_defm14a_before_301(self):
+        # S4：有 2.01 时 1.01（签约公告，常含对价）排在 DEFM14A 之后、3.01 之前
+        evidence = Evidence(
+            eightk_201=[_filing(accession="A201", filed=self.DELIST, doc_url="https://x/201")],
+            eightk_101=[_filing(accession="A101", filed=self.DELIST - timedelta(days=90),
+                                doc_url="https://x/101")],
+            eightk_301=[_filing(accession="A301", filed=self.DELIST, doc_url="https://x/301")],
+        )
+        picked = pick_merger_doc_candidates(evidence, self.DELIST)
+        assert [f.accession_number for f in picked] == ["A201", "A101", "A301"]
+
+    def test_defm14a_only_channel_orders_defm14a_101_301(self):
+        # S4：无 2.01（defm14a_only 路）顺序 [DEFM14A, 1.01, 3.01]
+        evidence = Evidence(
+            eightk_301=[_filing(accession="A301", filed=self.DELIST, doc_url="https://x/301")],
+            eightk_101=[_filing(accession="A101", filed=self.DELIST - timedelta(days=90),
+                                doc_url="https://x/101")],
+            defm14a=[_filing(accession="ADEF", form="DEFM14A",
+                             filed=self.DELIST - timedelta(days=60), doc_url="https://x/def")],
+        )
+        picked = pick_merger_doc_candidates(evidence, self.DELIST)
+        assert [f.accession_number for f in picked] == ["ADEF", "A101", "A301"]
+
+    def test_cap_three_drops_301_when_defm14a_and_101_present(self):
+        # S4：配额 3 满，3.01 被挤出（有 2.01 + DEFM14A + 1.01 已占满）
+        evidence = Evidence(
+            eightk_201=[_filing(accession="A201", filed=self.DELIST, doc_url="https://x/201")],
+            defm14a=[_filing(accession="ADEF", form="DEFM14A",
+                             filed=self.DELIST - timedelta(days=60), doc_url="https://x/def")],
+            eightk_101=[_filing(accession="A101", filed=self.DELIST - timedelta(days=90),
+                                doc_url="https://x/101")],
+            eightk_301=[_filing(accession="A301", filed=self.DELIST, doc_url="https://x/301")],
+        )
+        picked = pick_merger_doc_candidates(evidence, self.DELIST)
+        assert [f.accession_number for f in picked] == ["A201", "ADEF", "A101"]
+        assert "A301" not in [f.accession_number for f in picked]
 
     def test_defm14a_fills_when_fewer_8ks(self):
         evidence = Evidence(
@@ -2209,6 +2403,98 @@ class TestStockLegValuationPg:
         # final_price_date = DELIST-2；当日无 bar，回看命中最近的 DELIST-3 close 20.00
         # implied = 0.5 × 20.00 = 10.00；return = (10.00 - 10.00) / 10.00 = 0.00
         assert row.delisting_return == Decimal("0.00000000")
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL 集成：S1 换股句收购方解锁 + S2 自指守卫
+# ---------------------------------------------------------------------------
+
+# S1：收购方名字只出现在换股句里（无 "acquired by"/"subsidiary of" 措辞）——
+# 通用 acquirer 抽不出，stock_acquirer 兜住，换股腿仍解析出 return
+RATIO_ONLY_8K_HTML = (
+    "<html><body><p>On June 27, 2025, the transactions contemplated by the merger "
+    "agreement were consummated. Each share of Company common stock was converted "
+    "into 0.5000 shares of Eagle Corp. common stock for each share held.</p></body></html>"
+)
+# S2：完成 8-K 说 "merger with <本壳自身>"——收购方被抽成壳自己的名字
+SELF_MERGER_8K_HTML = (
+    "<html><body><p>On June 27, 2025, the Company completed its merger with Target Co. "
+    "Each share was converted into 0.5000 shares of Target Co. common stock for each "
+    "share held.</p></body></html>"
+)
+
+
+@pytest.mark.integration
+class TestStockAcquirerUnlockAndSelfGuardPg:
+    DELIST = date(2025, 6, 30)
+
+    def _seed(self, pg_db, doc_url, target_name="Target Co Common Stock"):
+        from data_models.models import DailyPrice, SecFiling, Security
+
+        with pg_db.get_session() as session:
+            session.add(Security(
+                id=61, symbol="tgt", current_symbol="tgt", market="US", type="CS",
+                name=target_name, is_active=False, delist_date=self.DELIST,
+                cik="0000000611", full_refresh_interval=30,
+            ))
+            session.add(DailyPrice(
+                security_id=61, date=self.DELIST - timedelta(days=2),
+                close=Decimal("10.00"), volume=1000,
+            ))
+            session.add(SecFiling(
+                source="SEC_EDGAR", cik="0000000611", form_type="8-K",
+                accession_number="0001-25-90061",
+                filing_date=self.DELIST + timedelta(days=3),
+                items="2.01,9.01", primary_document_url=doc_url,
+            ))
+            # 收购方：活跃 CS，名字 "Eagle Corp."，final_price_date 当日收盘 22.00
+            session.add(Security(
+                id=62, symbol="eagl", current_symbol="eagl", market="US", type="CS",
+                name="Eagle Corp.", is_active=True, full_refresh_interval=30,
+            ))
+            session.add(DailyPrice(
+                security_id=62, date=self.DELIST - timedelta(days=2),
+                close=Decimal("22.00"), volume=5000,
+            ))
+            session.commit()
+
+    def test_ratio_sentence_acquirer_unlocks_stock_leg(self, pg_db, monkeypatch):
+        # S1：通用 acquirer 措辞缺席，靠换股句里的 "Eagle Corp." 解析出收购方 → 写 return
+        self._seed(pg_db, "https://sec.test/ratioonly.htm")
+        import scripts.build_delisting_events as bde
+        monkeypatch.setattr(
+            bde, "_edgar_fetch_text",
+            lambda: {"https://sec.test/ratioonly.htm": RATIO_ONLY_8K_HTML}.__getitem__,
+        )
+        assert run(_args("--apply", "--fetch-8k-docs"), pg_db) == 0
+        with pg_db.engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT * FROM delisting_events WHERE security_id = 61"
+            )).one()
+        assert row.reason_code == "ACQUISITION_STOCK"
+        assert row.acquirer_name == "Eagle Corp."   # 来自换股句（通用 acquirer 缺席）
+        assert row.delisting_return == Decimal("0.10000000")
+        assert "stock_acquirer=Eagle Corp." in row.evidence
+        assert "acquirer_security=eagl#62" in row.evidence
+
+    def test_self_reference_acquirer_yields_no_return(self, pg_db, monkeypatch):
+        # S2：8-K 说 "merger with Target Co"（壳自身名）——收购方解析被自指守卫拦下，
+        # 不写伪 return，evidence 记 acquirer_self
+        self._seed(pg_db, "https://sec.test/selfmerge.htm", target_name="Target Co")
+        import scripts.build_delisting_events as bde
+        monkeypatch.setattr(
+            bde, "_edgar_fetch_text",
+            lambda: {"https://sec.test/selfmerge.htm": SELF_MERGER_8K_HTML}.__getitem__,
+        )
+        assert run(_args("--apply", "--fetch-8k-docs"), pg_db) == 0
+        with pg_db.engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT * FROM delisting_events WHERE security_id = 61"
+            )).one()
+        assert row.reason_code == "ACQUISITION_STOCK"
+        assert row.delisting_return is None            # 自指 → 绝不写伪 return
+        assert "acquirer_self" in row.evidence
+        assert "acquirer_security=" not in row.evidence
 
 
 # ---------------------------------------------------------------------------
