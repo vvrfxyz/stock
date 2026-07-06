@@ -325,6 +325,40 @@ class TestForm25ClassGuard:
     def test_etf_matching_is_loose(self):
         assert form25_class_matches_security("7.00% Fund Preferred Units", "ETF") is True
 
+    # --- 证券自身即该类工具时的例外路径（ADR/MLP）---
+
+    def test_ads_doc_accepted_when_security_is_adr(self):
+        assert form25_class_matches_security(
+            "American Depositary Shares, each representing four Ordinary Shares",
+            "CS", "Diageo plc American Depositary Shares") is True
+
+    def test_ads_doc_still_rejected_for_plain_cs(self):
+        assert form25_class_matches_security(
+            "American Depositary Shares, each representing four Ordinary Shares",
+            "CS", "Acme Corporation Common Stock") is False
+
+    def test_common_units_accepted_for_mlp(self):
+        assert form25_class_matches_security(
+            "Common Units Representing Limited Partner Interests",
+            "CS", "Enterprise Products Partners L.P. Common Units") is True
+
+    def test_preferred_depositary_doc_rejected_even_for_adr(self):
+        # 文档比证券名多出 preferred 标记：不是它自己的类，仍拒
+        assert form25_class_matches_security(
+            "Depositary Shares Each Representing a 1/40th Interest in a Share of "
+            "7.125% Series C Preferred Stock",
+            "CS", "XYZ Bancorp American Depositary Shares") is False
+
+    def test_notes_doc_rejected_when_name_lacks_marker(self):
+        assert form25_class_matches_security(
+            "7.25% Convertible Senior Notes due 2024",
+            "CS", "XYZ Corp Class A Common Stock") is False
+
+    def test_coupon_only_doc_class_still_rejected_for_plain_cs(self):
+        # 类描述只命中票息 %（无词标记）：空标记集不得触发例外放行
+        assert form25_class_matches_security(
+            "7.25% Securities due 2031", "CS", "Plain Co Common Stock") is False
+
 
 class TestParseForm25Rule:
     def test_single_citation(self):

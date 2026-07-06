@@ -187,6 +187,7 @@ class DelistedSecurity:
     type: str | None
     cik: str | None
     delist_date: date
+    name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -500,14 +501,26 @@ def parse_form25_rule(doc_text: str) -> str | None:
 
 
 def form25_class_matches_security(class_description: str | None,
-                                  security_type: str | None) -> bool:
+                                  security_type: str | None,
+                                  security_name: str | None = None) -> bool:
     """类守卫：CS 证券拒绝明确的非普通股类描述；ETF 份额描述五花八门宽松放行；
-    无类描述（legacy HTML 抽不出）无从否定，放行。"""
+    无类描述（legacy HTML 抽不出）无从否定，放行。
+    例外：文档类别命中的"非普通股"标记词若同样出现在证券自身名称里，说明该
+    证券本身就是这一类工具（ADR 的 American Depositary Shares、MLP 的
+    Common Units 等），此时该 Form 25 正是它自己的退市通知——放行。"""
     if (security_type or "").upper() == "ETF":
         return True
     if not class_description:
         return True
     primary = re.sub(r"\([^)]*\)", " ", class_description)
+    doc_markers = {m.group(0).lower().rstrip("s")
+                   for m in _FORM25_NON_CS_CLASS_RE.finditer(primary) if m.group(1)}
+    if doc_markers and security_name:
+        name_markers = {m.group(0).lower().rstrip("s")
+                        for m in _FORM25_NON_CS_CLASS_RE.finditer(security_name)
+                        if m.group(1)}
+        if doc_markers <= name_markers:
+            return True
     return _FORM25_NON_CS_CLASS_RE.search(primary) is None
 
 
@@ -957,7 +970,7 @@ def count_inactive_without_delist_date(session) -> int:
 
 def load_population(session, limit: int | None) -> list[DelistedSecurity]:
     sql = """
-        SELECT id, symbol, type, cik, delist_date
+        SELECT id, symbol, type, cik, delist_date, name
         FROM securities
         WHERE NOT is_active AND delist_date IS NOT NULL AND upper(market) = 'US'
         ORDER BY id
@@ -968,7 +981,7 @@ def load_population(session, limit: int | None) -> list[DelistedSecurity]:
         params["limit"] = limit
     return [
         DelistedSecurity(id=row.id, symbol=row.symbol, type=row.type,
-                         cik=row.cik, delist_date=row.delist_date)
+                         cik=row.cik, delist_date=row.delist_date, name=row.name)
         for row in session.execute(text(sql), params)
     ]
 
@@ -1203,7 +1216,8 @@ def fetch_form25_rules(
                 if parsed.note:
                     last_note = f"{candidate.accession_number}:{parsed.note}"
                 continue
-            if not form25_class_matches_security(parsed.class_description, security.type):
+            if not form25_class_matches_security(parsed.class_description, security.type,
+                                                 security.name):
                 stats["wrong_class"] += 1
                 evidence.form25_skipped_classes.append(
                     f"{candidate.accession_number}:{parsed.class_description}")
