@@ -628,6 +628,8 @@ def run_update_sec_fundamentals(args):
         cli_args.extend(['--since', args.since])
     if getattr(args, 'bulk_zip', None):
         cli_args.extend(['--bulk-zip', args.bulk_zip])
+    if getattr(args, 'include_inactive', False):
+        cli_args.append('--include-inactive')
     execute_script(update_sec_fundamentals_main, cli_args)
 
 
@@ -891,6 +893,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sec_fund.add_argument('--limit', type=int, default=0, help="限制处理数量。")
     p_sec_fund.add_argument('--since', type=str, default=None, help="增量：只处理该日后有财报 filing 的 CIK。")
     p_sec_fund.add_argument('--bulk-zip', type=str, default=None, help="本地 companyfacts.zip 路径（初次回填）。")
+    p_sec_fund.add_argument('--include-inactive', action='store_true',
+                            help="CIK 解析纳入退市证券（活跃优先锚定；退市 CS 基本面回填用）。")
     p_sec_fund.set_defaults(func=run_update_sec_fundamentals)
 
     p_insiders = subparsers.add_parser('update_insider_transactions', help="解析 SEC Form 3/4/5 内部人交易明细")
