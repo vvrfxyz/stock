@@ -18,8 +18,11 @@
 
 | 因子 / 假设 | 数据源 | 长窗最佳结果 | 裁决 | 一句话原因 | 细节 |
 |---|---|---|---|---|---|
-| max_lottery（彩票股 MAX 效应，Bali 2011） | 日线 | IC .034，t=+5.03，全 horizon ≥2.9（2016-2026） | **调味料**（变现待验证） | 统计碾压级但效应在难做空的空头腿+日频高换手，等权 LS 净后亏；**月频低换手变体未验证**（开放问题#1） | [wave-2 终审](research_technical_factors_2026-07.md) |
-| eod_reversal / eod_reversal_flow（尾盘位移次日反转，流量条件化） | 分钟 | flow 版 t=3.74 @h5 全过 Bonferroni；隔夜腿 t=+9.1 | **蚊子腿**（已结案 2026-07-06） | 反转 100% 在隔夜，次日盘中续行精确抵消（t=-5.4），close-to-close 零；隔夜单腿扣成本剩 2-4 bps/日且含未剔除的弹跳。可做执行择时叠加（调仓单挑尾盘放量被砸时点收盘成交，白捡隔夜反弹） | [wave-3](research_technical_factors_2026-07.md)、eod_decomposition 报告 |
+| **low_vol（低波动溢价，Ang 2006 总波动版）** | 日线 | IC .018-.037，t=4.38/3.13 @h1/h5 双过 Bonferroni（2016-2026） | **可用候选（价格族主干）** | 全项目第一个净后可正的组合形态：q5 纯多头年化 9.4%、净 Sharpe 0.53、换手仅 12.7×/年；partial IC 吸收 max_lottery（.0271→.0075）与大半 high_52w（.0211→.0057）；LS 为负——典型多头型防御因子，做空高波动腿在牛市流血。**注意 Sharpe 未跑赢同期 SPY（~0.8），价值在防御属性与复合成分，待超额基准检验** | [wave-4](research_technical_factors_2026-07.md) |
+| max_lottery（彩票股 MAX 效应，Bali 2011） | 日线 | IC .034，t=+5.03，全 horizon ≥2.9（2016-2026） | **调味料**（降档 2026-07-06） | wave-4 相关研究揭示其 74% 是波动效应马甲：对 low_vol 正交化后 partial IC .0271→.0075；独立变现价值转移给 low_vol，仅剩小分支残差 | wave-2 终审、wave-4 |
+| high_52w（52 周新高锚定，George-Hwang 2004） | 日线 | IC .015-.028，t=3.78 @h1 过 Bonferroni | **调味料** | 吸收动量（GH2004 原文结论在我们数据复现）但自身又大半被 low_vol 吸收（partial .0057）；LS 净后负 | wave-4 |
+| momentum_12_1（12-1 动量，Jegadeesh-Titman 1993） | 日线 | IC .013，t=3.85 @h1；t 随 horizon 快速衰减 | **死亡（被吸收）** | 显著但对 high_52w 正交化后 partial IC 归零（.0133→.0021）——"美股最强异象"在 2016+ 的横截面增量为零；若做动量敞口，用 high_52w 或 low_vol 表达更优 | wave-4 |
+| eod_reversal / eod_reversal_flow（尾盘位移次日反转，流量条件化） | 分钟 | flow 版 t=3.74 @h5 全过 Bonferroni；隔夜腿 t=+9.1 | **蚊子腿**（已结案 2026-07-06） | 反转 100% 在隔夜，次日盘中续行精确抵消（t=-5.4），close-to-close 零；隔夜单腿扣成本剩 2-4 bps/日且含未剔除的弹跳。可做执行择时叠加（调仓单挑尾盘放量被砸时点收盘成交，白捡隔夜反弹）。**wave-4 佐证：与全部日线因子秩相关 |r|<0.03，作为复合成分完全正交** | [wave-3](research_technical_factors_2026-07.md)、eod_decomposition 报告 |
 | last30_persistence（尾盘动量续行，HKS 2010） | 分钟 | IC -.006，t=-2.57 @h1（**符号与文献相反**） | 死亡（原假设）；反向版即 eod_reversal（见上） | 发表后反转：2016+ 尾盘强者次日回吐，疑与收盘竞价流崛起有关 | 同上 |
 | short_term_reversal（21 日反转） | 日线 | IC .011，t=+1.94 @h10 | 死亡 | 长窗不显著；经典效应在近十年美股已弱化 | wave-2 终审 |
 | signed_jump（有符号跳跃 RSJ） | 分钟 | t=+1.73 @h21 | 死亡 | 发表后衰减殆尽 | 同上 |
@@ -44,15 +47,24 @@
   63s（2,890×7,000），面板装载走 COPY + 进程内缓存（`research/factors/price_cache.py`）。
   写新研究脚本时禁止逐日 Python 循环，复用 `_quantile_weight_matrices`/`_masked_rowwise_corr`。
 - **多重检验记账**：变体族用统一 family 前缀（如 eod_pressure），全部试验进 trials.parquet；
-  评估过的 (factor, horizon) 网格已 68+ 组，单次 t=2 出头的"发现"先默认是噪音。
+  评估过的 (factor, horizon) 网格已 80+ 组，单次 t=2 出头的"发现"先默认是噪音。
+- **价格族冗余结构已裁决（2026-07-06，wave-4）**：六个价格系因子 ≈ **2.5 个独立信号**。
+  low_vol 是主干（吸收 max_lottery r=.74/partial .0075，大半吸收 high_52w），
+  momentum_12_1 ⊂ high_52w（partial .0021，GH2004 复现），eod_reversal_flow 完全正交
+  （与全部因子 |r|<0.03）。**任何新价格因子登记"新发现"前，必须先过"对 low_vol 与
+  high_52w 的 partial IC"这一关**（`research/factor_correlation.py` 十分钟跑完；
+  其 partial IC 是序列级近似，正式结论需逐日截面回归残差确认）。
 
 ## 开放问题（下一轮候选，按预期肉厚排序）
 
-1. **max_lottery 月频变现变体**：月频调仓（换手 383→~12 倍）+ 只做多低 MAX 倾斜，净后能否转正。t=5 的信号值得一次认真的变现尝试。
-2. **eod 隔夜腿精修**（低优先级，只改墓志铭不改结论）：开盘后 30 分钟 vwap 锚定剔除弹跳；财报日掩蔽（用 `sec_filings`）。
-3. **因子相关矩阵与复合打分**：存活因子（max_lottery、13F 两因子、eod 调味料）间相关性与增量 IC，评估合成价值。
+1. **low_vol 变现攻坚**：q5 纯多头（9.4%/0.53 净 Sharpe/12.7× 换手）对 SPY 与等权 universe 的
+   **超额**检验（现在只有绝对数）；月频调仓变体；残差波动率（对市场回归后）/ BAB beta 版精修。
+   这是价格族主干，全项目最接近可上钱的一条线。
+2. **复合打分原型**：low_vol + high_52w 残差 + eod_reversal_flow（执行层）+ 13F 两因子的
+   等权秩合成——五个近正交信号的组合 IC 与净后表现。
+3. **eod 隔夜腿精修**（低优先级，只改墓志铭不改结论）：开盘后 30 分钟 vwap 锚定剔除弹跳；财报日掩蔽（用 `sec_filings`）。
 4. **signed_jump 财报跳空掩蔽**：验证其残存信号是否只是财报事件代理（wave-2 遗留，优先级低）。
-5. **流动性分桶稳健性**：微观结构效应常聚于小盘，但小盘成本也高——存活因子按 dollar-volume 分桶重跑净后（wave-2 遗留）。
+5. **流动性分桶稳健性**：存活因子按 dollar-volume 分桶重跑净后（wave-2 遗留）。
 
 ## 登记流程（每轮研究收尾必做）
 
