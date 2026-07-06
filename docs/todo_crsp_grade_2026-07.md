@@ -294,3 +294,100 @@ security_details    -- vendor 易变快照：name/address/branding/market_cap/
 
 预计总量：3-4 周串行；两窗口并行可压到 ~2 周。每完成一个任务：工程记录追加到
 本文档对应节 + 更新 `data_infra_assessment_2026-07.md` 差距地图 + CLAUDE.md 表清单。
+
+---
+
+## 工程记录（2026-07-06 执行窗口，multi-agent workflow 一日落地主体）
+
+提交链 `732ea80..53d0d99`，全部部署 253，migration head `a2b3c4d5e6f7`。
+研究阶段对本文档假设的订正与各任务实际结果如下。
+
+### 任务 1（delisting_events）——步骤 1-3 完成，步骤 4 部分完成
+
+- **假设订正**：退市股 CIK 覆盖实测 95.3%（CS，`securities.cik` 兜底路径），
+  不是本文写的 ~26%——Form 25 回拉未等任务 4 即全量执行。真正缺的是退市股的
+  8-K 历史（抽样仅 8% 有退市日 ±30 天 8-K，因 `--all` 只同步活跃），已与 Form 25
+  同一轮回拉（form 过滤是客户端行为，零额外请求）。
+- `sec_filings.items` 新列：EDGAR submissions 自带 item codes 被 adapter 丢弃，
+  补列后 Item 2.01 判定变纯 SQL。回拉 9,576 CIK/98.9 万行/55 分钟零失败；
+  Form 25 族 0 → 8,435 行（25-NSE 6,915 + 25 1,395 + /A 125），84.3 万行 8-K 带 items。
+- **2025-08-01 截断队列根因**（本文未预见，评估的"496 截尾"已恶化到 674）：
+  管道休眠期（2025-08-02→2026-05-13）内退市的 417 只，复活时已 inactive 被
+  `update_massive_prices` 的 is_active 过滤永久挡住补拉；day-aggs 导入又按
+  massive-era 守卫跳过该段。修复：`--include-inactive`（仅显式 symbols）+
+  退市日上钳（回收防护镜像 list_date 下钳），497 只在 730 天窗口内重拉后
+  冻结 409→3、停滞 674→206（残余在窗口外，final_price=NULL+evidence）。
+- 分类器 `build_delisting_events.py`：终价 ±5 天窗（含 yfinance 双 NULL OTC 尾巴），
+  四个失败桶 evidence 编码；HIGH=同 CIK 8-K item 2.01 / Form 25 12d2-2 规则段解析
+  （`--fetch-form25-docs`），MEDIUM=identity MERGE/ETF 清盘，LOW=价格形态只定性；
+  全量重建 upsert，MANUAL 行保护；health_report 新增退市结局 P1 探针。
+- **步骤 4 遗留**：delisting_return 本轮恒 NULL（8-K 对价抽取 `--fetch-8k-docs`
+  未做）——"return 非 NULL ≥50%" 验收线与 20 年动量对比实验待该阶段补齐。
+  backtest 引擎与 run_baselines 接线已就绪（逐只 Series+标量兜底，
+  `--no-delisting-returns` 复现旧口径）。
+
+### 任务 2（companies）——完成
+
+- apply 结果：9,339 公司、10,635 只 CS 挂接（活跃 CS 99.85%、全 CS 97.34%）、
+  0 改挂；GOOG+GOOGL、brk.a+brk.b 验收探针过。报告五件套在
+  `logs/manual_backfill/companies_*.tsv`（双类股名录/工具行误标/改名世系）。
+- **假设订正**：基本面无重复计数问题（入库即锚每 CIK 最小 id），真实问题是反面
+  ——非主类股基本面为零、earnings_yield 分母低估；"3,056 多 ticker CIK"是 13F
+  侧口径，securities 侧全 CS 多证券组实测 1,077（活跃 CS 86 组，多为 baby
+  bonds/优先股误标 CS）。合并市值必须过 `is_common_equity_name` 普通股过滤。
+- **合并市值口径**：我们=上市类别之和。Berkshire 与外部一致到 0.1%
+  （1,095.2 vs 1,095B）；Alphabet 4,039 vs 外部 4,346B，差额恰为未上市 B 类
+  0.86B 股——外部把 B 类按上市价计入。±2% 验收在"上市类合并"口径下成立。
+- **关键修复**：`update_sec_fundamentals --include-inactive` 的 CIK 锚定改为
+  活跃优先（`is_active DESC, id ASC`），否则 26 个 CIK 的 1,290 万行事实会
+  翻锚到低 id 退市证券、活跃 ticker 基本面变 NaN（已加锁定测试）。
+
+### 任务 3（PIT 股本）——完成（验收评估待 bulk-zip 收尾）
+
+- **假设订正 ×3**：(a) 6 个股本概念全部已在白名单且已入库（2009-04 起，dei 概念
+  16.9 万行/4,459 家）——概念普查零工作量；(b) `research/market_cap.py` 已实现
+  本文"坑"里要求的整套方案（事件流→as-of→拆股前滚×原始价），任务缩水为给
+  `load_shares_events` 缝 XBRL 段；(c) 真正的瓶颈是幸存者偏差：退市 CS 仅
+  45/6,059 有 XBRL 事实，根因 `resolve_cik_map` 只选活跃——bulk-zip 重跑
+  （--include-inactive，命中 8,588 家 vs 原先约一半）是实际回填杠杆。
+- **坑的补充**（AAPL 金样本验证）：`市值=股本×未复权价` 不充分——拆股落在
+  period_end 与下一次申报之间时（AAPL 2020-08-31 拆 4:1，下一份 10-K 10-30 才
+  filed）有 9 周窗口 as-of 股本是拆前口径。拆股前滚必须**锚 period_end**
+  （XBRL 股本是该时点计量值），vendor 段锚 visible_date（400 天）不变；
+  接缝以每事件 stale_after/split_anchor 列表达，旧路径位级一致由既有测试锁定。
+- 2010 年 XBRL phase-in 只有 773 家——"2010 起 ≥85%" 实际从 2011-12 起算。
+
+### 任务 4（身份史）——主体完成
+
+- **分母订正**："11,555 条改名记录"实为任期行，真实改名 873 次/831 只——
+  验收覆盖率按此分母计。
+- apply 结果：RENAME 事件 19→633（HIGH 284/MEDIUM 330），覆盖率 68.1%（>60% 线）；
+  PIT FIGI 12,704 行物化进 security_identifiers（此前 FIGI 行为零，id_type='FIGI'
+  快照语义）；185 条退市任期行（source=MASSIVE_ARCHIVE）；幂等重跑 0 写验证过。
+- 报告桶待人工：tail_mismatch 200（快照后改名，live wins 隔离）、cik_ambiguous
+  475、figi_ambiguous 154、unresolved 3,747（多为 universe 外 OTC/权证）。
+- **退市 FIGI 43.5%→43.7%，距 ≥70% 目标缺口是硬约束**：parquet 只能唯一归属 11 只；
+  CUSIP→FIGI 路线候选仅 35 只（FIGI 缺失的退市股绝大多数也没有 CUSIP 识别符）。
+  需要新数据源（如 OpenFIGI ticker+exchange+日期 组合查询不可行——非 PIT 有回收
+  污染）。157/19 组重复 FIGI 合并经查 2026-07-02 已完成（deep-review），残余
+  82 个 'UNKNOWN' 字面量 FIGI 待清理。
+- 13F 映射经另一项目收割至 77.5%，剩余为设计内排除品种，不再追。
+
+### 任务 5（拆表设计）——第一期交付完成
+
+- `docs/securities_split_design.md`：实测 50 列（本文写 47，现含 company_id 51）；
+  三桶=身份 15/详情 25/同步状态 9 + 死列 2（sector、base_currency_name 直接删）；
+  写路径=7 条 db_manager 通道 + 8 个绕行写方；**规则重述**："universe 同步只可读"
+  与现实矛盾（rename/停用/隔离只有它在写）——改为"universe 同步不得经通用 upsert
+  写身份属性，只可调用一等身份操作 API"。迁移三阶段：绕行写方收口→双写+对账探针→
+  读方改指+旧列下线；生产零视图/触发器，跑道干净。估 8-11 人日。
+
+### 通用教训
+
+- `stmt.excluded.<col>` 的 getattr 访问在列名撞 ColumnCollection 字典方法
+  （items/keys/values）时返回 bound method，psycopg2 报 can't adapt——共享
+  `_build_upsert_statement` 已改 `excluded[key]` 索引访问；新列名命名时注意。
+- `upsert_delisting_events` 是全量重建语义（冲突覆盖全部 payload 列，缺 key 置
+  NULL），绝不可当局部更新用——已在 docstring 与测试锁死。
+- 并行窗口同树协作：分钟因子文件（research/factors/builtins/bar_geometry 等）
+  属主窗口在途工作，本窗口 commit 时须显式排除。
