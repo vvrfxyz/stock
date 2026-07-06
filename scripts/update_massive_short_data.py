@@ -94,8 +94,10 @@ def process_batch(
     max_dates = db_manager.get_security_short_max_dates([security.id for security in securities])
     interest_start_by_symbol: dict[str, date] = {}
     volume_start_by_symbol: dict[str, date] = {}
+    delist_end_by_symbol: dict[str, date | None] = {}
     for security_id, dates in max_dates.items():
         symbol = security_id_to_symbol[security_id]
+        security = symbol_to_security[symbol]
         interest_latest = dates.get("interest")
         volume_latest = dates.get("volume")
         interest_start_by_symbol[symbol] = (
@@ -106,10 +108,19 @@ def process_batch(
         )
         # 死票回收防护：list_date 之前的做空数据属于该 symbol 的旧身份
         # （同 update_massive_prices 的回填 clamp）。
-        list_date = symbol_to_security[symbol].list_date
+        list_date = security.list_date
         if list_date:
             interest_start_by_symbol[symbol] = max(interest_start_by_symbol[symbol], list_date)
             volume_start_by_symbol[symbol] = max(volume_start_by_symbol[symbol], list_date)
+        # 死票回收防护（上界，与上方 list_date 下界成对）：delist_date 之后的同名
+        # 做空数据可能属于回收该 symbol 的后继实体，一律不留（同 update_massive_prices
+        # 的回填终点 clamp）。活跃证券不受影响（挂着 delist_date 的脏元数据不 clamp）；
+        # 退市但 delist_date 未知的证券也不 clamp——宁多留勿猜。delist_date 当日保留。
+        delist_end_by_symbol[symbol] = (
+            security.delist_date
+            if not security.is_active and security.delist_date is not None
+            else None
+        )
 
     interest_batch_start = min(interest_start_by_symbol.values())
     volume_batch_start = min(volume_start_by_symbol.values())
@@ -123,6 +134,9 @@ def process_batch(
             continue
         if row["settlement_date"] < interest_start_by_symbol[security.symbol]:
             continue
+        delist_end = delist_end_by_symbol.get(security.symbol)
+        if delist_end is not None and row["settlement_date"] > delist_end:
+            continue
         row = dict(row)
         row["security_id"] = security.id
         row["source"] = "MASSIVE"
@@ -134,6 +148,9 @@ def process_batch(
         if not security:
             continue
         if row["date"] < volume_start_by_symbol[security.symbol]:
+            continue
+        delist_end = delist_end_by_symbol.get(security.symbol)
+        if delist_end is not None and row["date"] > delist_end:
             continue
         row = dict(row)
         row["security_id"] = security.id

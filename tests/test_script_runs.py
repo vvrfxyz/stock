@@ -510,6 +510,57 @@ class TestActionsRun:
         factor_rows = db.upsert_vendor_adjustment_factors.call_args.args[0]
         assert [row["factor_key"] for row in factor_rows] == ["dividend:new1"]
 
+    def test_events_after_delist_date_dropped(self, monkeypatch):
+        # 死票回收防护（上界，镜像 prices 的 fetch 终点 clamp）：退市证券
+        # delist_date 之后的同名事件可能属于回收该 symbol 的后继实体，不落库；
+        # delist_date 当日事件保留（与 prices 的 inclusive 终点同界）。
+        sec = _security(is_active=False, delist_date=date(2026, 3, 2))
+        monkeypatch.setattr(actions, "get_last_completed_trading_date", lambda market: END_DATE)
+        monkeypatch.setattr(actions, "get_securities_to_update", lambda db, args: [sec])
+        source, db = Mock(), Mock()
+        source.get_dividends_batch.return_value = [
+            {"ticker": "aapl", "ex_dividend_date": date(2026, 3, 2), "cash_amount": "0.15",
+             "currency": "USD", "source_event_id": "ondate", "historical_adjustment_factor": "0.99"},
+            {"ticker": "aapl", "ex_dividend_date": date(2026, 5, 11), "cash_amount": "0.21",
+             "currency": "USD", "source_event_id": "successor", "historical_adjustment_factor": "0.999"},
+        ]
+        source.get_splits_batch.return_value = [
+            {"ticker": "aapl", "execution_date": date(2026, 6, 1), "split_from": 2, "split_to": 1,
+             "source_event_id": "successorsplit", "historical_adjustment_factor": "2"},
+        ]
+        db.upsert_dividends.return_value = 1
+        db.upsert_splits.return_value = 0
+        db.upsert_vendor_adjustment_factors.return_value = 1
+
+        result = actions.run(actions.create_parser().parse_args([]), source, db)
+        assert _exit_code(result) == 0
+        dividends = db.upsert_dividends.call_args.args[1]
+        assert [d["source_event_id"] for d in dividends] == ["ondate"]
+        db.upsert_splits.assert_not_called()  # 后继实体拆股整条被丢弃后为空
+        factor_rows = db.upsert_vendor_adjustment_factors.call_args.args[0]
+        assert [row["factor_key"] for row in factor_rows] == ["dividend:ondate"]
+
+    def test_active_security_events_not_clamped_by_delist_date(self, monkeypatch):
+        # clamp 条件是 inactive AND delist_date 非 NULL：活跃证券即便挂着
+        # delist_date（修复期中间态/脏元数据）事件也照常落库。
+        sec = _security(delist_date=date(2026, 3, 2))
+        monkeypatch.setattr(actions, "get_last_completed_trading_date", lambda market: END_DATE)
+        monkeypatch.setattr(actions, "get_securities_to_update", lambda db, args: [sec])
+        source, db = Mock(), Mock()
+        source.get_dividends_batch.return_value = [
+            {"ticker": "aapl", "ex_dividend_date": date(2026, 5, 11), "cash_amount": "0.27",
+             "currency": "USD", "source_event_id": "d1", "historical_adjustment_factor": "0.999"},
+        ]
+        source.get_splits_batch.return_value = []
+        db.upsert_dividends.return_value = 1
+        db.upsert_splits.return_value = 0
+        db.upsert_vendor_adjustment_factors.return_value = 1
+
+        result = actions.run(actions.create_parser().parse_args([]), source, db)
+        assert _exit_code(result) == 0
+        dividends = db.upsert_dividends.call_args.args[1]
+        assert [d["source_event_id"] for d in dividends] == ["d1"]
+
 
 # ---------------------------------------------------------------------------
 # events
@@ -605,6 +656,52 @@ class TestShortDataRun:
         assert [row["settlement_date"] for row in interests] == [date(2026, 6, 15)]
         volumes = db.upsert_short_volumes.call_args.args[0]
         assert [row["date"] for row in volumes] == [date(2026, 6, 10)]
+
+    def test_rows_after_delist_date_dropped(self, monkeypatch):
+        # 死票回收防护（上界，镜像 prices 的 fetch 终点 clamp）：退市证券
+        # delist_date 之后的同名做空数据可能属于回收该 symbol 的后继实体；
+        # delist_date 当日保留（与 prices 的 inclusive 终点同界）。
+        sec = _security(is_active=False, delist_date=date(2026, 3, 2))
+        monkeypatch.setattr(short_data, "get_last_completed_trading_date", lambda market: END_DATE)
+        monkeypatch.setattr(short_data, "get_securities_to_update", lambda db, args, end: [sec])
+        source, db = Mock(), Mock()
+        db.get_security_short_max_dates.return_value = {1: {"interest": None, "volume": None}}
+        source.get_short_interest_batch.return_value = [
+            {"ticker": "aapl", "settlement_date": date(2026, 3, 2), "short_interest": 5},    # delist 当日
+            {"ticker": "aapl", "settlement_date": date(2026, 4, 15), "short_interest": 10},  # 后继实体
+        ]
+        source.get_short_volume_batch.return_value = [
+            {"ticker": "aapl", "date": date(2026, 2, 27), "short_volume": 3},  # 本证券
+            {"ticker": "aapl", "date": date(2026, 3, 3), "short_volume": 7},   # 后继实体
+        ]
+        db.upsert_short_interests.return_value = 1
+        db.upsert_short_volumes.return_value = 1
+
+        result = short_data.run(short_data.create_parser().parse_args([]), source, db)
+        assert _exit_code(result) == 0
+        interests = db.upsert_short_interests.call_args.args[0]
+        assert [row["settlement_date"] for row in interests] == [date(2026, 3, 2)]
+        volumes = db.upsert_short_volumes.call_args.args[0]
+        assert [row["date"] for row in volumes] == [date(2026, 2, 27)]
+
+    def test_active_security_rows_not_clamped_by_delist_date(self, monkeypatch):
+        # clamp 条件是 inactive AND delist_date 非 NULL：活跃证券即便挂着
+        # delist_date（修复期中间态/脏元数据）也照常落库。
+        sec = _security(delist_date=date(2026, 3, 2))
+        monkeypatch.setattr(short_data, "get_last_completed_trading_date", lambda market: END_DATE)
+        monkeypatch.setattr(short_data, "get_securities_to_update", lambda db, args, end: [sec])
+        source, db = Mock(), Mock()
+        db.get_security_short_max_dates.return_value = {1: {"interest": None, "volume": None}}
+        source.get_short_interest_batch.return_value = [
+            {"ticker": "aapl", "settlement_date": date(2026, 6, 1), "short_interest": 10},
+        ]
+        source.get_short_volume_batch.return_value = []
+        db.upsert_short_interests.return_value = 1
+
+        result = short_data.run(short_data.create_parser().parse_args([]), source, db)
+        assert _exit_code(result) == 0
+        interests = db.upsert_short_interests.call_args.args[0]
+        assert [row["settlement_date"] for row in interests] == [date(2026, 6, 1)]
 
 
 # ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@ from scripts.update_massive_short_data import get_securities_to_update, process_
 
 
 def test_process_batch_uses_incremental_start_dates_for_existing_rows():
-    security = SimpleNamespace(id=1, symbol="aapl", list_date=None)
+    security = SimpleNamespace(id=1, symbol="aapl", list_date=None, is_active=True, delist_date=None)
     source = Mock()
     db_manager = Mock()
     db_manager.get_security_short_max_dates.return_value = {

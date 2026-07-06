@@ -138,6 +138,28 @@ def _clamp_to_list_date(security: Security, items: list[dict]) -> list[dict]:
     return kept
 
 
+def _clamp_to_delist_date(security: Security, items: list[dict]) -> list[dict]:
+    """死票回收防护（上界，与 _clamp_to_list_date 下界成对）：delist_date 之后的
+    同名分红/拆股可能属于回收该 symbol 的后继实体，一律丢弃（同 update_massive_prices
+    的回填终点 clamp）。活跃证券不受影响（挂着 delist_date 的脏元数据不 clamp）；
+    退市但 delist_date 未知的证券也不 clamp——宁多留勿猜。delist_date 当日事件保留。"""
+    if security.is_active or security.delist_date is None or not items:
+        return items
+    kept = [item for item in items if (_event_ex_date(item) or security.delist_date) <= security.delist_date]
+    dropped = len(items) - len(kept)
+    if dropped:
+        logger.info(
+            "[{}] 丢弃 {} 条晚于 delist_date {} 的公司行动（属于回收该 symbol 的后继实体）。",
+            security.symbol, dropped, security.delist_date,
+        )
+    return kept
+
+
+def _clamp_to_identity_window(security: Security, items: list[dict]) -> list[dict]:
+    """本证券身份窗口 [list_date, delist_date] 之外的事件全部丢弃。"""
+    return _clamp_to_delist_date(security, _clamp_to_list_date(security, items))
+
+
 def _strip_ticker(rows: list[dict]) -> list[dict]:
     return [{key: value for key, value in row.items() if key != "ticker"} for row in rows]
 
@@ -294,10 +316,10 @@ def process_batch(
     for security in securities:
         symbol = security.symbol
         try:
-            security_dividends = _clamp_to_list_date(security, _strip_ticker(dividends_by_symbol.get(symbol, [])))
+            security_dividends = _clamp_to_identity_window(security, _strip_ticker(dividends_by_symbol.get(symbol, [])))
             security_splits = _sift_same_day_splits(
                 security,
-                _clamp_to_list_date(security, _strip_ticker(splits_by_symbol.get(symbol, []))),
+                _clamp_to_identity_window(security, _strip_ticker(splits_by_symbol.get(symbol, []))),
                 results_counter,
             )
 
