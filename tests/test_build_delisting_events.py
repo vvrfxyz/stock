@@ -917,23 +917,24 @@ class TestClassifyDecisionTable:
         assert row["delisting_return"] == Decimal("0.05000000")
 
     def test_stock_return_gate_floor_inclusive(self):
-        # implied = 0.2 × 10.00 = 2.00 恰在 0.2x 下界（含边界）→ 采信
+        # implied = 0.6 × 10.00 = 6.00 恰在股票腿紧闸门 0.6x 下界（含边界）→ 采信
         row = self._classify(
             evidence=Evidence(
                 eightk_201=[_filing(form="8-K")],
-                consideration=ConsiderationExtraction(stock_ratio=Decimal("0.2")),
+                consideration=ConsiderationExtraction(stock_ratio=Decimal("0.6")),
             ),
             final_price=Decimal("10.00"),
             acquirer_close=Decimal("10.00"),
         )
-        assert row["delisting_return"] == Decimal("-0.80000000")
+        assert row["delisting_return"] == Decimal("-0.40000000")
 
     def test_stock_return_below_floor_gated_out(self):
-        # implied = 0.199 × 10.00 = 1.99 < 0.2x 下界 → 不写数值，evidence 留痕
+        # implied = 0.599 × 10.00 = 5.99 < 0.6x 下界 → 不写数值，evidence 留痕
+        # （生产实测：混合 deal 漏抽现金腿时 implied 落在 ~0.3x，全被此闸拦下）
         row = self._classify(
             evidence=Evidence(
                 eightk_201=[_filing(form="8-K")],
-                consideration=ConsiderationExtraction(stock_ratio=Decimal("0.199")),
+                consideration=ConsiderationExtraction(stock_ratio=Decimal("0.599")),
             ),
             final_price=Decimal("10.00"),
             acquirer_close=Decimal("10.00"),
@@ -944,7 +945,7 @@ class TestClassifyDecisionTable:
         assert "vs final_price=10.00" in row["evidence"]
 
     def test_stock_return_above_ceiling_gated_out(self):
-        # implied = 6 × 10.00 = 60.00 > 5x 上界 → gated out
+        # implied = 6 × 10.00 = 60.00 > 1.5x 上界 → gated out
         row = self._classify(
             evidence=Evidence(
                 eightk_201=[_filing(form="8-K")],
@@ -2571,3 +2572,24 @@ class TestDelistingOutcomesProbePg:
             conn.commit()
         with pg_db.get_session() as session:
             assert report_delisting_outcomes(session) == 0
+
+
+class TestReturnConfidenceGate:
+    """return 只认 HIGH 置信的并购族——MEDIUM identity-merge 是同实体延续。"""
+
+    def test_medium_identity_merge_never_gets_consideration_return(self):
+        security = DelistedSecurity(id=1, symbol="verb", type="CS", cik="1",
+                                    delist_date=date(2025, 12, 1), name="Verb Tech")
+        evidence = Evidence(
+            merge_events=[MergeEvent(event_id=1, keep_security_id=2, keep_symbol="tonx")],
+            consideration=ConsiderationExtraction(cash=Decimal("9.51")),
+        )
+        row = classify(security, evidence, final_price=Decimal("14.50"),
+                       final_price_date=date(2025, 12, 1),
+                       price_bucket=None, price_pattern=None)
+        assert row["reason_code"] == "MERGER"
+        assert row["reason_confidence"] == "MEDIUM"
+        # DEFM14A 抽出的现金不是这只壳的退出对价——绝不落 return
+        assert row["delisting_return"] is None
+        # 对价证据照记（人工复核线索）
+        assert "consideration_cash=9.51" in row["evidence"]

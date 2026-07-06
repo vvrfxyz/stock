@@ -183,6 +183,13 @@ EIGHTK_DOCS_PER_SECURITY = 3           # 每只候选最多抓 3 份主文档
 # 股票腿/混合对价的 implied value 过同一闸门。
 CASH_SANITY_FLOOR_RATIO = 0.2
 CASH_SANITY_CEIL_RATIO = 5.0
+# 股票腿/混合腿的独立紧闸门：合法换股并购的 implied（ratio×acquirer_close±现金腿）
+# 与终价同样收敛（p50≈0 论证与现金同构），偏离 [0.6x, 1.5x] 必是抽取残缺——
+# 生产实测三种失败模式全部落在闸外：混合 deal 漏抽现金腿（implied≈0.3x，
+# mcrn/ceb/xls/ghdx）、优先股类误配普通股换股比（1.7-1.8x，ibkco/ibkcp）、
+# 收购方同名撞库解析错价（slct 的 First Bancorp NC vs First BanCorp PR）。
+STOCK_SANITY_FLOOR_RATIO = 0.6
+STOCK_SANITY_CEIL_RATIO = 1.5
 # 破产三证之一：终价须低于 $0.1（近零终值——事实全损）
 BANKRUPTCY_FINAL_PRICE_CEILING = Decimal("0.1")
 # 收购方收盘价缺 final_price_date 当日 bar 时的回看天数（自然日）
@@ -607,9 +614,12 @@ _CASH_AMOUNT = r"(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)"
 # "without interest" 可出现在金额与 "in cash" 之间或末尾；"per share" 位置两可。
 _CASH_PATTERNS = [
     # "right to receive $26.50 in cash(, without interest)" /
-    # "right to receive $26.50 per share in cash"
+    # "right to receive $26.50 per share in cash" /
+    # 混合对价枚举句式："right to receive (i) $11.80 in cash, without interest,
+    # and (ii) 0.1612 shares of ..."——列表标记 (i)/(a)/(1) 可选（Milacron/CEB/
+    # Exelis/Genomic Health 型混合 deal 的现金腿全靠它）
     re.compile(
-        r"right\s+to\s+receive\s+\$\s?" + _CASH_AMOUNT
+        r"right\s+to\s+receive\s+(?:\((?:[ivx]{1,4}|[a-z]|\d{1,2})\)\s*)?\$\s?" + _CASH_AMOUNT
         + r"(?:\s+per\s+share)?(?:\s*,?\s*without\s+interest\s*,?)?\s+in\s+cash",
         re.IGNORECASE,
     ),
@@ -1281,12 +1291,15 @@ def classify(
     # 对价推导的 return 只对并购族 reason_code 计算——form25 规则把证券定成
     # EXCHANGE_DROP/VOLUNTARY/LIQUIDATION（'b'/'c'/'a1'）而其身份 MERGE 事件又让
     # 它进了对价抽取路时，抽出的对价不代表这只证券的退出对价，绝不能落成 return。
+    # 且只认 HIGH 置信：MEDIUM 的 identity-merge MERGER 是同实体延续（持仓换到
+    # keep 侧，非现金退出），DEFM14A 抽出的现金数字不是这只壳的退出对价。
     delisting_return: Decimal | None = None
     if bankruptcy_confirmed:
         delisting_return = Decimal("-1")
     elif (
         consideration is not None
         and reason_code in ("MERGER", "ACQUISITION_CASH", "ACQUISITION_STOCK")
+        and confidence == "HIGH"
         and final_price is not None
         and final_price > 0
     ):
@@ -1301,18 +1314,23 @@ def classify(
             and not consideration.election
         ):
             # 换股独占：implied = ratio × acquirer_close；混合：再加现金腿。
-            # implied 过与现金同款的 [0.2x, 5x] 闸门，出界记 evidence 不写数值。
+            # implied 过股票腿专属紧闸门 [0.6x, 1.5x]（常量注释记载三种生产实测
+            # 失败模式），出界记 evidence 不写数值。
             implied = consideration.stock_ratio * acquirer_close
             if consideration.cash is not None:
                 implied += consideration.cash
-            if cash_within_sanity_gate(implied, final_price):
+            if (
+                Decimal(str(STOCK_SANITY_FLOOR_RATIO)) * final_price
+                <= implied
+                <= Decimal(str(STOCK_SANITY_CEIL_RATIO)) * final_price
+            ):
                 delisting_return = (
                     (implied - final_price) / final_price
                 ).quantize(Decimal("1E-8"))
             else:
                 tokens.append(
                     f"stock_gated_out={implied} vs final_price={final_price} "
-                    f"(outside [{CASH_SANITY_FLOOR_RATIO}x, {CASH_SANITY_CEIL_RATIO}x])"
+                    f"(outside [{STOCK_SANITY_FLOOR_RATIO}x, {STOCK_SANITY_CEIL_RATIO}x])"
                 )
 
     return {
