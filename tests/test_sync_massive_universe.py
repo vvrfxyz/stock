@@ -61,6 +61,7 @@ class FakeDB:
         self.identity_events = []
         self.symbol_upserts = []
         self.sessions = []
+        self.deactivate_calls = []
 
     def get_session(self):
         session = MagicMock()
@@ -92,6 +93,10 @@ class FakeDB:
     def upsert_securities_by_symbol(self, rows, touch_info_timestamp=True):
         self.symbol_upserts.extend(rows)
         return len(rows)
+
+    def deactivate_missing_securities(self, active_symbols):
+        self.deactivate_calls.append(set(active_symbols))
+        return 0
 
     def close(self):
         pass
@@ -182,10 +187,10 @@ class TestSingleRenameFailureIsolated:
         assert [r["id"] for r in db.info_upserts] == [2]
         # normal 路径不受影响
         assert db.symbol_upserts == [{"symbol": "new1"}]
-        # mark-missing 步骤仍执行（session 顺序：加载 → 4b NEW_LISTING 查询 → mark-missing）
-        assert len(db.sessions) == 3
-        assert db.sessions[2].execute.called
-        assert db.sessions[2].commit.called
+        # mark-missing 步骤仍执行，且已收口为 deactivate_missing_securities API
+        # （不再经 session 直写 UPDATE securities）
+        assert db.deactivate_calls == [{"x", "c", "new1"}]
+        assert len(db.sessions) == 2  # 加载 resolver → 4b NEW_LISTING 反查
 
     def test_swap_cycle_both_quarantined_batch_survives(self, monkeypatch):
         # A↔B 互换成环：两条都撞占用防御，各自隔离，批处理继续

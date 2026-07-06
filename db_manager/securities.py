@@ -4,12 +4,27 @@ import random
 from datetime import date, datetime, timezone
 
 from loguru import logger
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from data_models.models import Company, Security, SecurityIdentityEvent, SecuritySymbolHistory
+from data_models.models import Company, DailyPrice, Security, SecurityIdentityEvent, SecuritySymbolHistory
+from utils.massive_config import ALLOWED_US_SECURITY_TYPES
 
 from .helpers import _clean_for_model, _dedupe_rows_by_key, _group_rows_by_key_set
+
+# enrich_security_identity 可补空的身份/生命周期列白名单（阶段 1a 收编
+# B2/B3/B4/B9 各脚本散落的 NULL-only 补空直写；name/exchange 在拆表终态
+# 分属详情/身份两桶，阶段 3 再分流）。
+ENRICHABLE_SECURITY_COLUMNS = frozenset({
+    "delist_date",
+    "list_date",
+    "cik",
+    "composite_figi",
+    "share_class_figi",
+    "name",
+    "exchange",
+    "company_id",
+})
 
 
 def _norm_identifier(value) -> str | None:
@@ -336,6 +351,106 @@ class SecuritiesMixin:
                 | (Security.price_data_latest_date < latest_date)
             )
             .values(price_data_latest_date=latest_date)
+        )
+        with self.engine.connect() as conn:
+            result = conn.execute(stmt)
+            conn.commit()
+            return result.rowcount or 0
+
+    def recalculate_price_latest_dates(self, security_ids: list[int] | None = None) -> int:
+        """按 daily_prices 事实重算 price_data_latest_date 水位（收编 B6/B7 直写）。
+
+        - security_ids=None：全表校准（calibrate_price_latest_date 语义）；
+          传 ids：范围自愈（import_day_aggs touched_ids 语义）；空列表直接返回 0。
+        - join 语义：只更新在 daily_prices 里有行的证券——无价格行的证券
+          不触碰、绝不回落 NULL（那是 repair_identity husk 合并的专属语义，
+          阶段 2 收口时另走通道）。
+        - 守卫统一为 IS DISTINCT FROM：水位已一致的行不产生无效写
+          （与 B6 的 `!= OR IS NULL` 在 max_date 非 NULL 前提下逐行等价）。
+
+        返回实际更新的行数。
+        """
+        latest = select(
+            DailyPrice.security_id,
+            func.max(DailyPrice.date).label("max_date"),
+        ).group_by(DailyPrice.security_id)
+        if security_ids is not None:
+            if not security_ids:
+                return 0
+            latest = latest.where(DailyPrice.security_id.in_(security_ids))
+        subquery = latest.subquery("latest_dates")
+
+        stmt = (
+            update(Security)
+            .values(price_data_latest_date=subquery.c.max_date)
+            .where(Security.id == subquery.c.security_id)
+            .where(Security.price_data_latest_date.is_distinct_from(subquery.c.max_date))
+        )
+        with self.engine.connect() as conn:
+            result = conn.execute(stmt)
+            conn.commit()
+            return result.rowcount or 0
+
+    def deactivate_missing_securities(self, active_symbols: set[str]) -> int:
+        """把不在 vendor 活跃名单中的 US 白名单类型活跃证券标记为 inactive（收编 B1 直写）。
+
+        三重过滤内聚在此：upper(market)='US' + upper(type) IN
+        ALLOWED_US_SECURITY_TYPES + is_active=True，且 symbol 不在 active_symbols
+        中才摘牌。--limit / --skip-mark-missing-inactive 之类的门禁留在脚本层。
+
+        active_symbols 为空集抛 ValueError：空名单等价于全量摘牌，只可能是
+        上游拉取失败，绝不能落库（sync_massive_universe 在名单为空时早退，
+        正常路径到不了这里）。返回实际摘牌行数。
+        """
+        if not active_symbols:
+            raise ValueError("deactivate_missing_securities 拒绝空 active_symbols：等价于全量摘牌。")
+        stmt = (
+            update(Security)
+            .where(func.upper(Security.market) == "US")
+            .where(func.upper(Security.type).in_(ALLOWED_US_SECURITY_TYPES))
+            .where(Security.is_active == True)  # noqa: E712
+            .where(~Security.symbol.in_(active_symbols))
+            .values(is_active=False)
+        )
+        with self.engine.connect() as conn:
+            result = conn.execute(stmt)
+            conn.commit()
+            return result.rowcount or 0
+
+    def enrich_security_identity(self, security_id: int, fills: dict) -> int:
+        """NULL-only 逐列补空身份/生命周期字段（收编 B2/B3/B4/B9 各脚本的补空直写）。
+
+        对 fills 中每个非 None 值执行 SET col = COALESCE(col, :val)，
+        WHERE 带 OR(col IS NULL) 守卫——既有值绝不覆盖。列名限
+        ENRICHABLE_SECURITY_COLUMNS 白名单，未知列抛 ValueError。
+
+        返回 rowcount：1 = 至少一列实际补入；0 = 行不存在、fills 全为
+        None、或所有目标列均已非 NULL（无操作——backfill_rename_events
+        的竞态计数正依赖这一语义）。
+
+        语义定案（vs sync_delisted_universe 旧 _apply_fills 的整行 AND 守卫）：
+        旧守卫要求全部 fill 列都为 NULL 才整行补；本 API 是逐列 COALESCE——
+        并发下部分列已被他人补入的行不再整行跳过，而是补齐剩余 NULL 列。
+        这严格更精确，且任何情况下都不会覆盖既有值。
+        """
+        unknown = set(fills) - ENRICHABLE_SECURITY_COLUMNS
+        if unknown:
+            raise ValueError(
+                f"enrich_security_identity 收到白名单外的列: {sorted(unknown)}"
+            )
+        columns = Security.__table__.c
+        values = {
+            col: func.coalesce(columns[col], value)
+            for col, value in fills.items()
+            if value is not None
+        }
+        if not values:
+            return 0
+        stmt = (
+            update(Security)
+            .where(Security.id == security_id)
+            .where(or_(*[columns[col].is_(None) for col in values]))
+            .values(values)
         )
         with self.engine.connect() as conn:
             result = conn.execute(stmt)

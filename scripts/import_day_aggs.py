@@ -351,17 +351,10 @@ def main(argv: list[str] | None = None) -> int:
 
         # 水位线自愈：导入历史 bar 一般不会推高 MAX(date)，但个别证券
         # （水位曾为空/滞后）可能变化，统一按事实重算，保住 integrity 检查。
+        # 范围重算收口进 db_manager（IS DISTINCT FROM 守卫语义不变）。
         if not args.dry_run and touched_ids:
-            with db_manager.get_session() as session:
-                fixed = session.execute(text("""
-                    UPDATE securities s SET price_data_latest_date = agg.max_date
-                    FROM (SELECT security_id, MAX(date) AS max_date FROM daily_prices
-                          WHERE security_id = ANY(:ids) GROUP BY security_id) agg
-                    WHERE s.id = agg.security_id
-                      AND s.price_data_latest_date IS DISTINCT FROM agg.max_date
-                """), {"ids": list(touched_ids)})
-                session.commit()
-                logger.info("水位线校准: {} 只证券。", fixed.rowcount or 0)
+            fixed = db_manager.recalculate_price_latest_dates(list(touched_ids))
+            logger.info("水位线校准: {} 只证券。", fixed)
         return 0
     except Exception as exc:
         logger.opt(exception=exc).critical("import_day_aggs 执行失败: {}", exc)

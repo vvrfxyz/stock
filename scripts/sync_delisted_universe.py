@@ -230,19 +230,15 @@ def _write_match_audit(match_log: list[dict]) -> str | None:
 
 
 def _apply_fills(db_manager: DatabaseManager, to_fill: list[tuple[int, dict]]) -> int:
-    from sqlalchemy import text
+    """NULL 字段补齐走 enrich_security_identity（逐列 COALESCE，绝不覆盖既有值）。
+
+    返回至少补入一列的行数。与旧的整行 AND(col IS NULL) 守卫相比，并发下
+    部分列已被他人补入的行会补齐剩余 NULL 列而非整行跳过（语义定案见
+    db_manager enrich_security_identity docstring）；逐行独立提交，幂等重跑安全。
+    """
     applied = 0
-    with db_manager.get_session() as session:
-        for sec_id, fills in to_fill:
-            sets = ", ".join(f"{col} = :{col}" for col in fills)
-            # 只补 NULL：并发防御，绝不覆盖既有值
-            guards = " AND ".join(f"{col} IS NULL" for col in fills)
-            result = session.execute(
-                text(f"UPDATE securities SET {sets} WHERE id = :sec_id AND {guards}"),
-                {**fills, "sec_id": sec_id},
-            )
-            applied += result.rowcount
-        session.commit()
+    for sec_id, fills in to_fill:
+        applied += db_manager.enrich_security_identity(sec_id, fills)
     return applied
 
 
@@ -357,7 +353,6 @@ def _run_enrich(args, source: MassiveSource, db_manager: DatabaseManager, stats:
             return (sec.id, "enrich_vendor_no_list_date", None)
         return (sec.id, "enriched", fills)
 
-    from sqlalchemy import text
     # 分批跑+批间落库：几小时的任务中途被杀时已完成的批次不丢
     for lo in range(0, len(population), ENRICH_COMMIT_BATCH):
         chunk = population[lo:lo + ENRICH_COMMIT_BATCH]
@@ -365,20 +360,15 @@ def _run_enrich(args, source: MassiveSource, db_manager: DatabaseManager, stats:
             chunk, worker, max_workers=args.enrich_workers,
             desc=f"富化退市证券 {lo + 1}-{lo + len(chunk)}/{len(population)}")
         stats["enrich_fatal_error"] += counter.get("FATAL_ERROR", 0)
-        with db_manager.get_session() as session:
-            for result in outputs:
-                if result is None:
-                    continue
-                sec_id, status, fills = result
-                stats[status] += 1
-                if status != "enriched":
-                    continue
-                sets = ", ".join(f"{col} = COALESCE({col}, :{col})" for col in fills)
-                session.execute(
-                    text(f"UPDATE securities SET {sets} WHERE id = :sec_id"),
-                    {**fills, "sec_id": sec_id},
-                )
-            session.commit()
+        for result in outputs:
+            if result is None:
+                continue
+            sec_id, status, fills = result
+            stats[status] += 1
+            if status != "enriched":
+                continue
+            # 逐列 COALESCE 补空收口进 db_manager（与旧直写同语义，绝不覆盖）
+            db_manager.enrich_security_identity(sec_id, fills)
         logger.info("阶段 B 进度 {}/{}: {}", min(lo + ENRICH_COMMIT_BATCH, len(population)),
                     len(population), {k: v for k, v in stats.items() if k.startswith("enrich")})
 

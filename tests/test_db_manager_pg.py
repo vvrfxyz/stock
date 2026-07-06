@@ -993,3 +993,163 @@ class TestPipelineTaskRuns:
         pg_db.finish_task_run(id2, exit_code=1, error_sample="timeout")
 
         assert _scalar(pg_db, "SELECT count(*) FROM pipeline_task_runs WHERE run_id = 'run-003'") == 2
+
+
+# ---------------------------------------------------------------------------
+# 阶段 1a 收口 API（B1/B2-B4-B9/B6-B7 旁路收编，语义见各 docstring）
+# ---------------------------------------------------------------------------
+
+class TestDeactivateMissingSecurities:
+    def test_only_active_us_whitelisted_types_are_deactivated(self, pg_db):
+        """B1 三重过滤：非 US / 非白名单类型 / 已 inactive 的行都不触碰。"""
+        _insert_security(pg_db, 1, "gone")                              # US CS 活跃、不在名单 → 摘牌
+        _insert_security(pg_db, 2, "keep")                              # US CS 活跃、在名单 → 不动
+        _insert_security(pg_db, 3, "cagone", market="CA")              # 非 US → 不动
+        _insert_security(pg_db, 4, "fundgone", type="FUND")            # 非白名单类型 → 不动
+        _insert_security(pg_db, 5, "deadgone", is_active=False)        # 已 inactive → 不动（rowcount 不含它）
+
+        marked = pg_db.deactivate_missing_securities({"keep"})
+
+        assert marked == 1
+        assert _scalar(pg_db, "SELECT is_active FROM securities WHERE id=1") is False
+        assert _scalar(pg_db, "SELECT is_active FROM securities WHERE id=2") is True
+        assert _scalar(pg_db, "SELECT is_active FROM securities WHERE id=3") is True
+        assert _scalar(pg_db, "SELECT is_active FROM securities WHERE id=4") is True
+        assert _scalar(pg_db, "SELECT is_active FROM securities WHERE id=5") is False
+
+    def test_market_and_type_match_case_insensitively(self, pg_db):
+        _insert_security(pg_db, 1, "lowmkt", market="us", type="cs")
+        assert pg_db.deactivate_missing_securities({"other"}) == 1
+        assert _scalar(pg_db, "SELECT is_active FROM securities WHERE id=1") is False
+
+    def test_etf_type_included_in_whitelist(self, pg_db):
+        _insert_security(pg_db, 1, "etfgone", type="ETF")
+        assert pg_db.deactivate_missing_securities({"other"}) == 1
+
+    def test_empty_active_symbols_rejected(self, pg_db):
+        """空名单等价于全量摘牌，只可能是上游拉取失败——必须拒绝。"""
+        _insert_security(pg_db, 1, "aapl")
+        with pytest.raises(ValueError, match="空 active_symbols"):
+            pg_db.deactivate_missing_securities(set())
+        assert _scalar(pg_db, "SELECT is_active FROM securities WHERE id=1") is True
+
+    def test_idempotent_rerun_returns_zero(self, pg_db):
+        _insert_security(pg_db, 1, "gone")
+        assert pg_db.deactivate_missing_securities({"keep"}) == 1
+        assert pg_db.deactivate_missing_securities({"keep"}) == 0
+
+
+class TestEnrichSecurityIdentity:
+    def test_fills_only_null_columns_never_overwrites(self, pg_db):
+        """核心不变量：既有非 NULL 值绝不被覆盖，NULL 列逐列补入。"""
+        _insert_security(pg_db, 1, "dead", is_active=False,
+                         cik="0000000001", name="Existing Name")
+
+        changed = pg_db.enrich_security_identity(1, {
+            "cik": "0000009999",            # 已有值 → 不覆盖
+            "name": "Vendor Name",          # 已有值 → 不覆盖
+            "delist_date": date(2015, 6, 1),  # NULL → 补入
+            "composite_figi": "BBG000NEW",    # NULL → 补入
+        })
+
+        assert changed == 1
+        assert _scalar(pg_db, "SELECT cik FROM securities WHERE id=1") == "0000000001"
+        assert _scalar(pg_db, "SELECT name FROM securities WHERE id=1") == "Existing Name"
+        assert _scalar(pg_db, "SELECT delist_date FROM securities WHERE id=1") == date(2015, 6, 1)
+        assert _scalar(pg_db, "SELECT composite_figi FROM securities WHERE id=1") == "BBG000NEW"
+
+    def test_partially_filled_row_gets_remaining_nulls(self, pg_db):
+        """语义定案（vs 旧 _apply_fills 整行 AND 守卫）：部分列已有值时不再
+        整行跳过，而是补齐剩余 NULL 列——严格更精确且仍绝不覆盖。"""
+        _insert_security(pg_db, 1, "dead", is_active=False, cik="0000000001")
+
+        changed = pg_db.enrich_security_identity(1, {
+            "cik": "0000009999",
+            "delist_date": date(2015, 6, 1),
+        })
+
+        assert changed == 1
+        assert _scalar(pg_db, "SELECT cik FROM securities WHERE id=1") == "0000000001"
+        assert _scalar(pg_db, "SELECT delist_date FROM securities WHERE id=1") == date(2015, 6, 1)
+
+    def test_all_target_columns_already_filled_returns_zero(self, pg_db):
+        """全部目标列均已非 NULL → rowcount=0 无操作写
+        （backfill_rename_events 的竞态跳过计数依赖此语义）。"""
+        _insert_security(pg_db, 1, "aapl", composite_figi="BBG000EXIST")
+        assert pg_db.enrich_security_identity(1, {"composite_figi": "BBG000OTHER"}) == 0
+        assert _scalar(pg_db, "SELECT composite_figi FROM securities WHERE id=1") == "BBG000EXIST"
+
+    def test_missing_row_returns_zero(self, pg_db):
+        assert pg_db.enrich_security_identity(404, {"cik": "0000000001"}) == 0
+
+    def test_none_values_are_skipped(self, pg_db):
+        _insert_security(pg_db, 1, "aapl")
+        # fills 全为 None：无操作，也不应生成空 SET 的非法 SQL
+        assert pg_db.enrich_security_identity(1, {"cik": None, "name": None}) == 0
+        assert _scalar(pg_db, "SELECT cik FROM securities WHERE id=1") is None
+
+    def test_unknown_column_rejected(self, pg_db):
+        _insert_security(pg_db, 1, "aapl")
+        with pytest.raises(ValueError, match="白名单外"):
+            pg_db.enrich_security_identity(1, {"is_active": False})
+        with pytest.raises(ValueError, match="白名单外"):
+            pg_db.enrich_security_identity(1, {"symbol": "hack"})
+
+    def test_idempotent_rerun(self, pg_db):
+        _insert_security(pg_db, 1, "dead", is_active=False)
+        assert pg_db.enrich_security_identity(1, {"cik": "0000000001"}) == 1
+        assert pg_db.enrich_security_identity(1, {"cik": "0000000001"}) == 0
+        assert _scalar(pg_db, "SELECT cik FROM securities WHERE id=1") == "0000000001"
+
+
+class TestRecalculatePriceLatestDates:
+    def _prices(self, pg_db, security_id, *dates):
+        pg_db.upsert_daily_prices([
+            {"security_id": security_id, "date": d, "close": 1} for d in dates
+        ])
+
+    def test_full_table_recalculation(self, pg_db):
+        """security_ids=None：全表按 MAX(daily_prices.date) 校准（B6 语义）。"""
+        _insert_security(pg_db, 1, "aapl", price_data_latest_date=date(2026, 6, 1))
+        _insert_security(pg_db, 2, "msft")   # 水位 NULL、有价格 → 补齐
+        _insert_security(pg_db, 3, "goog")   # 无价格行 → 不触碰（不回落 NULL 也不写）
+        self._prices(pg_db, 1, date(2026, 6, 10))
+        self._prices(pg_db, 2, date(2026, 6, 9), date(2026, 6, 10))
+
+        fixed = pg_db.recalculate_price_latest_dates()
+
+        assert fixed == 2
+        assert _scalar(pg_db, "SELECT price_data_latest_date FROM securities WHERE id=1") == date(2026, 6, 10)
+        assert _scalar(pg_db, "SELECT price_data_latest_date FROM securities WHERE id=2") == date(2026, 6, 10)
+        assert _scalar(pg_db, "SELECT price_data_latest_date FROM securities WHERE id=3") is None
+
+    def test_scoped_recalculation_only_touches_given_ids(self, pg_db):
+        """传 ids：范围重算（B7 touched_ids 语义），范围外滞后水位不动。"""
+        _insert_security(pg_db, 1, "aapl", price_data_latest_date=date(2026, 1, 1))
+        _insert_security(pg_db, 2, "msft", price_data_latest_date=date(2026, 1, 1))
+        self._prices(pg_db, 1, date(2026, 6, 10))
+        self._prices(pg_db, 2, date(2026, 6, 10))
+
+        assert pg_db.recalculate_price_latest_dates([1]) == 1
+        assert _scalar(pg_db, "SELECT price_data_latest_date FROM securities WHERE id=1") == date(2026, 6, 10)
+        assert _scalar(pg_db, "SELECT price_data_latest_date FROM securities WHERE id=2") == date(2026, 1, 1)
+
+    def test_is_distinct_from_guard_skips_up_to_date_rows(self, pg_db):
+        """水位已一致 → 不产生无效写，rowcount=0。"""
+        _insert_security(pg_db, 1, "aapl", price_data_latest_date=date(2026, 6, 10))
+        self._prices(pg_db, 1, date(2026, 6, 10))
+        assert pg_db.recalculate_price_latest_dates([1]) == 0
+        assert pg_db.recalculate_price_latest_dates() == 0
+
+    def test_stale_watermark_can_move_backwards_to_fact(self, pg_db):
+        """重算是"按事实对齐"而非单向推进：虚高水位会被拉回 MAX(date)。"""
+        _insert_security(pg_db, 1, "aapl", price_data_latest_date=date(2026, 12, 31))
+        self._prices(pg_db, 1, date(2026, 6, 10))
+        assert pg_db.recalculate_price_latest_dates([1]) == 1
+        assert _scalar(pg_db, "SELECT price_data_latest_date FROM securities WHERE id=1") == date(2026, 6, 10)
+
+    def test_empty_id_list_is_noop(self, pg_db):
+        _insert_security(pg_db, 1, "aapl")
+        self._prices(pg_db, 1, date(2026, 6, 10))
+        assert pg_db.recalculate_price_latest_dates([]) == 0
+        assert _scalar(pg_db, "SELECT price_data_latest_date FROM securities WHERE id=1") is None

@@ -14,7 +14,7 @@ from collections import defaultdict, deque
 from datetime import timedelta
 
 from loguru import logger
-from sqlalchemy import func, update
+from sqlalchemy import func
 from tqdm import tqdm
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -351,18 +351,7 @@ def main(argv: list[str] | None = None) -> int:
         if not should_mark_missing_inactive and args.limit > 0 and not args.skip_mark_missing_inactive:
             logger.warning("检测到 --limit，已自动跳过 missing->inactive 标记，避免测试范围外数据被误伤。")
         if should_mark_missing_inactive:
-            with db_manager.get_session() as session:
-                stmt = (
-                    update(Security)
-                    .where(func.upper(Security.market) == "US")
-                    .where(func.upper(Security.type).in_(ALLOWED_US_SECURITY_TYPES))
-                    .where(Security.is_active == True)
-                    .where(~Security.symbol.in_(active_symbols))
-                    .values(is_active=False)
-                )
-                result = session.execute(stmt)
-                session.commit()
-                marked_inactive = result.rowcount or 0
+            marked_inactive = db_manager.deactivate_missing_securities(active_symbols)
 
         logger.success(
             "Massive universe 同步完成: fetched={} upserted={} renamed={} rename_skipped={} recycled={} dead_ticker_recycled={} new_listings={} marked_inactive={}",

@@ -1,8 +1,9 @@
 """sync_delisted_universe 纯逻辑单元测试：名单去重 + 既有行匹配分类 + 时点身份核对。"""
 from datetime import date
 from types import SimpleNamespace
+from unittest.mock import Mock
 
-from scripts.sync_delisted_universe import _dedupe_entries, _overview_matches, classify_entries
+from scripts.sync_delisted_universe import _apply_fills, _dedupe_entries, _overview_matches, classify_entries
 
 
 class TestOverviewMatches:
@@ -98,3 +99,25 @@ class TestClassifyEntries:
         entries = [_entry("dup", date(2010, 1, 5)), _entry("dup", date(2010, 1, 20))]
         to_insert, to_fill, stats = classify_entries(entries, existing)
         assert len(to_fill) == 1 and stats["dup_match_same_row"] == 1 and not to_insert
+
+
+class TestApplyFills:
+    def test_delegates_to_enrich_api_and_sums_rowcounts(self):
+        """补空写路径已收口进 db_manager：逐行调 enrich_security_identity，
+        返回值 = 实际补入行数之和（rowcount=0 的竞态行不计）。"""
+        db = Mock()
+        db.enrich_security_identity.side_effect = [1, 0, 1]
+        to_fill = [
+            (5, {"delist_date": date(2015, 6, 1), "cik": "0001"}),
+            (7, {"name": "Raced Away"}),
+            (9, {"composite_figi": "BBG9"}),
+        ]
+
+        applied = _apply_fills(db, to_fill)
+
+        assert applied == 2
+        assert db.enrich_security_identity.call_args_list == [
+            ((5, {"delist_date": date(2015, 6, 1), "cik": "0001"}),),
+            ((7, {"name": "Raced Away"}),),
+            ((9, {"composite_figi": "BBG9"}),),
+        ]

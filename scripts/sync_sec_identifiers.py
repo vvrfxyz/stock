@@ -11,7 +11,6 @@ from datetime import timedelta
 from pathlib import Path
 
 from loguru import logger
-from sqlalchemy import update
 
 project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
@@ -77,14 +76,9 @@ def main(argv: list[str] | None = None) -> int:
 
             backfilled = 0
             if cik_backfills:
-                with db_manager.engine.connect() as conn:
-                    for security_id, cik in cik_backfills.items():
-                        conn.execute(
-                            update(Security)
-                            .where(Security.id == security_id, Security.cik.is_(None))
-                            .values(cik=cik)
-                        )
-                    conn.commit()
+                for security_id, cik in cik_backfills.items():
+                    # NULL-only 补空收口进 db_manager：既有 cik 绝不覆盖
+                    db_manager.enrich_security_identity(security_id, {"cik": cik})
                 backfilled = len(cik_backfills)
 
             logger.info("活跃证券 {}，按 symbol 命中 SEC 映射 {}，未命中 {}。",

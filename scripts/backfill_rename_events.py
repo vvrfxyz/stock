@@ -56,13 +56,11 @@ from datetime import date, datetime, timedelta, timezone
 
 from loguru import logger
 from sqlalchemy import text
-from sqlalchemy import update as sa_update
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from data_models.models import Security
 from db_manager import DatabaseManager
 from utils.script_logging import setup_logging as configure_script_logging
 
@@ -675,21 +673,17 @@ def load_acceptance_metrics(engine) -> dict:
 # 写入（--apply）
 # --------------------------------------------------------------------------- #
 def apply_figi_fills(db_manager: DatabaseManager, fills: list) -> tuple[list, int]:
-    """fill-never-overwrite：WHERE composite_figi IS NULL 守卫；返回 (实际回填, 竞态跳过数)。"""
+    """fill-never-overwrite：composite_figi 补空走 enrich_security_identity
+    （NULL-only 守卫收口进 db_manager）；返回 (实际回填, 竞态跳过数)。
+    rowcount=0（行不存在或 figi 已被他人补入）计竞态跳过，与旧
+    WHERE composite_figi IS NULL 直写语义一致。"""
     applied: list[tuple[int, str]] = []
     raced = 0
-    with db_manager.engine.connect() as conn:
-        for sid, figi in fills:
-            result = conn.execute(
-                sa_update(Security)
-                .where(Security.id == sid, Security.composite_figi.is_(None))
-                .values(composite_figi=figi)
-            )
-            if result.rowcount:
-                applied.append((sid, figi))
-            else:
-                raced += 1
-        conn.commit()
+    for sid, figi in fills:
+        if db_manager.enrich_security_identity(sid, {"composite_figi": figi}):
+            applied.append((sid, figi))
+        else:
+            raced += 1
     if applied:
         db_manager.insert_missing_security_identifiers([
             {

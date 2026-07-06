@@ -6,7 +6,7 @@ import argparse
 from datetime import timedelta
 
 from loguru import logger
-from sqlalchemy import func, update, select
+from sqlalchemy import func, select
 
 # --- 路径设置 ---
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -41,19 +41,19 @@ def calibrate_latest_price_dates(db_manager: DatabaseManager, dry_run: bool = Fa
     logger.info("开始校准 price_data_latest_date 字段...")
 
     try:
-        with db_manager.get_session() as session:
-            # 步骤 1: 创建一个子查询，用于计算每个 security_id 的最新日期
-            # SQL: SELECT security_id, MAX(date) AS max_date FROM daily_prices GROUP BY security_id
-            subquery = (
-                select(
-                    DailyPrice.security_id,
-                    func.max(DailyPrice.date).label('max_date')
+        if dry_run:
+            with db_manager.get_session() as session:
+                # 子查询：计算每个 security_id 的最新日期
+                # SQL: SELECT security_id, MAX(date) AS max_date FROM daily_prices GROUP BY security_id
+                subquery = (
+                    select(
+                        DailyPrice.security_id,
+                        func.max(DailyPrice.date).label('max_date')
+                    )
+                    .group_by(DailyPrice.security_id)
+                    .subquery('latest_dates')  # 将其转换为一个命名的子查询
                 )
-                .group_by(DailyPrice.security_id)
-                .subquery('latest_dates')  # 将其转换为一个命名的子查询
-            )
 
-            if dry_run:
                 logger.info("--- [模拟运行] ---")
                 logger.info("将查找需要更新的记录...")
                 # 在模拟运行时，我们查询出需要更新的股票及其新旧日期
@@ -87,31 +87,12 @@ def calibrate_latest_price_dates(db_manager: DatabaseManager, dry_run: bool = Fa
                                 f"目标日期: {row.max_date}")
                 logger.info("--- [模拟运行结束] ---")
 
-            else:
-                # 步骤 2: 构建 UPDATE 语句
-                # 使用 SQLAlchemy Core 的多表 UPDATE 语法 (PostgreSQL 支持)
-                # SQL: UPDATE securities
-                #      SET price_data_latest_date = ld.max_date
-                #      FROM latest_dates ld
-                #      WHERE securities.id = ld.security_id
-                #        AND (securities.price_data_latest_date IS NULL OR securities.price_data_latest_date != ld.max_date);
-                stmt = (
-                    update(Security)
-                    .values(price_data_latest_date=subquery.c.max_date)
-                    .where(Security.id == subquery.c.security_id)
-                    .where(
-                        (Security.price_data_latest_date != subquery.c.max_date) |
-                        (Security.price_data_latest_date.is_(None))
-                    )
-                )
-
-                # 步骤 3: 执行更新并获取受影响的行数
-                logger.info("正在执行批量更新操作...")
-                result = session.execute(stmt)
-                session.commit()
-
-                rows_affected = result.rowcount
-                logger.success(f"✅ 校准完成！成功更新了 {rows_affected} 条记录。")
+        else:
+            # 全表水位重算收口进 db_manager（IS DISTINCT FROM 守卫，
+            # 与旧的 != OR IS NULL 谓词逐行等价；无价格行的证券不触碰）。
+            logger.info("正在执行批量更新操作...")
+            rows_affected = db_manager.recalculate_price_latest_dates()
+            logger.success(f"✅ 校准完成！成功更新了 {rows_affected} 条记录。")
 
     except Exception as e:
         logger.opt(exception=e).error(f"校准过程中发生错误: {e}")
