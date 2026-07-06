@@ -27,6 +27,26 @@ ACTIONS_UPDATE_INTERVAL_DAYS = 90
 MAX_CONCURRENT_WORKERS = 8
 API_BATCH_SIZE = 100
 VENDOR_FACTOR_QUANT = Decimal("1.000000000000")
+# 同日冲突拆股隔离的持久工件（追加写），镜像归档路径的 quarantine_detail.tsv——
+# 仅靠 WARNING 日志没有人工裁决队列，遗漏的真实拆股会静默悬置
+SPLIT_QUARANTINE_TSV = os.path.join(project_root, "logs", "split_conflict_quarantine.tsv")
+
+
+def _record_split_quarantine(security: Security, ex_date: date, group: list[dict]) -> None:
+    from datetime import datetime, timezone
+    try:
+        os.makedirs(os.path.dirname(SPLIT_QUARANTINE_TSV), exist_ok=True)
+        is_new = not os.path.exists(SPLIT_QUARANTINE_TSV)
+        with open(SPLIT_QUARANTINE_TSV, "a", encoding="utf-8") as fh:
+            if is_new:
+                fh.write("recorded_at_utc\tsecurity_id\tsymbol\tex_date\tsource_event_id\tsplit_from\tsplit_to\n")
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            for item in group:
+                sf, st = _split_ratio_repr(item)
+                fh.write(f"{now}\t{security.id}\t{security.symbol}\t{ex_date}\t"
+                         f"{item.get('source_event_id') or ''}\t{sf}\t{st}\n")
+    except OSError as e:
+        logger.opt(exception=e).error("拆股隔离 TSV 写入失败（不影响本批处理）: {}", SPLIT_QUARANTINE_TSV)
 
 
 def _infer_currency(security: Security) -> str | None:
@@ -141,6 +161,56 @@ def _format_factor_key_decimal(value) -> str | None:
         return str(value)
 
 
+def _split_ratio_repr(item: dict) -> tuple[str | None, str | None]:
+    """拆股比例的规范化字符串对（15 与 15.0000 同形），同归档 sift_splits 的 _fmt 口径。"""
+    return (
+        _format_factor_key_decimal(item.get("split_from")),
+        _format_factor_key_decimal(item.get("split_to")),
+    )
+
+
+def _sift_same_day_splits(security: Security, items: list[dict], results_counter: Counter) -> list[dict]:
+    """同日冲突拆股守卫，镜像归档导入的 R9/R10（import_corporate_actions_archive.sift_splits）。
+
+    vendor 会对同一 (ticker, 执行日) 双发拆股且比例互斥（TSM 实测）：
+    - 同日比例位级一致的精确重复只保留 source_event_id 最小的一条（R9 保留规则的
+      无 prod 侧回退分支——live 路径不读库，取不到 prod 已存在 id 的优先项）；
+    - 同日出现多个不同 (split_from, split_to) 规范形式即冲突，全组不落库、不写
+      vendor 因子行，响亮告警留人工裁决（R10）——静默 upsert 任意一条都会污染复权因子链。
+    """
+    if len(items) < 2:
+        return items
+    groups: dict[date, list[dict]] = defaultdict(list)
+    passthrough: list[dict] = []
+    for item in items:
+        ex_date = _event_ex_date(item)
+        if ex_date is None:
+            passthrough.append(item)  # 无执行日的行维持现状：由 upsert_splits 自行丢弃
+        else:
+            groups[ex_date].append(item)
+    kept: list[dict] = []
+    for ex_date in sorted(groups):
+        group = groups[ex_date]
+        if len({_split_ratio_repr(item) for item in group}) > 1:
+            results_counter["SPLIT_CONFLICT_QUARANTINED"] += len(group)
+            _record_split_quarantine(security, ex_date, group)
+            logger.warning(
+                "[{}] 同日 {} 出现 {} 条比例互斥的拆股事件，全组隔离不落库，须人工裁决: {}",
+                security.symbol, ex_date, len(group),
+                "; ".join(
+                    f"{item.get('source_event_id') or '?'}"
+                    f"={_split_ratio_repr(item)[0]}:{_split_ratio_repr(item)[1]}"
+                    for item in group
+                ),
+            )
+            continue
+        if len(group) > 1:
+            results_counter["SPLIT_DUPLICATE_DROPPED"] += len(group) - 1
+            group = [min(group, key=lambda item: str(item.get("source_event_id") or ""))]
+        kept.extend(group)
+    return kept + passthrough
+
+
 def _build_vendor_factor_rows(
     security: Security,
     dividends: list[dict],
@@ -225,7 +295,11 @@ def process_batch(
         symbol = security.symbol
         try:
             security_dividends = _clamp_to_list_date(security, _strip_ticker(dividends_by_symbol.get(symbol, [])))
-            security_splits = _clamp_to_list_date(security, _strip_ticker(splits_by_symbol.get(symbol, [])))
+            security_splits = _sift_same_day_splits(
+                security,
+                _clamp_to_list_date(security, _strip_ticker(splits_by_symbol.get(symbol, []))),
+                results_counter,
+            )
 
             if security_dividends:
                 inferred_currency = _infer_currency(security)
@@ -282,10 +356,20 @@ def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseMan
     logger.info("  成功(仅重复): {}", results_counter["SUCCESS_DUPLICATE_ONLY"])
     logger.info("  成功(无 actions): {}", results_counter["SUCCESS_NO_ACTIONS"])
     logger.info("  错误: {}", results_counter["ERROR"] + results_counter["FATAL_ERROR"])
+    if results_counter["SPLIT_CONFLICT_QUARANTINED"]:
+        logger.warning(
+            "  同日冲突拆股隔离: {} 条（比例互斥未落库，须人工裁决，明细见上方 WARNING）",
+            results_counter["SPLIT_CONFLICT_QUARANTINED"],
+        )
     logger.info("--------------------")
     errors = results_counter["ERROR"] + results_counter["FATAL_ERROR"]
     exit_code = 1 if errors else 0
-    stats = {"processed": len(securities), "written": total_changed, "failed": errors}
+    stats = {
+        "processed": len(securities),
+        "written": total_changed,
+        "failed": errors,
+        "split_conflicts_quarantined": results_counter["SPLIT_CONFLICT_QUARANTINED"],
+    }
     return exit_code, stats
 
 

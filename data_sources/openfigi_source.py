@@ -8,9 +8,11 @@
 由 scripts/sync_openfigi_identifiers.py 编排。
 
 候选归并口径：一个 CUSIP 常返回多交易所多行，按 compositeFIGI 去重——
-唯一 compositeFIGI 视为 MATCHED；多个不同 compositeFIGI 视为 AMBIGUOUS
-（figi/ticker 等字段全置 None，仅保留第一条的 name 供诊断）；
-空 data / warning / error 视为 NOT_FOUND。
+唯一 compositeFIGI 视为 MATCHED；多个不同 compositeFIGI 时先做 US composite
+消歧（跨市场多上市——ADR 典型——会带出他国 composite，exchCode='US' 的行
+即美国 composite；恰有一个不同的 US composite -> 以它 MATCHED），仍无法
+唯一化才视为 AMBIGUOUS（figi/ticker 等字段全置 None，仅保留第一条的 name
+供诊断）；空 data / warning / error 视为 NOT_FOUND。
 """
 from __future__ import annotations
 
@@ -64,6 +66,31 @@ def _empty_result(status: str) -> dict[str, Any]:
         "market_sector": None,
         "exch_code": None,
     }
+
+
+def _matched_result(composite_figi: Any, candidate: dict[str, Any]) -> dict[str, Any]:
+    result = _empty_result("MATCHED")
+    result["composite_figi"] = composite_figi
+    for field_name, vendor_key in _CANDIDATE_FIELD_MAP.items():
+        result[field_name] = candidate.get(vendor_key)
+    return result
+
+
+def _pick_unique_us_composite(candidates: list[Any]) -> dict[str, Any] | None:
+    """多 compositeFIGI 消歧：exchCode='US' 的行是美国 composite 本体
+    （UN/UW 等是其下属交易所行，带同一 compositeFIGI）。恰有一个不同的
+    US composite -> 返回该行；零个或多个不同 -> None（保持 AMBIGUOUS）。
+    compositeFIGI 缺失的 US 行不构成锚点。"""
+    us_rows = [
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, dict)
+        and (candidate.get("exchCode") or "").strip().upper() == "US"
+        and candidate.get("compositeFIGI")
+    ]
+    if len({row["compositeFIGI"] for row in us_rows}) != 1:
+        return None
+    return us_rows[0]
 
 
 class OpenFigiSource:
@@ -208,7 +235,12 @@ class OpenFigiSource:
             return _empty_result("NOT_FOUND")
 
         if len(by_figi) > 1:
-            # 多个不同 compositeFIGI：真歧义。figi/ticker 等字段全置 None，
+            # 多个不同 compositeFIGI：先尝试 US composite 消歧——跨市场多上市
+            # （退市旗舰 ADR 的 13F 挂链唯一通道）常见他国 composite 混入。
+            us_composite = _pick_unique_us_composite(candidates)
+            if us_composite is not None:
+                return _matched_result(us_composite.get("compositeFIGI"), us_composite)
+            # 零个或多个不同 US composite：真歧义。figi/ticker 等字段全置 None，
             # 仅保留第一条候选的 name 供人工诊断。
             result = _empty_result("AMBIGUOUS")
             first = candidates[0] if isinstance(candidates[0], dict) else {}
@@ -216,11 +248,7 @@ class OpenFigiSource:
             return result
 
         composite_figi, first = next(iter(by_figi.items()))
-        result = _empty_result("MATCHED")
-        result["composite_figi"] = composite_figi
-        for field_name, vendor_key in _CANDIDATE_FIELD_MAP.items():
-            result[field_name] = first.get(vendor_key)
-        return result
+        return _matched_result(composite_figi, first)
 
     def map_cusips(self, cusips: list[str]) -> dict[str, dict]:
         """批量映射 CUSIP -> FIGI。返回 {cusip: 归并结果}，key 为清洗后的大写 CUSIP。

@@ -35,6 +35,7 @@ if project_root not in sys.path:
 from data_models.models import Security
 from data_sources.massive_source import MassiveSource
 from db_manager import DatabaseManager
+from utils.massive_config import ALLOWED_US_SECURITY_TYPES
 from utils.massive_task import build_standard_parser, run_concurrently, run_massive_task
 from utils.trading_calendar import get_last_completed_trading_date
 
@@ -82,7 +83,7 @@ def get_securities_to_update(db_manager: DatabaseManager, args: argparse.Namespa
         query = (
             session.query(Security)
             .filter(Security.market.ilike("US"))
-            .filter(Security.type.in_(["CS", "ETF"]))
+            .filter(Security.type.in_(ALLOWED_US_SECURITY_TYPES))
             .filter(or_(Security.is_active.is_(True), Security.delist_date >= start))
         )
         if args.symbols:

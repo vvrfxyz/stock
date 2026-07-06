@@ -71,4 +71,50 @@ CURATED_CONCEPTS: dict[str, set[str]] = {
         "EntityCommonStockSharesOutstanding",
         "EntityPublicFloat",
     },
+    # IFRS 申报方（20-F/40-F 的 ADR：TSM、BABA 等）在 companyfacts 里挂 "ifrs-full"
+    # taxonomy；概念名与 us-gaap 块经济口径一一对应（IFRS 官方元素名，驼峰原文）。
+    "ifrs-full": {
+        # --- 利润表 ---
+        "Revenue",
+        "RevenueFromContractsWithCustomers",  # IFRS 15
+        "CostOfSales",
+        "GrossProfit",
+        "ResearchAndDevelopmentExpense",
+        "SellingGeneralAndAdministrativeExpense",
+        "DistributionCosts",  # IAS 1 按功能法拆分（部分申报方不报 SG&A 合计）
+        "AdministrativeExpense",
+        "ProfitLossFromOperatingActivities",
+        "ProfitLossBeforeTax",
+        "IncomeTaxExpenseContinuingOperations",
+        "ProfitLoss",
+        "ProfitLossAttributableToOwnersOfParent",
+        "BasicEarningsLossPerShare",
+        "DilutedEarningsLossPerShare",
+        "WeightedAverageShares",  # basic 加权股数
+        "AdjustedWeightedAverageShares",  # diluted 加权股数
+        # --- 资产负债表 ---
+        "Assets",
+        "CurrentAssets",
+        "CashAndCashEquivalents",
+        "TradeAndOtherCurrentReceivables",
+        "Inventories",
+        "Liabilities",
+        "CurrentLiabilities",
+        "Borrowings",
+        "ShorttermBorrowings",
+        "LongtermBorrowings",
+        "Equity",
+        "EquityAttributableToOwnersOfParent",
+        "NumberOfSharesIssued",
+        "NumberOfSharesOutstanding",
+        # --- 现金流量表 ---
+        "CashFlowsFromUsedInOperatingActivities",
+        "CashFlowsFromUsedInInvestingActivities",
+        "CashFlowsFromUsedInFinancingActivities",
+        "PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities",
+        "DepreciationAndAmortisationExpense",
+        "DividendsPaidClassifiedAsFinancingActivities",
+        "DividendsPaidToEquityHoldersOfParentClassifiedAsFinancingActivities",
+        "PaymentsToAcquireOrRedeemEntitysShares",
+    },
 }

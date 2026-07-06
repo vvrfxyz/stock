@@ -32,6 +32,7 @@ from db_manager import DatabaseManager
 from utils.adjusted_prices import get_adjusted_daily_bars
 from utils.key_rate_limiter import KeyRateLimiter
 from utils.massive_config import (
+    ALLOWED_US_SECURITY_TYPES,
     MASSIVE_RATE_LIMIT,
     MASSIVE_RATE_SECONDS,
     get_massive_api_keys,
@@ -60,6 +61,7 @@ def create_parser() -> argparse.ArgumentParser:
 def pick_sample(db_manager: DatabaseManager, sample_size: int, window_start: date, seed: int) -> list[str]:
     quota = max(sample_size // 4, 1)
     with db_manager.engine.connect() as conn:
+        # 有意 CS-only：大市值分层按普通股口径抽样，不随白名单类型扩展
         mega = [r[0] for r in conn.execute(text(
             """SELECT symbol FROM securities
                WHERE is_active AND upper(type)='CS' AND upper(market)='US' AND market_cap IS NOT NULL
@@ -67,19 +69,21 @@ def pick_sample(db_manager: DatabaseManager, sample_size: int, window_start: dat
         splitters = [r[0] for r in conn.execute(text(
             """SELECT DISTINCT s.symbol FROM securities s
                JOIN corporate_actions ca ON ca.security_id = s.id
-               WHERE s.is_active AND upper(s.type) IN ('CS','ETF') AND upper(s.market)='US'
+               WHERE s.is_active AND upper(s.type) = ANY(:allowed_types) AND upper(s.market)='US'
                  AND ca.action_type='SPLIT' AND ca.ex_date >= :ws
-               ORDER BY s.symbol LIMIT :n"""), {"ws": window_start, "n": quota * 3})]
+               ORDER BY s.symbol LIMIT :n"""),
+            {"ws": window_start, "n": quota * 3, "allowed_types": list(ALLOWED_US_SECURITY_TYPES)})]
         payers = [r[0] for r in conn.execute(text(
             """SELECT DISTINCT s.symbol FROM securities s
                JOIN corporate_actions ca ON ca.security_id = s.id
-               WHERE s.is_active AND upper(s.type) IN ('CS','ETF') AND upper(s.market)='US'
+               WHERE s.is_active AND upper(s.type) = ANY(:allowed_types) AND upper(s.market)='US'
                  AND ca.action_type='DIVIDEND' AND ca.ex_date >= :ws
-               ORDER BY s.symbol LIMIT :n"""), {"ws": window_start, "n": quota * 3})]
+               ORDER BY s.symbol LIMIT :n"""),
+            {"ws": window_start, "n": quota * 3, "allowed_types": list(ALLOWED_US_SECURITY_TYPES)})]
         universe = [r[0] for r in conn.execute(text(
             """SELECT symbol FROM securities
-               WHERE is_active AND upper(type) IN ('CS','ETF') AND upper(market)='US'
-               ORDER BY symbol"""))]
+               WHERE is_active AND upper(type) = ANY(:allowed_types) AND upper(market)='US'
+               ORDER BY symbol"""), {"allowed_types": list(ALLOWED_US_SECURITY_TYPES)})]
 
     rng = random.Random(seed)
     selected: list[str] = []

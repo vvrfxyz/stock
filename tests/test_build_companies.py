@@ -24,6 +24,18 @@ def _row(security_id, symbol, *, name=None, cik="0000000001", is_active=True):
 # 纯逻辑
 # ---------------------------------------------------------------------------
 
+class TestCompanyEquityTypes:
+    """锁定归组类型白名单——本脚本的 ETF 隔离不变量依赖它。"""
+
+    def test_exact_contents(self):
+        # CS + ADR 家族，缺一多一都算破坏口径（ADR 全域入库 2026-07 定稿）
+        assert build_companies.COMPANY_EQUITY_TYPES == ("CS", "ADRC", "ADRP", "ADRR")
+
+    def test_etf_never_included(self):
+        # ETF 发行人 CIK ≠ 基金实体；一旦有人把共享常量（含 ETF）接进来，这里必须先红
+        assert "ETF" not in build_companies.COMPANY_EQUITY_TYPES
+
+
 class TestBuildGrouping:
     def test_groups_by_cik_and_sorts_members(self):
         groups = build_companies.build_grouping([
@@ -191,6 +203,18 @@ class TestBuildCompaniesApply:
         assert _scalar(pg_db, "SELECT company_id FROM securities WHERE id=1") is not None
         assert _scalar(pg_db, "SELECT company_id FROM securities WHERE id=2") is None
         assert _scalar(pg_db, "SELECT company_id FROM securities WHERE id=3") is None
+
+    def test_adr_rows_grouped_like_cs(self, pg_db, tmp_path):
+        # ADR 家族（COMPANY_EQUITY_TYPES）与 CS 同口径归组；同 CIK 的 ETF 仍隔离
+        _insert_security(pg_db, 1, "tsm", name="Taiwan Semiconductor ADR",
+                         sec_type="ADRC", cik="0001046179")
+        _insert_security(pg_db, 2, "tsmetf", name="TSM Trust ETF",
+                         sec_type="ETF", cik="0001046179")
+
+        assert build_companies.run(_args(tmp_path, "--apply"), pg_db) == 0
+
+        assert _scalar(pg_db, "SELECT company_id FROM securities WHERE id=1") is not None
+        assert _scalar(pg_db, "SELECT company_id FROM securities WHERE id=2") is None
 
     def test_delisted_only_cik_grouped_and_null_cik_left_alone(self, pg_db, tmp_path):
         _insert_security(pg_db, 1, "dead1", name="Dead Corp", cik="0000000009", is_active=False)

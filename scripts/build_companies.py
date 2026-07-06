@@ -1,8 +1,8 @@
-"""companies 初始归组：按 CIK 把 US CS 证券归入公司实体（PERMCO 等价物）。
+"""companies 初始归组：按 CIK 把 US 公司型证券归入公司实体（PERMCO 等价物）。
 
-第一期范围（todo_crsp_grade_2026-07 任务 2）：**只做 CS**（活跃 + 退市）。
-ETF 发行人 CIK 与基金实体是两回事，绝不给 ETF 归组。cik 为 NULL 的 CS 留空
-（多为老退市——任务 4 补 CIK 后自然入组）。
+范围：COMPANY_EQUITY_TYPES（CS + ADR 家族，活跃 + 退市；ADR 自 2026-07
+ADR 全域入库起纳入）。ETF 发行人 CIK 与基金实体是两回事，绝不给 ETF 归组。
+cik 为 NULL 的行留空（多为老退市——补 CIK 后自然入组）。
 
 流程：
   (a) 从 securities 取全部 US CS（cik 非空）按 CIK 归组，公司名 seed 取
@@ -49,6 +49,12 @@ SUMMARY_REPORT = "companies_grouping_summary.tsv"
 # 验收探针：已知双类股，两腿必须归同一 company（symbol 库内小写）。
 ACCEPTANCE_PAIRS = (("goog", "googl"), ("brk.a", "brk.b"))
 
+# 公司归组类型白名单：CS + ADR 家族（发行实体有真实 CIK）。
+# 永不含 ETF——ETF 发行人 CIK ≠ 基金实体，归组即污染
+# （tests/test_build_companies.py 的 ETF 隔离测试锁定此不变量）。
+# 因此本脚本绝不 import ALLOWED_US_SECURITY_TYPES（该共享常量含 ETF）。
+COMPANY_EQUITY_TYPES = ("CS", "ADRC", "ADRP", "ADRR")
+
 
 def setup_logging():
     configure_script_logging("build_companies")
@@ -78,18 +84,19 @@ def create_parser() -> argparse.ArgumentParser:
 # ------------------------------------------------------------------ #
 
 def fetch_cs_rows(db_manager) -> list[dict]:
-    """全部 US CS（cik 非空）——活跃 + 退市。ETF 从不进入本查询。"""
+    """全部 US COMPANY_EQUITY_TYPES 证券（cik 非空）——活跃 + 退市。ETF 从不进入本查询。"""
     sql = text(
         """
         select id, symbol, name, cik, is_active
         from securities
-        where market = 'US' and type = 'CS'
+        where market = 'US' and type = any(:company_types)
           and cik is not null and btrim(cik) <> ''
         order by cik, id
         """
     )
     with db_manager.engine.connect() as conn:
-        return [dict(row) for row in conn.execute(sql).mappings()]
+        return [dict(row) for row in conn.execute(
+            sql, {"company_types": list(COMPANY_EQUITY_TYPES)}).mappings()]
 
 
 def _seed_name(members: list[dict]) -> str | None:
@@ -195,14 +202,15 @@ def find_reassign_conflicts(db_manager) -> list[dict]:
                s.company_id as old_company_id, oc.cik as old_company_cik
         from securities s
         join companies oc on oc.id = s.company_id
-        where s.market = 'US' and s.type = 'CS'
+        where s.market = 'US' and s.type = any(:company_types)
           and s.cik is not null and btrim(s.cik) <> ''
           and oc.cik is distinct from btrim(s.cik)
         order by s.id
         """
     )
     with db_manager.engine.connect() as conn:
-        return [dict(row) for row in conn.execute(sql).mappings()]
+        return [dict(row) for row in conn.execute(
+            sql, {"company_types": list(COMPANY_EQUITY_TYPES)}).mappings()]
 
 
 def _write_tsv(path: str, rows: list[dict], columns: list[str]) -> None:
@@ -241,7 +249,7 @@ def apply_grouping(db_manager, groups: dict[str, dict], *, allow_reassign: bool)
     公司名缺失时省略 name 键（upsert_companies 冲突时不会把既有名覆盖成 NULL）。
     回填分两条腿：NULL -> 值 的新挂无条件执行；非 NULL -> 不同值 的改挂只在
     --allow-reassign 下执行（默认腿保证幂等重跑是 no-op）。UPDATE 限定
-    type='CS' AND market='US'——ETF 即便同 cik 也绝不触碰。
+    type = any(COMPANY_EQUITY_TYPES) AND market='US'——ETF 即便同 cik 也绝不触碰。
     """
     company_rows = []
     for cik in sorted(groups):
@@ -254,6 +262,7 @@ def apply_grouping(db_manager, groups: dict[str, dict], *, allow_reassign: bool)
 
     linked = 0
     reassigned = 0
+    params = {"company_types": list(COMPANY_EQUITY_TYPES)}
     with db_manager.engine.connect() as conn:
         # btrim(s.cik) 与 build_grouping 的 Python strip 同口径——万一存在带
         # 空白的 cik，归组键与回填 join 键也不会分叉。
@@ -263,10 +272,10 @@ def apply_grouping(db_manager, groups: dict[str, dict], *, allow_reassign: bool)
             set company_id = c.id
             from companies c
             where btrim(s.cik) = c.cik
-              and s.type = 'CS' and s.market = 'US'
+              and s.type = any(:company_types) and s.market = 'US'
               and s.company_id is null
             """
-        )).rowcount or 0
+        ), params).rowcount or 0
         if allow_reassign:
             reassigned = conn.execute(text(
                 """
@@ -274,11 +283,11 @@ def apply_grouping(db_manager, groups: dict[str, dict], *, allow_reassign: bool)
                 set company_id = c.id
                 from companies c
                 where btrim(s.cik) = c.cik
-                  and s.type = 'CS' and s.market = 'US'
+                  and s.type = any(:company_types) and s.market = 'US'
                   and s.company_id is not null
                   and s.company_id <> c.id
                 """
-            )).rowcount or 0
+            ), params).rowcount or 0
         conn.commit()
     return companies_written, linked, reassigned
 
@@ -303,11 +312,12 @@ def coverage_stats(db_manager) -> dict:
           count(*) filter (where cik is not null and btrim(cik) <> ''
                            and btrim(cik) !~ '^[0-9]{10}$') as malformed_cik
         from securities
-        where market = 'US' and type = 'CS'
+        where market = 'US' and type = any(:company_types)
         """
     )
     with db_manager.engine.connect() as conn:
-        return dict(conn.execute(sql).mappings().one())
+        return dict(conn.execute(
+            sql, {"company_types": list(COMPANY_EQUITY_TYPES)}).mappings().one())
 
 
 def _pct(numerator: int, denominator: int) -> str:

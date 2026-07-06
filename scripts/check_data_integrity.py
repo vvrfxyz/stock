@@ -15,6 +15,7 @@ if project_root not in sys.path:
 
 from db_manager import DatabaseManager
 from data_models.models import Security, DailyPrice
+from utils.massive_config import ALLOWED_US_SECURITY_TYPES
 from utils.script_logging import setup_logging as configure_script_logging
 
 
@@ -176,10 +177,10 @@ def check_active_list_date_coverage(session, limit: int) -> int:
         SELECT COUNT(*) AS n
         FROM securities
         WHERE is_active IS TRUE AND upper(market) = 'US'
-          AND upper(type) IN ('CS', 'ETF') AND list_date IS NULL
+          AND upper(type) = ANY(:allowed_types) AND list_date IS NULL
         """
     )
-    n = session.execute(sql).scalar_one()
+    n = session.execute(sql, {"allowed_types": list(ALLOWED_US_SECURITY_TYPES)}).scalar_one()
     if n > 50:
         logger.error("活跃 US CS/ETF 中 {} 只 list_date 为 NULL（阈值 50）——疑似每日同步再度抹除。", n)
         return n
@@ -251,7 +252,7 @@ def check_calendar_gaps(session, limit: int, window_start: date, min_sessions: i
             FROM securities s
             JOIN daily_prices dp ON dp.security_id = s.id
             WHERE s.is_active IS TRUE
-              AND upper(s.type) IN ('CS', 'ETF')
+              AND upper(s.type) = ANY(:allowed_types)
               AND upper(s.market) = 'US'
             GROUP BY s.id, s.symbol
             HAVING MAX(dp.date) >= CAST(:window_start AS date)
@@ -283,7 +284,8 @@ def check_calendar_gaps(session, limit: int, window_start: date, min_sessions: i
         ORDER BY missing_sessions DESC, symbol
         """
     )
-    rows = session.execute(sql, {"window_start": window_start, "min_sessions": min_sessions}).all()
+    rows = session.execute(sql, {"window_start": window_start, "min_sessions": min_sessions,
+                                 "allowed_types": list(ALLOWED_US_SECURITY_TYPES)}).all()
     _report_rows(
         f"交易日缺口（{window_start} 起，连续缺失 >= {min_sessions} 个交易日）",
         len(rows),
@@ -363,7 +365,7 @@ def check_unexplained_jumps(session, limit: int, window_start: date, threshold: 
             WHERE dp.date >= :window_start
               AND dp.close IS NOT NULL
               AND s.is_active IS TRUE
-              AND upper(s.type) IN ('CS', 'ETF')
+              AND upper(s.type) = ANY(:allowed_types)
               AND upper(s.market) = 'US'
         )
         SELECT m.security_id, m.symbol, m.date, m.prev_close, m.close,
@@ -379,7 +381,8 @@ def check_unexplained_jumps(session, limit: int, window_start: date, threshold: 
         ORDER BY ABS(m.close / NULLIF(m.prev_close, 0) - 1) DESC
         """
     )
-    rows = session.execute(sql, {"window_start": window_start, "threshold": threshold}).all()
+    rows = session.execute(sql, {"window_start": window_start, "threshold": threshold,
+                                 "allowed_types": list(ALLOWED_US_SECURITY_TYPES)}).all()
     if not rows:
         logger.success(f"✅ 无事件大跳变预警（{window_start} 起，阈值 {threshold:.0%}）: OK")
         return 0

@@ -13,6 +13,11 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.massive_config import ALLOWED_US_SECURITY_TYPES
+
 DEFAULT_PROGRESS_PATH = PROJECT_ROOT / "logs" / "massive_shares_chunks_2026-05-15.jsonl"
 
 
@@ -64,12 +69,18 @@ def get_symbols(market: str) -> list[str]:
         select symbol
         from securities
         where upper(market) = :market
-          and upper(type) in ('CS', 'ETF')
+          and upper(type) = ANY(:allowed_types)
         order by symbol asc
         """
     )
     with engine.connect() as conn:
-        return [row[0] for row in conn.execute(query, {"market": market.upper()})]
+        return [
+            row[0]
+            for row in conn.execute(
+                query,
+                {"market": market.upper(), "allowed_types": list(ALLOWED_US_SECURITY_TYPES)},
+            )
+        ]
 
 
 def iter_chunks(items: list[str], chunk_size: int):

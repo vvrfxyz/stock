@@ -31,7 +31,7 @@ from utils.script_logging import setup_logging as configure_script_logging
 
 DEFAULT_FORMS = {
     "10-K", "10-K/A", "10-Q", "10-Q/A", "8-K", "8-K/A",
-    "20-F", "20-F/A", "40-F", "6-K",
+    "20-F", "20-F/A", "40-F", "40-F/A", "6-K", "6-K/A",
     "DEF 14A", "DEFA14A",
     "3", "4", "5", "3/A", "4/A", "5/A",
     "13F-HR", "13F-HR/A",

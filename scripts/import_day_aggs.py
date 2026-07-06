@@ -51,6 +51,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from db_manager import DatabaseManager
+from utils.massive_config import ALLOWED_US_SECURITY_TYPES
 from utils.script_logging import setup_logging as configure_script_logging
 
 IMPORTABLE_TICKER = re.compile(r"^[A-Z][A-Z0-9.]*$")
@@ -162,8 +163,8 @@ def load_tenures(db_manager: DatabaseManager) -> dict[str, list[tuple[int, date,
             SELECT s.id, s.symbol, s.list_date, s.delist_date, s.is_active,
                    (SELECT MAX(dp.date) FROM daily_prices dp WHERE dp.security_id = s.id) AS max_bar
             FROM securities s
-            WHERE upper(s.market) = 'US' AND upper(s.type) IN ('CS', 'ETF')
-        """)).all()
+            WHERE upper(s.market) = 'US' AND upper(s.type) = ANY(:allowed_types)
+        """), {"allowed_types": list(ALLOWED_US_SECURITY_TYPES)}).all()
         hist = session.execute(text("""
             SELECT security_id, lower(symbol) AS symbol, start_date, end_date
             FROM security_symbol_history

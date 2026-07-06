@@ -95,6 +95,7 @@ def test_multi_exchange_candidates_merge_to_single_matched(sleep_calls):
 
 
 def test_distinct_composite_figis_yield_ambiguous(sleep_calls):
+    # _candidate 默认 exchCode='US'：两个不同的 US composite -> 消歧不了，保持 AMBIGUOUS
     session = FakeSession(
         [
             FakeResponse(
@@ -121,6 +122,114 @@ def test_distinct_composite_figis_yield_ambiguous(sleep_calls):
     assert row["market_sector"] is None
     assert row["exch_code"] is None
     assert row["name"] == "FIRST CO"  # 保留第一条 name 供诊断
+
+
+def test_unique_us_composite_disambiguates_multi_listing_to_matched(sleep_calls):
+    # ADR 跨市场多上市（BABA 型）：他国 composite + 唯一 US composite（含其
+    # 下属交易所行同 FIGI）-> 以 US composite MATCHED，字段取 US 行
+    session = FakeSession(
+        [
+            FakeResponse(
+                [
+                    {
+                        "data": [
+                            _candidate("BBG00KVTBY91", exchCode="HK", ticker="9988",
+                                       name="ALIBABA GROUP HOLDING LTD"),
+                            _candidate("BBG006G2JVL2", exchCode="US", ticker="BABA",
+                                       name="ALIBABA GRP-ADR"),
+                            _candidate("BBG006G2JVL2", exchCode="UN", ticker="BABA",
+                                       name="ALIBABA GRP-ADR"),
+                        ]
+                    }
+                ]
+            )
+        ]
+    )
+    source = OpenFigiSource(api_key="", session=session)
+
+    row = source.map_cusips(["01609W102"])["01609W102"]
+
+    assert row["status"] == "MATCHED"
+    assert row["composite_figi"] == "BBG006G2JVL2"
+    assert row["share_class_figi"] == "BBG006G2JVL2-SC"
+    assert row["ticker"] == "BABA"
+    assert row["name"] == "ALIBABA GRP-ADR"
+    assert row["exch_code"] == "US"
+
+
+def test_multi_composite_zero_us_stays_ambiguous(sleep_calls):
+    session = FakeSession(
+        [
+            FakeResponse(
+                [
+                    {
+                        "data": [
+                            _candidate("BBG000AAAAA1", exchCode="LN", name="FIRST CO"),
+                            _candidate("BBG000BBBBB2", exchCode="GR", name="SECOND CO"),
+                        ]
+                    }
+                ]
+            )
+        ]
+    )
+    source = OpenFigiSource(api_key="", session=session)
+
+    row = source.map_cusips(["12345678X"])["12345678X"]
+
+    assert row["status"] == "AMBIGUOUS"
+    assert row["composite_figi"] is None
+    assert row["name"] == "FIRST CO"
+
+
+def test_multi_composite_multiple_us_composites_stay_ambiguous(sleep_calls):
+    session = FakeSession(
+        [
+            FakeResponse(
+                [
+                    {
+                        "data": [
+                            _candidate("BBG000AAAAA1", exchCode="US", name="US ONE"),
+                            _candidate("BBG000BBBBB2", exchCode="US", name="US TWO"),
+                            _candidate("BBG000CCCCC3", exchCode="LN", name="FOREIGN"),
+                        ]
+                    }
+                ]
+            )
+        ]
+    )
+    source = OpenFigiSource(api_key="", session=session)
+
+    row = source.map_cusips(["12345678X"])["12345678X"]
+
+    assert row["status"] == "AMBIGUOUS"
+    assert row["composite_figi"] is None
+    assert row["name"] == "US ONE"
+
+
+def test_us_row_missing_composite_figi_is_not_an_anchor(sleep_calls):
+    # exchCode='US' 但 compositeFIGI 缺失的行不构成消歧锚点
+    session = FakeSession(
+        [
+            FakeResponse(
+                [
+                    {
+                        "data": [
+                            _candidate(None, exchCode="US", name="NO FIGI US"),
+                            _candidate("BBG000AAAAA1", exchCode="LN"),
+                            _candidate("BBG000BBBBB2", exchCode="GR"),
+                        ]
+                    }
+                ]
+            )
+        ]
+    )
+    source = OpenFigiSource(api_key="", session=session)
+
+    row = source.map_cusips(["12345678X"])["12345678X"]
+
+    assert row["status"] == "AMBIGUOUS"
+    assert row["composite_figi"] is None
+    assert row["name"] == "NO FIGI US"
 
 
 def test_warning_and_empty_data_are_not_found(sleep_calls):

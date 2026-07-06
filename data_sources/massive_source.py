@@ -16,7 +16,7 @@ from requests.exceptions import RequestException
 
 from data_sources.base import DataSourceInterface
 from utils.key_rate_limiter import KeyRateLimiter
-from utils.massive_config import MASSIVE_BASE_URL, iter_chunks, is_supported_us_security_type
+from utils.massive_config import MASSIVE_BASE_URL, iter_chunks
 from utils.secret_masking import (
     mask_api_key_in_url as _mask_api_key_in_url,
     mask_api_keys_in_text as _mask_api_keys_in_text,
@@ -409,7 +409,7 @@ class MassiveSource(DataSourceInterface):
             results = [item for item in results if (item.get("locale") or "").upper() == locale_upper]
         if not allowed:
             return results
-        return [item for item in results if is_supported_us_security_type(item.get("type")) and (item.get("type") or "").upper() in allowed]
+        return [item for item in results if (item.get("type") or "").upper() in allowed]
 
     def list_delisted_tickers(
         self,

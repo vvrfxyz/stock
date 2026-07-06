@@ -1,14 +1,17 @@
 """import_corporate_actions_archive 纯逻辑单元测试：清洗规则（R3/R7-R11）+ 归属 + 值冲突挂起（R13）。"""
 from collections import Counter
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 import pandas as pd
 import pytest
 
 from scripts.import_corporate_actions_archive import (
+    build_ticker_cutoffs,
     dedupe_dividends,
     drop_already_imported,
+    effective_cutoff,
+    extended_security_cutoffs,
     holdback_mismatches,
     load_dividend_rows,
     load_split_rows,
@@ -214,6 +217,125 @@ class TestWindowFilter:
         rows = [_div("E1", "A", date(2027, 1, 1), "1")]
         kept = _window_filter(rows, date(2003, 1, 1), None, Counter(), "dividend", [])
         assert len(kept) == 1
+
+
+class TestPerSecurityCutoff:
+    """inactive 证券逐证券上界：live actions 只选活跃证券，[cutoff, delist_date]
+    两条路径都不覆盖，归档负责到 delist_date+1（exclusive，与任期上界同口径）。"""
+
+    CUTOFF = date(2024, 5, 14)
+    FAR = date(9999, 1, 1)
+
+    def _pipeline(self, rows, tenures, securities, cutoff=CUTOFF):
+        """按 main() 的接线走一遍：延长上界 -> symbol 粗筛 -> 归属层精确上界。"""
+        stats, quarantine, detail = Counter(), Counter(), []
+        security_cutoffs = extended_security_cutoffs(securities, cutoff) if cutoff else {}
+        ticker_cutoffs = build_ticker_cutoffs(tenures, security_cutoffs)
+        kept = _window_filter(rows, date(2003, 1, 1), cutoff, stats, "dividend",
+                              detail, ticker_cutoffs)
+        by_sec = resolve_events(kept, tenures, stats, quarantine, "dividend", detail,
+                                cutoff=cutoff, security_cutoffs=security_cutoffs)
+        return by_sec, stats
+
+    def test_effective_cutoff_formula(self):
+        c = self.CUTOFF
+        assert effective_cutoff(c, True, None) == c
+        # 活跃行残留 delist_date（脏数据）也不放宽：live 窗口神圣不可侵入
+        assert effective_cutoff(c, True, date(2025, 1, 1)) == c
+        # inactive 且 delist_date NULL：无可信上界，保守回退全局 cutoff
+        assert effective_cutoff(c, False, None) == c
+        assert effective_cutoff(c, False, date(2025, 3, 10)) == date(2025, 3, 11)
+        # max 语义：上界绝不早于全局 cutoff（cutoff 前退市的证券与旧口径无差别）
+        assert effective_cutoff(c, False, date(2023, 6, 1)) == c
+
+    def test_extended_map_only_contains_bounds_beyond_cutoff(self):
+        secs = [(1, True, None),                    # 活跃
+                (30, False, date(2025, 3, 10)),     # cutoff 后退市：放宽
+                (40, False, date(2023, 6, 1)),      # cutoff 前退市：无差异项
+                (50, False, None)]                  # NULL delist：回退全局
+        assert extended_security_cutoffs(secs, self.CUTOFF) == {30: date(2025, 3, 11)}
+
+    def test_build_ticker_cutoffs_takes_max_extended_bound(self):
+        tenures = {"a": [(1, date(2003, 1, 1), date(2020, 1, 1)),
+                         (2, date(2020, 1, 1), date(2025, 7, 2))],
+                   "b": [(3, date(2003, 1, 1), self.FAR)]}
+        cutoffs = {1: date(2024, 8, 1), 2: date(2025, 7, 2)}
+        assert build_ticker_cutoffs(tenures, cutoffs) == {"a": date(2025, 7, 2)}
+
+    def test_active_security_keeps_global_cutoff(self):
+        tenures = {"aapl": [(1, date(1980, 12, 12), self.FAR)]}
+        rows = [_div("E1", "AAPL", date(2024, 5, 13), "0.24"),
+                _div("E2", "AAPL", date(2024, 5, 14), "0.24"),
+                _div("E3", "AAPL", date(2025, 2, 10), "0.25")]
+        by_sec, stats = self._pipeline(rows, tenures, [(1, True, None)])
+        assert [r["id"] for r in by_sec[1]] == ["E1"]
+        assert stats["dividend_at_or_after_cutoff"] == 2
+
+    def test_inactive_delisted_after_cutoff_covered_through_delist_date(self):
+        # 洞的主体：cutoff 后退市的证券，[cutoff, delist_date] 现在归档负责
+        delist = date(2025, 3, 10)
+        tenures = {"dead": [(30, date(2010, 1, 4), delist + timedelta(days=1))]}
+        rows = [_div("E1", "DEAD", date(2024, 5, 14), "0.10"),   # cutoff 当天：导入
+                _div("E2", "DEAD", date(2025, 3, 10), "0.10"),   # 退市日当天：导入
+                _div("E3", "DEAD", date(2025, 3, 11), "0.10"),   # delist+1 起排除
+                _div("E4", "DEAD", date(2025, 6, 1), "0.10")]
+        by_sec, stats = self._pipeline(rows, tenures, [(30, False, delist)])
+        assert [r["id"] for r in by_sec[30]] == ["E1", "E2"]
+        assert stats["dividend_mapped"] == 2
+        assert stats["dividend_at_or_after_cutoff"] == 2
+        assert stats["dividend_out_of_tenure"] == 0
+
+    def test_inactive_delisted_before_cutoff_nothing_beyond_delist(self):
+        delist = date(2023, 6, 1)
+        tenures = {"old": [(40, date(2010, 1, 4), delist + timedelta(days=1))]}
+        rows = [_div("E1", "OLD", date(2023, 6, 1), "0.10"),    # 退市日：导入
+                _div("E2", "OLD", date(2023, 8, 1), "0.10"),    # 退市后 cutoff 前：任期外
+                _div("E3", "OLD", date(2024, 6, 1), "0.10")]    # cutoff 后
+        by_sec, stats = self._pipeline(rows, tenures, [(40, False, delist)])
+        assert [r["id"] for r in by_sec[40]] == ["E1"]
+        assert stats["dividend_out_of_tenure"] == 1
+        assert stats["dividend_at_or_after_cutoff"] == 1
+
+    def test_inactive_null_delist_date_falls_back_to_global_cutoff(self):
+        # 无可信退市日：不放宽；任期端点是 max_bar+1 代理（2024-08-01 有 bar）
+        tenures = {"zomb": [(50, date(2010, 1, 4), date(2024, 8, 2))]}
+        rows = [_div("E1", "ZOMB", date(2024, 4, 1), "0.10"),
+                _div("E2", "ZOMB", date(2024, 6, 3), "0.10")]   # cutoff 后、任期内：不导入
+        by_sec, stats = self._pipeline(rows, tenures, [(50, False, None)])
+        assert [r["id"] for r in by_sec[50]] == ["E1"]
+        assert stats["dividend_at_or_after_cutoff"] == 1
+
+    def test_recycled_symbol_active_successor_never_absorbs_live_window(self):
+        # §A.5：老主人退市 2025-03-10（放行到 03-11），新主人 03-11 起活跃；
+        # symbol 粗筛的延长绝不能把 live 窗口事件塞给活跃现任
+        delist = date(2025, 3, 10)
+        tenures = {"reuse": [(30, date(2010, 1, 4), date(2025, 3, 11)),
+                             (60, date(2025, 3, 11), self.FAR)]}
+        rows = [_div("E1", "REUSE", date(2025, 3, 10), "0.10"),  # 老主人退市日
+                _div("E2", "REUSE", date(2025, 3, 11), "0.10"),  # 新主人首日 = live 窗口
+                _div("E3", "REUSE", date(2024, 8, 1), "0.10")]   # 洞内，归老主人
+        by_sec, stats = self._pipeline(rows, tenures, [(30, False, delist), (60, True, None)])
+        assert sorted(r["id"] for r in by_sec[30]) == ["E1", "E3"]
+        assert 60 not in by_sec
+        assert stats["dividend_at_or_after_cutoff"] == 1
+
+    def test_resolve_level_backstop_enforces_active_cutoff(self):
+        # 归属层精确上界兜底：即使粗筛放行（脏数据令 symbol 上界过宽），
+        # 活跃证券也绝不吸收 >= 全局 cutoff 的归档事件
+        tenures = {"aapl": [(1, date(1980, 12, 12), self.FAR)]}
+        stats, quarantine = Counter(), Counter()
+        by_sec = resolve_events([_div("E1", "AAPL", date(2024, 6, 3), "0.25")],
+                                tenures, stats, quarantine, "dividend", [],
+                                cutoff=self.CUTOFF, security_cutoffs={})
+        assert not by_sec
+        assert stats["dividend_at_or_after_cutoff"] == 1
+        assert stats["dividend_mapped"] == 0
+
+    def test_cutoff_none_disables_all_bounds(self):
+        tenures = {"dead": [(30, date(2010, 1, 4), date(2025, 3, 11))]}
+        by_sec, _ = self._pipeline([_div("E1", "DEAD", date(2025, 3, 10), "0.10")],
+                                   tenures, [(30, False, date(2025, 3, 10))], cutoff=None)
+        assert len(by_sec[30]) == 1
 
 
 class TestHoldbackMismatches:

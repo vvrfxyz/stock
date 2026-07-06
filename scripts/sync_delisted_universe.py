@@ -37,9 +37,10 @@ if project_root not in sys.path:
 
 from data_sources.massive_source import MassiveSource
 from db_manager import DatabaseManager
+from utils.massive_config import ALLOWED_US_SECURITY_TYPES
 from utils.massive_task import run_concurrently, run_massive_task
 
-SUPPORTED_TYPES = {"CS", "ETF"}
+SUPPORTED_TYPES = frozenset(ALLOWED_US_SECURITY_TYPES)
 # symbol 兜底匹配时，vendor 退市日与库内 delist_date 允许的最大偏差
 DELIST_MATCH_TOLERANCE = timedelta(days=35)
 FILLABLE_FIELDS = ("delist_date", "cik", "composite_figi", "share_class_figi", "name", "exchange")
@@ -79,13 +80,16 @@ def _dedupe_entries(entries: list[dict]) -> list[dict]:
     return list(best.values())
 
 
-def classify_entries(entries: list[dict], existing_rows) -> tuple[list, list, Counter]:
+def classify_entries(entries: list[dict], existing_rows,
+                     match_log: list[dict] | None = None) -> tuple[list, list, Counter]:
     """纯逻辑：vendor 退市条目 -> (待插入 payload 列表, 待补齐 (security_id, fills) 列表, 统计)。
 
     existing_rows: 元素含 id/symbol/is_active/list_date/delist_date/cik/
-    composite_figi/share_class_figi/name/exchange。
+    composite_figi/share_class_figi/name/exchange（可选 type，用于跨类型吸收审计）。
     匹配优先级 FIGI → CIK+symbol → symbol+退市日邻近（仅退市行）；命中活跃行
     视为改名幽灵跳过。填充只补 NULL 字段，绝不改写既有值。
+    match_log 若提供，逐条记录被吸收（filled/noop）的匹配明细，供 dry-run
+    人工审计跨类型吸收；vendor 类型与 DB 类型都已知且不同时计 matched_cross_type。
     """
     by_figi: dict[str, list] = {}
     by_cik_sym: dict[tuple, list] = {}
@@ -106,20 +110,24 @@ def classify_entries(entries: list[dict], existing_rows) -> tuple[list, list, Co
         symbol = item["symbol"]
         delist = item["delist_date"]
         match = None
+        matched_via = None
         candidates = by_figi.get(item.get("composite_figi") or "", [])
         if candidates:
             inactive = [r for r in candidates if not r.is_active]
             match = inactive[0] if inactive else candidates[0]
+            matched_via = "figi"
         if match is None and item.get("cik"):
             candidates = by_cik_sym.get((item["cik"], symbol), [])
             if candidates:
                 inactive = [r for r in candidates if not r.is_active]
                 match = inactive[0] if inactive else candidates[0]
+                matched_via = "cik_symbol"
         if match is None:
             for row in by_sym_inactive.get(symbol, []):
                 if row.delist_date is None or delist is None \
                         or abs(row.delist_date - delist) <= DELIST_MATCH_TOLERANCE:
                     match = row
+                    matched_via = "symbol_delist"
                     break
 
         if match is not None and match.is_active:
@@ -131,6 +139,22 @@ def classify_entries(entries: list[dict], existing_rows) -> tuple[list, list, Co
                 continue
             fills = {f: item.get(f) for f in FILLABLE_FIELDS
                      if getattr(match, f) is None and item.get(f) is not None}
+            vendor_type = (item.get("type") or "").upper() or None
+            db_type = (getattr(match, "type", None) or "").upper() or None
+            if vendor_type and db_type and vendor_type != db_type:
+                stats["matched_cross_type"] += 1
+            if match_log is not None:
+                match_log.append({
+                    "vendor_symbol": symbol,
+                    "vendor_type": vendor_type or "",
+                    "vendor_delist": delist,
+                    "matched_via": matched_via,
+                    "security_id": match.id,
+                    "db_symbol": match.symbol,
+                    "db_type": db_type or "",
+                    "db_delist": match.delist_date,
+                    "disposition": "filled" if fills else "noop",
+                })
             if fills:
                 to_fill.append((match.id, fills))
                 filled_ids.add(match.id)
@@ -180,10 +204,29 @@ def _load_existing(db_manager: DatabaseManager):
     with db_manager.get_session() as session:
         return session.execute(text("""
             SELECT id, symbol, is_active, list_date, delist_date, cik,
-                   composite_figi, share_class_figi, name, exchange
+                   composite_figi, share_class_figi, name, exchange, type
             FROM securities
             WHERE upper(market) = 'US'
         """)).all()
+
+
+def _write_match_audit(match_log: list[dict]) -> str | None:
+    """把吸收匹配明细写成 TSV 供人工审计（dry-run 与正式跑都写，整跑覆盖）。"""
+    if not match_log:
+        return None
+    audit_path = os.path.join(project_root, "logs", "delisted_match_audit.tsv")
+    try:
+        os.makedirs(os.path.dirname(audit_path), exist_ok=True)
+        columns = ["vendor_symbol", "vendor_type", "vendor_delist", "matched_via",
+                   "security_id", "db_symbol", "db_type", "db_delist", "disposition"]
+        with open(audit_path, "w", encoding="utf-8") as fh:
+            fh.write("\t".join(columns) + "\n")
+            for row in match_log:
+                fh.write("\t".join("" if row[c] is None else str(row[c]) for c in columns) + "\n")
+    except OSError as e:
+        logger.opt(exception=e).error("匹配审计 TSV 写入失败（不影响同步）: {}", audit_path)
+        return None
+    return audit_path
 
 
 def _apply_fills(db_manager: DatabaseManager, to_fill: list[tuple[int, dict]]) -> int:
@@ -209,10 +252,10 @@ def _enrich_population(db_manager: DatabaseManager, limit: int):
         rows = session.execute(text("""
             SELECT id, symbol, delist_date, cik, composite_figi
             FROM securities
-            WHERE upper(market) = 'US' AND upper(type) IN ('CS', 'ETF')
+            WHERE upper(market) = 'US' AND upper(type) = ANY(:allowed_types)
               AND is_active = false AND list_date IS NULL AND delist_date IS NOT NULL
             ORDER BY delist_date DESC, id
-        """)).all()
+        """), {"allowed_types": list(ALLOWED_US_SECURITY_TYPES)}).all()
     return rows[:limit] if limit > 0 else rows
 
 
@@ -343,14 +386,23 @@ def _run_enrich(args, source: MassiveSource, db_manager: DatabaseManager, stats:
 def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseManager) -> tuple[int, dict]:
     typed_entries, untyped_entries, stats = _fetch_entries(args, source)
     existing = _load_existing(db_manager)
-    to_insert, to_fill, cls_stats = classify_entries(typed_entries, existing)
+    match_log: list[dict] = []
+    to_insert, to_fill, cls_stats = classify_entries(typed_entries, existing, match_log=match_log)
     stats.update(cls_stats)
 
     # 无类型条目：能匹配上既有行的直接补 NULL 字段；匹配不上的走时点鉴定
-    u_insert, u_fill, u_stats = classify_entries(untyped_entries, existing)
+    u_insert, u_fill, u_stats = classify_entries(untyped_entries, existing, match_log=match_log)
     for key, value in u_stats.items():
         stats[f"untyped_{key}"] += value
     to_fill.extend(u_fill)
+
+    audit_path = _write_match_audit(match_log)
+    cross_type = stats.get("matched_cross_type", 0) + stats.get("untyped_matched_cross_type", 0)
+    if cross_type:
+        logger.warning("检测到 {} 条跨类型吸收匹配（vendor 类型 != 库内类型），须人工审计: {}",
+                       cross_type, audit_path)
+    elif audit_path:
+        logger.info("匹配审计明细已写入: {}", audit_path)
 
     if args.dry_run:
         stats["untyped_pending_type_check"] = len(u_insert)

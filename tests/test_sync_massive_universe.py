@@ -182,10 +182,10 @@ class TestSingleRenameFailureIsolated:
         assert [r["id"] for r in db.info_upserts] == [2]
         # normal 路径不受影响
         assert db.symbol_upserts == [{"symbol": "new1"}]
-        # mark-missing 步骤仍执行（get_session 第二次调用即该步骤）
-        assert len(db.sessions) == 2
-        assert db.sessions[1].execute.called
-        assert db.sessions[1].commit.called
+        # mark-missing 步骤仍执行（session 顺序：加载 → 4b NEW_LISTING 查询 → mark-missing）
+        assert len(db.sessions) == 3
+        assert db.sessions[2].execute.called
+        assert db.sessions[2].commit.called
 
     def test_swap_cycle_both_quarantined_batch_survives(self, monkeypatch):
         # A↔B 互换成环：两条都撞占用防御，各自隔离，批处理继续

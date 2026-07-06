@@ -667,10 +667,12 @@ def run_update_institutional_holdings(args):
 
 
 def run_update_fx_rates(args):
-    logger.info("执行: 同步 ECB 参考汇率")
+    logger.info("执行: 同步 FX 参考汇率（ECB + FRED）")
     cli_args = []
     if args.since:
         cli_args.extend(['--since', args.since])
+    if getattr(args, 'skip_fred', False):
+        cli_args.append('--skip-fred')
     execute_script(update_fx_rates_main, cli_args)
 
 
@@ -915,8 +917,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_13f.add_argument('--reparse', action='store_true', help="重新解析已入库 filing。")
     p_13f.set_defaults(func=run_update_institutional_holdings)
 
-    p_fx = subparsers.add_parser('update_fx_rates', help="同步 ECB 每日参考汇率（非 USD 分红折算用）")
+    p_fx = subparsers.add_parser('update_fx_rates', help="同步 FX 参考汇率（ECB 欧元基准 + FRED USD 直连；非 USD 分红折算用）")
     p_fx.add_argument('--since', type=str, default=None, help="只写入该日期之后的汇率；不传则全历史回填。")
+    p_fx.add_argument('--skip-fred', action='store_true', help="跳过 FRED 分支（无 FRED_API_KEY 的环境只同步 ECB）。")
     p_fx.set_defaults(func=run_update_fx_rates)
 
     p_rf = subparsers.add_parser('update_risk_free_rates', help="同步 FRED DTB3 risk-free reference rates")

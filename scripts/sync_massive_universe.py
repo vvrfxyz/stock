@@ -1,3 +1,10 @@
+"""同步 Massive 活跃美股 universe。
+
+身份事件全集：RENAME（改名）/ RECYCLE（回收，含死票回收 DEAD_TICKER_RECYCLE）/
+QUARANTINE（rename 写入失败隔离）/ NEW_LISTING（新上市，含 origin 标记）。
+NEW_LISTING 是新入库证券的回滚锚点：按 details.origin=massive_universe_sync
+可整体回溯某次 universe 扩容引入的行（type 白名单锚点的双保险）。
+"""
 import argparse
 import json
 import os
@@ -35,7 +42,7 @@ def setup_logging():
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="同步 Massive 活跃美股 universe，只保留普通股 / ETF。",
+        description="同步 Massive 活跃美股 universe，只保留 ALLOWED_US_SECURITY_TYPES 白名单类型。",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("--market", type=str, default="US", help="市场，当前仅支持 US。")
@@ -46,6 +53,22 @@ def create_parser() -> argparse.ArgumentParser:
         help="跳过将 Massive 活跃列表之外的保留类型证券标记为 inactive。",
     )
     return parser
+
+
+def _lookup_active_us_ids_by_symbol(db_manager: DatabaseManager, symbols: set[str]) -> dict[str, int]:
+    """NEW_LISTING 事件锚定用的 symbol -> 活跃行 id 反查。
+
+    is_active 过滤是 DEAD_TICKER_RECYCLE 场景的正确性前提：回收 symbol 的死行
+    与新行同名，只有活跃行部分唯一索引（_active_symbol_uc）保证命中唯一新行。
+    """
+    with db_manager.get_session() as session:
+        return dict(
+            session.query(Security.symbol, Security.id)
+            .filter(func.upper(Security.market) == "US")
+            .filter(Security.is_active == True)
+            .filter(Security.symbol.in_(symbols))
+            .all()
+        )
 
 
 def _classify_incoming(resolver, upsert_rows):
@@ -257,7 +280,8 @@ def main(argv: list[str] | None = None) -> int:
             })
             logger.warning(
                 "symbol={} 为死票回收：新上市复用 inactive security_id={} 的代码"
-                "（incoming figi={} cik={} name={}），已写 RECYCLE 事件；"
+                "（incoming figi={} cik={} name={}），已写 RECYCLE 事件，"
+                "新行入库后另写 NEW_LISTING 事件锚定新身份；"
                 "价格回填将被 clamp 到新证券 list_date。",
                 row["symbol"], result.recycled_from,
                 row.get("composite_figi"), row.get("cik"), row.get("name"),
@@ -269,6 +293,56 @@ def main(argv: list[str] | None = None) -> int:
 
         # 4) 正常 upsert（含新上市 + 已有证券更新 + 改名后的元数据更新）
         changed = db_manager.upsert_securities_by_symbol(normal_rows, touch_info_timestamp=False)
+
+        # 4b) 新上市写 NEW_LISTING 身份事件——新行的回滚锚点。此前 NEW 路径
+        #     只写 RENAME/RECYCLE/QUARANTINE，新证券本身没有任何事件锚，
+        #     批量回滚只能靠 type 白名单反推。幂等性与 DEAD_TICKER_RECYCLE
+        #     同源：重跑时 symbol 已是活跃行，resolver 判 ACTIVE_SYMBOL 而非
+        #     NEW，不会重复发事件。security_id 在 upsert 前不存在，只能事后
+        #     按 symbol 反查（NEW 判定保证该 symbol 此前无活跃持有者，活跃
+        #     行部分唯一索引保证反查命中的就是刚插入的新行）。
+        new_listing_rows = [
+            (row, result)
+            for row, result in zip(upsert_rows, results)
+            if result.resolution_type == "NEW"
+        ]
+        new_listing_events = []
+        if new_listing_rows:
+            new_symbols = {row["symbol"] for row, _ in new_listing_rows}
+            id_by_symbol = _lookup_active_us_ids_by_symbol(db_manager, new_symbols)
+            for row, result in new_listing_rows:
+                new_security_id = id_by_symbol.get(row["symbol"])
+                if new_security_id is None:
+                    # 批内 symbol 大小写变体去重等原因未实际落库：跳过，避免错锚。
+                    logger.warning(
+                        "NEW 上市 symbol={} 在 upsert 后未找到活跃行，跳过 NEW_LISTING 事件。",
+                        row["symbol"],
+                    )
+                    continue
+                details = {
+                    "origin": "massive_universe_sync",
+                    "incoming_figi": row.get("composite_figi"),
+                    "incoming_cik": row.get("cik"),
+                    "incoming_name": row.get("name"),
+                    "incoming_type": row.get("type"),
+                    "incoming_list_date": str(row.get("list_date")) if row.get("list_date") else None,
+                }
+                event = {
+                    "security_id": new_security_id,
+                    "event_type": "NEW_LISTING",
+                    "new_symbol": row["symbol"],
+                    "resolution_source": "AUTO",
+                    "confidence": "HIGH",
+                }
+                if result.recycled_from is not None:
+                    # 死票回收的新行：与 2b) 的 RECYCLE 事件互为镜像，
+                    # related_security_id 指向被复用代码的旧身份。
+                    event["related_security_id"] = result.recycled_from
+                    details["recycled_from"] = result.recycled_from
+                event["details"] = json.dumps(details, ensure_ascii=False)
+                new_listing_events.append(event)
+            if new_listing_events:
+                db_manager.insert_identity_events(new_listing_events)
 
         # 5) 标记不在活跃列表中的证券为 inactive
         active_symbols = {row["symbol"] for row in upsert_rows}
@@ -291,13 +365,14 @@ def main(argv: list[str] | None = None) -> int:
                 marked_inactive = result.rowcount or 0
 
         logger.success(
-            "Massive universe 同步完成: fetched={} upserted={} renamed={} rename_skipped={} recycled={} dead_ticker_recycled={} marked_inactive={}",
+            "Massive universe 同步完成: fetched={} upserted={} renamed={} rename_skipped={} recycled={} dead_ticker_recycled={} new_listings={} marked_inactive={}",
             len(upsert_rows),
             changed,
             len(rename_rows) - len(skipped_renames),
             len(skipped_renames),
             len(recycle_rows),
             len(dead_ticker_recycles),
+            len(new_listing_events),
             marked_inactive,
         )
         if skipped_renames:

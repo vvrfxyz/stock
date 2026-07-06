@@ -6,7 +6,10 @@ institutional_holdings 中 security_id 为空的 CUSIP 用 OpenFIGI 兜底：
 1. 候选集：holdings 中 security_id IS NULL 且 cusip 非空（9 位）的 distinct CUSIP；
 2. 查询过滤（openfigi_cusip_lookups 缓存）：MATCHED 永不重查——CUSIP->FIGI 是
    稳定映射；NOT_FOUND / AMBIGUOUS 负缓存超过 --refresh-days 才重查；
-   --limit 截断本次 API 查询量（0=不限）；
+   --limit 截断本次 API 查询量（0=不限）。注意：AMBIGUOUS 缓存行只存诊断用
+   name，不存候选明细，归并新规则（如 US composite 消歧，见
+   data_sources/openfigi_source.py）无法本地重放存量 AMBIGUOUS 行——
+   要让它们受益必须重查（等 TTL 过期或 --refresh-days 0 强制），耗 API 配额；
 3. 按 source.batch_size 分批调 map_cusips，逐批落缓存——单批失败不丢已得批次，
    只有全批失败才以退出码 1 触发调度重试；
 4. 解析落链（每次对全部 MATCHED 缓存行全量重跑，纯本地零 API 开销——新上市

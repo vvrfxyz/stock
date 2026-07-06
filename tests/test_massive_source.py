@@ -121,6 +121,30 @@ class MassiveSourceTests(unittest.TestCase):
 
         self.assertEqual([item["ticker"] for item in rows], ["AAPL"])
 
+    def test_list_active_tickers_caller_allowed_types_is_sole_type_gate(self):
+        # ADR 方案 §B 去掉 is_supported_us_security_type 冗余双重门后，
+        # 类型过滤唯一权威来源是调用方传入的 allowed_types（生产唯一调用方
+        # sync_massive_universe 传 ALLOWED_US_SECURITY_TYPES）。显式请求
+        # 白名单外类型时不再被全局常量二次拦截。
+        session = FakeSession(
+            [
+                FakeResponse(
+                    {
+                        "status": "OK",
+                        "results": [
+                            {"ticker": "AAPL", "locale": "us", "type": "CS"},
+                            {"ticker": "TESTP", "locale": "us", "type": "PFD"},
+                        ],
+                    }
+                )
+            ]
+        )
+        source = MassiveSource(DummyRateLimiter(), session=session)
+
+        rows = source.list_active_tickers(allowed_types=["PFD"])
+
+        self.assertEqual([item["ticker"] for item in rows], ["TESTP"])
+
     def test_get_security_info_retries_with_historical_date(self):
         session = FakeSession(
             [

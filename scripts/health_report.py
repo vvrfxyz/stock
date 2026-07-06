@@ -16,6 +16,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from db_manager import DatabaseManager
+from utils.massive_config import ALLOWED_US_SECURITY_TYPES
 from utils.script_logging import setup_logging as configure_script_logging
 
 
@@ -77,6 +78,7 @@ def report_table_freshness(session) -> int:
 def report_securities_summary(session) -> None:
     """证券 universe 概况。"""
     _section("Securities Universe")
+    # 有意 CS-only/ETF-only 的 KPI 口径：按类型分列的计数是固定看板指标，不随白名单扩展
     sql = text("""
         SELECT
             count(*) as total,
@@ -228,9 +230,9 @@ def report_price_data_consistency(session) -> tuple[int, int]:
     row = session.execute(text("""
         SELECT count(*) FROM securities s
         WHERE s.is_active AND upper(s.market) = 'US'
-          AND s.type IN ('CS', 'ETF')
+          AND s.type = ANY(:allowed_types)
           AND s.price_data_latest_date IS NULL
-    """)).scalar()
+    """), {"allowed_types": list(ALLOWED_US_SECURITY_TYPES)}).scalar()
     if row > 0:
         p1 += row
         logger.warning("  [P1] 活跃证券无价格数据: {} 只", row)
@@ -350,9 +352,9 @@ def report_staleness(session) -> int:
         row = session.execute(text(f"""
             SELECT count(*) FROM securities
             WHERE is_active AND upper(market) = 'US'
-              AND type IN ('CS', 'ETF')
+              AND type = ANY(:allowed_types)
               AND ({col} IS NULL OR {col} < now() - make_interval(days => :days))
-        """), {"days": max_days}).scalar()
+        """), {"days": max_days, "allowed_types": list(ALLOWED_US_SECURITY_TYPES)}).scalar()
         if row > 0:
             p2 += 1
             logger.info("  [P2] {} 超过 {} 天未更新: {} 只", label, max_days, row)
