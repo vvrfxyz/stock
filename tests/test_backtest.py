@@ -265,6 +265,116 @@ class TestTerminalReturn:
 
 
 # ============================================================
+# 5c. terminal_return 按证券注入（pd.Series）+ fallback
+# ============================================================
+
+class TestTerminalReturnPerSecurity:
+    """terminal_return 可传 pd.Series（index=security_id，值=已实现退市收益）。
+
+    语义锁定：
+    - Series 有值的证券在其首个永久缺失日注入该证券自己的收益；
+    - Series 缺失/NaN 的证券回退 terminal_return_fallback；
+    - fallback 也为 None 时该证券不注入（等价该证券 terminal_return=None 旧口径）；
+    - 标量路径与旧实现完全一致（回归由 5b 锁定，等价性在此双向验证）。
+    """
+
+    @staticmethod
+    def _two_delist_panel():
+        """sec1 在 t=2 起永久缺失、sec2 在 t=3 起永久缺失，退市日双双仍持仓 0.5。"""
+        dates = ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"]
+        prices = _panel({1: [100.0, 110.0, None, None, None],
+                         2: [50.0, 55.0, 55.0, None, None]}, dates)
+        weights = _panel({1: [0.5, 0.5, 0.0, 0.0, 0.0],
+                          2: [0.5, 0.5, 0.5, 0.0, 0.0]}, dates)
+        return prices, weights
+
+    def test_series_value_and_fallback_land_on_first_terminal_day(self):
+        """Series 有值用自己的值、缺失用 fallback，且都恰好落在首个永久缺失日。"""
+        prices, weights = self._two_delist_panel()
+        result = run_backtest(
+            "test", weights, prices, cost_bps=0.0,
+            terminal_return=pd.Series({1: -1.0}),  # sec2 缺失 -> fallback
+            terminal_return_fallback=-0.3,
+        )
+        # t=1: 两只各 0.5 仓 × 10% = 0.10
+        assert abs(result.daily_returns.iloc[1] - 0.10) < 1e-9
+        # t=2: sec1 首个永久缺失日，注入 Series 值 -1.0 × held 0.5 = -0.5；sec2 当日涨 0%
+        assert abs(result.daily_returns.iloc[2] - (-0.5)) < 1e-9
+        # t=3: sec2 首个永久缺失日，Series 无值 -> fallback -0.3 × held 0.5 = -0.15
+        assert abs(result.daily_returns.iloc[3] - (-0.15)) < 1e-9
+        # t=4: 两只都已过"第一天"，不重复注入
+        assert result.daily_returns.iloc[4] == 0.0
+
+    def test_series_nan_value_uses_fallback(self):
+        """Series 里显式 NaN 与缺失同义：回退 fallback。"""
+        prices, weights = self._two_delist_panel()
+        result = run_backtest(
+            "test", weights, prices, cost_bps=0.0,
+            terminal_return=pd.Series({1: -1.0, 2: np.nan}),
+            terminal_return_fallback=-0.3,
+        )
+        assert abs(result.daily_returns.iloc[2] - (-0.5)) < 1e-9
+        assert abs(result.daily_returns.iloc[3] - (-0.15)) < 1e-9
+
+    def test_series_missing_without_fallback_is_no_injection(self):
+        """Series 缺失且无 fallback：该证券退市日不注入（沿旧口径赚 0%）。"""
+        prices, weights = self._two_delist_panel()
+        result = run_backtest(
+            "test", weights, prices, cost_bps=0.0,
+            terminal_return=pd.Series({1: -1.0}),
+        )
+        # sec1 照常注入
+        assert abs(result.daily_returns.iloc[2] - (-0.5)) < 1e-9
+        # sec2 无值无 fallback：退市日收益 0，与 terminal_return=None 同口径
+        assert result.daily_returns.iloc[3] == 0.0
+        assert result.daily_returns.iloc[4] == 0.0
+
+    def test_series_missing_matches_none_semantics_exactly(self):
+        """对 Series 完全没覆盖的证券，逐日收益与 terminal_return=None 完全一致。"""
+        dates = ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"]
+        prices = _panel({2: [50.0, 55.0, 55.0, None, None]}, dates)
+        weights = _panel({2: [1.0, 1.0, 1.0, 0.0, 0.0]}, dates)
+
+        none_result = run_backtest("none", weights, prices, cost_bps=0.0, terminal_return=None)
+        series_result = run_backtest(
+            "series", weights, prices, cost_bps=0.0,
+            terminal_return=pd.Series({1: -1.0}),  # 面板里只有 sec2，完全未覆盖
+        )
+        pd.testing.assert_series_equal(
+            none_result.daily_returns, series_result.daily_returns,
+            check_names=False, check_exact=True,
+        )
+
+    def test_series_covering_all_equals_scalar(self):
+        """全覆盖同值 Series 与标量路径结果完全一致（向后兼容锚点）。"""
+        prices, weights = self._two_delist_panel()
+        scalar = run_backtest("scalar", weights, prices, cost_bps=0.0, terminal_return=-1.0)
+        series = run_backtest(
+            "series", weights, prices, cost_bps=0.0,
+            terminal_return=pd.Series({1: -1.0, 2: -1.0}),
+        )
+        pd.testing.assert_series_equal(
+            scalar.daily_returns, series.daily_returns, check_names=False, check_exact=True
+        )
+        pd.testing.assert_series_equal(
+            scalar.equity, series.equity, check_names=False, check_exact=True
+        )
+        assert scalar.terminal_missing_position_days == series.terminal_missing_position_days
+
+    def test_fallback_ignored_for_scalar_terminal_return(self):
+        """标量 terminal_return 时 fallback 不参与：行为与不传 fallback 完全一致。"""
+        prices, weights = self._two_delist_panel()
+        base = run_backtest("a", weights, prices, cost_bps=0.0, terminal_return=-1.0)
+        with_fb = run_backtest(
+            "b", weights, prices, cost_bps=0.0,
+            terminal_return=-1.0, terminal_return_fallback=-0.3,
+        )
+        pd.testing.assert_series_equal(
+            base.daily_returns, with_fb.daily_returns, check_names=False, check_exact=True
+        )
+
+
+# ============================================================
 # 6. equity 曲线一致性
 # ============================================================
 

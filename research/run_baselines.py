@@ -111,6 +111,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Universe hash: {universe['universe_hash']}")
     print(f"平均可交易标的数: {eligible.sum(axis=1).mean():.0f}")
 
+    # TODO(wave 2 / delisting_events): 表落地后在此按 security_id 加载已实现退市收益，
+    # 以 pd.Series(index=security_id) 传 terminal_return、CLI 标量降级为 terminal_return_fallback。
+    # run_backtest 已支持 float | pd.Series | None（Series 只能编程式传入，CLI 行为不变）。
     results = [
         run_backtest("momentum_12_1 (top10%, 月调)", momentum_12_1(adj_close, eligible), adj_close, cost_bps=args.cost_bps, terminal_return=args.terminal_return),
         run_backtest("sma_50_200 趋势 (周调)", sma_trend(adj_close, eligible), adj_close, cost_bps=args.cost_bps, terminal_return=args.terminal_return),

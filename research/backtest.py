@@ -6,7 +6,10 @@
 - 成本按换手 × cost_bps 双边计：turnover_t = sum(|w_t - w_{t-1}|)。
 - 收益用价格列自身 ffill 后 pct_change，停牌/缺口复牌的跳空收益会在复牌日计入；
   若持仓后价格永久缺失，引擎在指标中报告 terminal_missing_position_days；
-  terminal_return 可为这些退市持仓注入一个收益假设（默认 None=保持旧口径不注入）。
+  terminal_return 可为这些退市持仓注入一个收益假设（默认 None=保持旧口径不注入）：
+  标量对所有退市持仓统一注入；pd.Series（index=security_id）按证券注入各自的
+  真实退市收益，Series 缺失/NaN 的证券回退到 terminal_return_fallback，
+  fallback 也为 None 时该证券不注入（等价于旧口径退市赚 0%）。
 
 这是研究原型，不建模盘中滑点、做空费率、权重漂移再平衡。
 """
@@ -90,7 +93,8 @@ def run_backtest(
     *,
     cost_bps: float = 10.0,
     hold_through_gaps: bool = True,
-    terminal_return: float | None = None,
+    terminal_return: float | pd.Series | None = None,
+    terminal_return_fallback: float | None = None,
 ) -> BacktestResult:
     returns = _returns_with_gap_recovery(adj_close)
     weights = weights.reindex(index=returns.index, columns=returns.columns).fillna(0.0)
@@ -100,12 +104,23 @@ def run_backtest(
     # 退市/终止收益政策：持仓后价格永久缺失时，默认 _returns_with_gap_recovery 给 NaN，
     # fillna(0.0) 后等于静默赚 0%。terminal_return 让调用方为"退市当日"注入一个收益假设
     # （如 -1.0=-100%）。只在永久缺失的第一天（退市事件日）注入一次，避免重复相乘炸掉数学。
+    # 标量=统一假设；pd.Series（index=security_id，值=已实现退市收益）=按证券注入，
+    # Series 缺失/NaN 的证券回退到 terminal_return_fallback（None 则不注入，保持旧口径）。
     if terminal_return is not None and terminal_missing_position_days > 0:
         ever_future_price = adj_close.notna()[::-1].cummax()[::-1]
         terminal_mask = held.gt(0) & adj_close.isna() & ~ever_future_price
         first_terminal = terminal_mask & ~terminal_mask.shift(1, fill_value=False)
-        returns = returns.copy()
-        returns[first_terminal] = terminal_return
+        if isinstance(terminal_return, pd.Series):
+            # 向量化按列注入：把 Series 对齐到面板列（security_id），fallback 补洞后
+            # 仍缺值的列不注入（等价于该证券沿用 terminal_return=None 的旧口径）。
+            per_security = terminal_return.reindex(returns.columns).astype("float64")
+            if terminal_return_fallback is not None:
+                per_security = per_security.fillna(terminal_return_fallback)
+            inject = first_terminal & per_security.notna()
+            returns = returns.mask(inject, per_security, axis=1)
+        else:
+            returns = returns.copy()
+            returns[first_terminal] = terminal_return
     # 停牌期冻结持仓，避免复牌跨缺口收益被清零的权重吞掉（默认开启；可关以复现旧口径）。
     effective_held = _hold_through_price_gaps(held, adj_close) if hold_through_gaps else held
     gross = (effective_held * returns.fillna(0.0)).sum(axis=1)
