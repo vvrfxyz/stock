@@ -11,8 +11,9 @@ cik 为 NULL 的行留空（多为老退市——补 CIK 后自然入组）。
   (c) 集合式 UPDATE securities.company_id（只填 NULL——已挂到**不同**公司的
       行绝不静默改挂，进 reassign 报告，人工确认后加 --allow-reassign 执行）；
   (d) 报告落 logs/：覆盖率、同 CIK 名称分歧样本（改名世系，人工过目不阻塞）、
-      多证券组拆成 真双类股名录 vs 工具行误标（common-equity 名称分类器与
-      research/company_market_cap.py 共用同一函数，flag-don't-drop：误标行
+      多证券组拆成 真双类股名录 vs 工具行误标（common-equity 分类器与
+      research/company_market_cap.py 共用同一函数——二期起 share_class_figi
+      结构化证据优先、名称启发式兜底；flag-don't-drop：误标行
       照挂 company_id，只是不进双类股名录、不计合并市值）；
   (e) 验收探针：goog+googl、brk.a+brk.b 各归同一 company。
 
@@ -37,7 +38,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from db_manager import DatabaseManager
-from research.company_market_cap import is_common_equity_name
+from research.company_market_cap import is_common_equity
 from utils.script_logging import setup_logging as configure_script_logging
 
 DUAL_CLASS_REPORT = "companies_dual_class.tsv"
@@ -84,10 +85,15 @@ def create_parser() -> argparse.ArgumentParser:
 # ------------------------------------------------------------------ #
 
 def fetch_cs_rows(db_manager) -> list[dict]:
-    """全部 US COMPANY_EQUITY_TYPES 证券（cik 非空）——活跃 + 退市。ETF 从不进入本查询。"""
+    """全部 US COMPANY_EQUITY_TYPES 证券（cik 非空）——活跃 + 退市。ETF 从不进入本查询。
+
+    share_class_figi 等三列是 common-equity 分类器（is_common_equity）的
+    结构化证据输入，与读取层 load_security_company_map 同口径。
+    """
     sql = text(
         """
-        select id, symbol, name, cik, is_active
+        select id, symbol, name, cik, is_active,
+               share_class_figi, share_class_shares_outstanding, ticker_suffix
         from securities
         where market = 'US' and type = any(:company_types)
           and cik is not null and btrim(cik) <> ''
@@ -133,7 +139,14 @@ def build_grouping(rows: list[dict]) -> dict[str, dict]:
             "symbol": row["symbol"],
             "name": row["name"],
             "is_active": bool(row["is_active"]),
-            "is_common_equity": is_common_equity_name(row["name"]),
+            # 结构化证据键在纯 dict 输入（单测）里可缺省——row.get 退化为
+            # 名称启发式，与 is_common_equity 的 fallback 语义一致。
+            "is_common_equity": is_common_equity(
+                row["name"],
+                share_class_figi=row.get("share_class_figi"),
+                share_class_shares_outstanding=row.get("share_class_shares_outstanding"),
+                ticker_suffix=row.get("ticker_suffix"),
+            ),
         }
         groups.setdefault(cik, {"cik": cik, "members": []})["members"].append(member)
     for group in groups.values():

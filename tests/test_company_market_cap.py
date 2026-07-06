@@ -1,6 +1,7 @@
 """research.company_market_cap 的公司级合并市值语义测试。
 
-单元层：is_common_equity_name 名称分类器 + aggregate_company_market_cap 纯聚合；
+单元层：is_common_equity（结构化证据优先）/ is_common_equity_name（名称
+fallback）分类器 + aggregate_company_market_cap 纯聚合；
 集成层：load_security_company_map / load_company_market_cap_panel 走真实 schema。
 """
 from __future__ import annotations
@@ -12,6 +13,7 @@ from sqlalchemy import text
 
 from research.company_market_cap import (
     aggregate_company_market_cap,
+    is_common_equity,
     is_common_equity_name,
     load_company_market_cap_panel,
     load_security_company_map,
@@ -58,9 +60,9 @@ class TestIsCommonEquityName:
         assert is_common_equity_name("Wright Medical Group N.V.") is True
         assert is_common_equity_name("United Airlines Holdings, Inc.") is True
 
-    def test_known_phase1_false_positives_are_locked(self):
-        # 已知误伤（真名撞词表），第一期文档化接受：变更此行为须同步更新
-        # research/company_market_cap.py 的 docstring 与归组报告口径。
+    def test_known_phase1_false_positives_stay_false_in_name_fallback(self):
+        # 一期真名撞词表的两例误伤：名称启发式本身仍然保守（fallback 行为
+        # 不变）——翻正发生在 is_common_equity 的结构化证据层（见下一个类）。
         assert is_common_equity_name("Preferred Bank") is False
         assert is_common_equity_name("Unit Corporation") is False
 
@@ -68,6 +70,68 @@ class TestIsCommonEquityName:
         assert is_common_equity_name(None) is True
         assert is_common_equity_name("") is True
         assert is_common_equity_name("   ") is True
+
+
+# ---------------------------------------------------------------------------
+# is_common_equity（二期结构化证据优先——归组与读取层共用的唯一判别）
+# ---------------------------------------------------------------------------
+
+class TestIsCommonEquity:
+    def test_known_phase1_false_positives_fixed_by_share_class_figi(self):
+        # 2026-07 生产库探针：pfbc/unt 都携带 share_class_figi，正证据覆盖
+        # 名称正则命中。变更此行为须同步更新 company_market_cap.py docstring
+        # 与归组报告口径。
+        assert is_common_equity("Preferred Bank", share_class_figi="BBG001S9SFK1") is True
+        assert is_common_equity("UNIT Corporation", share_class_figi="BBG001S5X2X8") is True
+
+    def test_share_class_figi_overrides_any_name_hit(self):
+        # LP common units / ADS 这类真普通股名称命中正则，靠 FIGI 翻正
+        assert is_common_equity(
+            "Energy Transfer LP Common Units representing limited partner interests",
+            share_class_figi="BBG001SDHNW4",
+        ) is True
+        assert is_common_equity(
+            "Sohu.com Limited American Depositary Shares",
+            share_class_figi="BBG00L2DB5V4",
+        ) is True
+
+    @pytest.mark.parametrize("name", [
+        # 探针核验：命中正则的真工具行无一携带 share_class_figi——无证据时
+        # 名称启发式必须继续把它们挡在外面
+        "B. Riley Financial, Inc. 5.00% Senior Notes due 2026",
+        "Oxford Lane Capital Corp. 7.95% Notes due 2032",
+        "T-Mobile US, Inc. 5.500% Senior Notes due June 2070",
+        "Brighthouse Financial, Inc. Depositary shares, each representing a "
+        "1/1,000th interest in a share of 5.375% Non-Cumulative Preferred Stock, Series C",
+    ])
+    def test_instrument_rows_without_evidence_stay_excluded(self, name):
+        assert is_common_equity(name) is False
+
+    def test_shares_outstanding_is_not_positive_evidence(self):
+        # 探针反例：vendor 对 depositary preferred/baby bond 也填
+        # share_class_shares_outstanding（bhfan 20M、mchpp 27M 等 36 行）——
+        # 该列绝不能翻正名称命中
+        assert is_common_equity(
+            "Brighthouse Financial, Inc. Depositary shares, each representing a "
+            "1/1,000th interest in a share of 5.375% Non-Cumulative Preferred Stock, Series C",
+            share_class_shares_outstanding=20_000_000,
+        ) is False
+
+    def test_ticker_suffix_is_not_evidence_either_way(self):
+        # 真双类股（brk.b 的 B）与工具行（rilyg 的 G）都有后缀——后缀不参与判定
+        assert is_common_equity(
+            "B. Riley Financial, Inc. 5.00% Senior Notes due 2026", ticker_suffix="G"
+        ) is False
+        assert is_common_equity("Berkshire Hathaway Inc.", ticker_suffix="B") is True
+
+    def test_no_evidence_falls_back_to_name_heuristic(self):
+        assert is_common_equity("Apple Inc.") is True
+        assert is_common_equity("Preferred Bank") is False  # 无 FIGI 时误伤仍在（44% 退市覆盖率）
+        assert is_common_equity(None) is True
+
+    def test_blank_or_nan_figi_treated_as_absent(self):
+        assert is_common_equity("Unit Corporation", share_class_figi="   ") is False
+        assert is_common_equity("Unit Corporation", share_class_figi=float("nan")) is False
 
 
 # ---------------------------------------------------------------------------
@@ -139,21 +203,22 @@ def _insert_company(pg_db, cik, name) -> int:
 
 
 def _insert_security(pg_db, security_id, symbol, *, name=None, sec_type="CS",
-                     company_id=None, cik=None, is_active=True):
+                     company_id=None, cik=None, is_active=True, share_class_figi=None):
     with pg_db.engine.connect() as conn:
         conn.execute(
             text(
                 """
                 insert into securities
                     (id, symbol, current_symbol, name, market, type, cik, company_id,
-                     is_active, full_refresh_interval)
+                     is_active, full_refresh_interval, share_class_figi)
                 values
                     (:id, :symbol, :symbol, :name, 'US', :type, :cik, :company_id,
-                     :is_active, 30)
+                     :is_active, 30, :share_class_figi)
                 """
             ),
             {"id": security_id, "symbol": symbol, "name": name, "type": sec_type,
-             "cik": cik, "company_id": company_id, "is_active": is_active},
+             "cik": cik, "company_id": company_id, "is_active": is_active,
+             "share_class_figi": share_class_figi},
         )
         conn.commit()
 
@@ -217,6 +282,21 @@ class TestLoadSecurityCompanyMap:
         assert load_security_company_map(pg_db.engine, company_ids=[company_id + 999]).empty
         assert load_security_company_map(pg_db.engine, company_ids=[]).empty
 
+    def test_share_class_figi_overrides_name_regex_in_map(self, pg_db):
+        # pfbc 型一期误伤：名称命中 preferred 但携带 share_class_figi -> 翻正；
+        # 同公司无 FIGI 的 notes 行仍被名称启发式挡住
+        company_id = _insert_company(pg_db, "0000000066", "Preferred Bank")
+        _insert_security(pg_db, 1, "pfbc", name="Preferred Bank",
+                         company_id=company_id, cik="0000000066",
+                         share_class_figi="BBG001S9SFK1")
+        _insert_security(pg_db, 2, "pfbcn", name="Preferred Bank 5.00% Notes due 2030",
+                         company_id=company_id, cik="0000000066")
+
+        members = load_security_company_map(pg_db.engine)
+
+        assert members["security_id"].tolist() == [1, 2]
+        assert members["is_common_equity"].tolist() == [True, False]
+
 
 @pytest.mark.integration
 class TestLoadCompanyMarketCapPanel:
@@ -249,6 +329,21 @@ class TestLoadCompanyMarketCapPanel:
 
         assert panel.columns.tolist() == [company_id]
         assert panel[company_id].isna().all()
+
+    def test_figi_backed_name_hit_member_is_counted(self, pg_db):
+        # 二期翻正的一期误伤（pfbc 型）必须进合并市值
+        company_id = _insert_company(pg_db, "0000000066", "Preferred Bank")
+        _insert_security(pg_db, 1, "pfbc", name="Preferred Bank",
+                         company_id=company_id, cik="0000000066",
+                         share_class_figi="BBG001S9SFK1")
+        _insert_share(pg_db, 1, "2025-01-02", "2024-12-31", 1_000_000)
+        _insert_price(pg_db, 1, "2025-01-06", 7.0)
+        dates = pd.DatetimeIndex(pd.to_datetime(["2025-01-06"]))
+
+        panel = load_company_market_cap_panel(pg_db.engine, dates=dates)
+
+        assert panel.columns.tolist() == [company_id]
+        assert panel.loc["2025-01-06", company_id] == 7_000_000.0
 
     def test_company_ids_filter_scopes_members(self, pg_db):
         cid_a = _insert_company(pg_db, "0000000011", "Corp A")
