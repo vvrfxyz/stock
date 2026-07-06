@@ -199,6 +199,9 @@ python -m research.evaluate --factors your_factor_name --start 2024-05-14
 
 ## 数据约束
 
+> **开新因子/新研究前，先查 [`docs/research_ledger.md`](research_ledger.md)（研究总账）**——
+> 已裁决的因子、被证伪的假设、方法论教训都在那里，防止重复研究；每轮研究收尾也必须回写总账。
+
 - **回测起始日不早于 2003-01-01**：2026-07 corporate-actions 归档回填后，`computed_adjustment_factors` 覆盖 ex_date >= 2003-01-01（`docs/corp_actions_archive_2026-07.md`）。注意 evaluate 默认窗口仍为 2024-05-14 起（20 年全市场面板内存大，长窗口显式传 `--start`）；且非价格因子各有自身数据下限（short 2024-05+、13F 2013Q2+、市值类当前 2024-06+）。
 - **退市股因子缺口**：因子构建只跑 `is_active=True`，退市后有 SPLIT 事件但无因子行的证券须用 `securities_with_uncovered_events` 整体剔除。
 - **连库优先 `RESEARCH_DATABASE_URL`**：研究层默认连 253 生产库（只读），避免本地无数据时报错。
