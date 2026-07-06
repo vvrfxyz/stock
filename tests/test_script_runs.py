@@ -694,3 +694,49 @@ class TestSecFilingsTargetSelection:
 
     def test_default_forms_include_form_25_family(self):
         assert {"25", "25/A", "25-NSE", "25-NSE/A"} <= sec_filings.DEFAULT_FORMS
+
+
+import scripts.update_sec_fundamentals as sec_fundamentals  # noqa: E402
+
+
+class TestFundamentalsCikAnchoring:
+    """锁定 resolve_cik_map 的锚定语义：共用 CIK 时活跃优先、id 最小者；
+    --include-inactive 扩大候选集不得翻转既有锚点（否则重导会把 1290 万行
+    事实的 security_id 从活跃证券翻到低 id 退市证券，活跃 ticker 基本面变 NaN）。"""
+
+    @pytest.fixture()
+    def db(self):
+        manager = _SecFilingsFakeDb()
+        rows = [
+            # id, symbol, active, cik —— id 2 退市但比活跃的 id 5 更小，共用同一 CIK
+            (2, "nymt", False, "0001273685"),
+            (5, "adam", True, "0001273685"),
+            (7, "goneco", False, "0000000007"),  # 该 CIK 无活跃证券——退市股可当锚
+            (9, "aapl", True, "0000320193"),
+        ]
+        with manager.get_session() as session:
+            for id_, symbol, active, cik in rows:
+                session.add(Security(
+                    id=id_, symbol=symbol, current_symbol=symbol, market="US",
+                    type="CS", is_active=active, cik=cik, full_refresh_interval=30,
+                ))
+            session.commit()
+        return manager
+
+    def _args(self, **overrides):
+        defaults = dict(symbols=[], limit=0, include_inactive=False)
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def test_shared_cik_anchors_active_even_with_lower_inactive_id(self, db):
+        cik_map = sec_fundamentals.resolve_cik_map(db, self._args(include_inactive=True))
+        assert cik_map["0001273685"].id == 5  # 活跃 adam，而非低 id 退市 nymt
+
+    def test_inactive_only_cik_gets_inactive_anchor(self, db):
+        cik_map = sec_fundamentals.resolve_cik_map(db, self._args(include_inactive=True))
+        assert cik_map["0000000007"].id == 7
+
+    def test_default_active_only_excludes_inactive_only_ciks(self, db):
+        cik_map = sec_fundamentals.resolve_cik_map(db, self._args())
+        assert "0000000007" not in cik_map
+        assert cik_map["0001273685"].id == 5

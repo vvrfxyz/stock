@@ -54,20 +54,23 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include-inactive", action="store_true",
                         help="不带 symbols 时把退市证券也纳入 CIK 解析（默认仅活跃）；"
                              "供 --bulk-zip 回填退市 CS 的基本面/股本历史。共用 CIK 时"
-                             "仍锚 security_id 最小者，扩大候选集可能让退市证券成为锚。")
+                             "锚定活跃优先、security_id 最小者——仅当该 CIK 无活跃证券时"
+                             "才锚退市证券，既有锚点不因扩大候选集而翻转。")
     return parser
 
 
 def resolve_cik_map(db_manager: DatabaseManager, args: argparse.Namespace) -> dict[str, SimpleNamespace]:
     """返回 {cik10: primary_security}。CIK 取 SEC 映射优先、Massive 回退；
-    共用 CIK 时取 security_id 最小者为 primary。"""
+    共用 CIK 时锚定活跃优先、security_id 最小者（活跃证券排前，先见先锚——
+    退市证券只有在该 CIK 无活跃证券时才成为锚，避免 --include-inactive
+    把既有事实的 security_id 翻到低 id 退市证券上）。"""
     with db_manager.get_session() as session:
         query = session.query(Security.id, Security.symbol, Security.cik).filter(Security.market == "US")
         if args.symbols:
             query = query.filter(Security.symbol.in_([s.lower() for s in args.symbols]))
         elif not getattr(args, "include_inactive", False):
             query = query.filter(Security.is_active == True)  # noqa: E712
-        securities = query.order_by(Security.id.asc()).all()
+        securities = query.order_by(Security.is_active.desc(), Security.id.asc()).all()
         sec_cik_by_security = dict(
             session.query(SecurityIdentifier.security_id, SecurityIdentifier.id_value)
             .filter(SecurityIdentifier.id_type == "CIK", SecurityIdentifier.source == "SEC")
