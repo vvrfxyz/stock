@@ -171,7 +171,7 @@ def load_symbol_map(engine: Engine) -> pd.Series:
     return df.set_index("id")["symbol"]
 
 
-def load_delisting_returns(engine: Engine) -> pd.Series:
+def load_delisting_returns(engine: Engine, *, fund_closure_par: bool = True) -> pd.Series:
     """逐证券实测退市收益（index=security_id int, values=float）。
 
     来源 delisting_events.delisting_return（docs/todo_crsp_grade_2026-07.md 任务 1）。
@@ -179,16 +179,33 @@ def load_delisting_returns(engine: Engine) -> pd.Series:
     是最后那次退市，借用更早退市周期的收益属于口径错误——最近一次无实测值的
     证券整体缺席，由 run_backtest 的 terminal_return_fallback 兜底（宁缺毋滥）。
     表未填充时返回空 Series，调用方应退回全局标量假设。
+
+    fund_closure_par=True（默认）：ETF 清盘（reason_code='FUND_CLOSURE'）且
+    final_price 在场、delisting_return 为 NULL 的行在**读取时**合成 0.0。
+    理由（任务交接件"坑"节背书）：ETF 清盘的最终 NAV 分配常在退市后数周，
+    final_price 已收敛到预期 NAV，持有人按面值平价退出，return≈0 是对的口径；
+    事实表遵循"无实据不写数值"纪律，经验值只活在读取层——这正是那条经验值。
+    实测值（含恰为 0.0 的实测）永远优先，不会被合成值覆盖。纯粹主义者可
+    fund_closure_par=False 关闭，只拿实测行。
     """
+    if fund_closure_par:
+        value_expr = (
+            "coalesce(delisting_return, "
+            "case when reason_code = 'FUND_CLOSURE' and final_price is not null "
+            "then 0.0 end)"
+        )
+    else:
+        value_expr = "delisting_return"
     sql = text(
-        """
-        select security_id, delisting_return::float8 as delisting_return
+        f"""
+        select security_id, ({value_expr})::float8 as delisting_return
         from (
-            select distinct on (security_id) security_id, delisting_return
+            select distinct on (security_id)
+                   security_id, delisting_return, reason_code, final_price
             from delisting_events
             order by security_id, delist_date desc
         ) latest
-        where delisting_return is not null
+        where ({value_expr}) is not null
         """
     )
     df = pd.read_sql_query(sql, engine)

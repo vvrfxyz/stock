@@ -1,9 +1,12 @@
 """build_delisting_events 的单元 + PostgreSQL 集成测试。
 
 单元层锁定纯函数：final_price 窗口选择、失败证据桶、12d2-2 规则段解析、
-终价形态推断、reason 决策表（含 full-rebuild 全列 payload）。
+终价形态推断、reason 决策表（含 full-rebuild 全列 payload）、8-K 对价抽取
+（现金正则金样本 / 众数判定 / sanity 闸门 / 收购方保守抽取 / 换股比 /
+文档优先级与漏斗）。
 集成层锁定端到端语义：dry-run 不落库、--apply 幂等重建、MANUAL 行保护、
-delist_date 修订后的残行清理。文档抓取一律 mock，测试不触网。
+delist_date 修订后的残行清理、--fetch-8k-docs 对价写入与 ACQUISITION_CASH
+升级。文档抓取一律 mock，测试不触网。
 """
 from datetime import date, timedelta
 from decimal import Decimal
@@ -17,19 +20,30 @@ from scripts.build_delisting_events import (
     BUCKET_NO_PRICE_HISTORY,
     BUCKET_NO_RELIABLE_BAR,
     BUCKET_TRUNCATED,
+    EIGHTK_DOC_FAILURE_ABORT,
+    ConsiderationExtraction,
     DelistedSecurity,
     Evidence,
     Filing,
     MergeEvent,
+    cash_within_sanity_gate,
     classify,
     classify_price_failure,
     create_parser,
+    extract_acquirer_names,
+    extract_cash_amounts,
+    extract_consideration,
+    extract_stock_ratios,
     fetch_form25_rules,
+    fetch_merger_considerations,
     infer_price_pattern,
     needs_price_pattern,
     parse_form25_rule,
+    pick_clear_mode,
+    pick_merger_doc_candidates,
     run,
     select_final_bar,
+    strip_html,
 )
 
 
@@ -289,6 +303,75 @@ class TestClassifyDecisionTable:
         assert row["consideration_stock_ratio"] is None
         assert row["delisting_return"] is None
 
+    # --- --fetch-8k-docs 对价抽取后的升级/写数分支 ---
+
+    def test_cash_only_extraction_upgrades_to_acquisition_cash_and_computes_return(self):
+        row = self._classify(
+            evidence=Evidence(
+                eightk_201=[_filing(form="8-K")],
+                consideration=ConsiderationExtraction(
+                    cash=Decimal("10.05"), acquirer="Acme Holdings, Inc.",
+                    accessions=["0001-25-000201"],
+                ),
+            ),
+            final_price=Decimal("10.00"),
+        )
+        assert (row["reason_code"], row["reason_confidence"]) == ("ACQUISITION_CASH", "HIGH")
+        assert row["consideration_cash"] == Decimal("10.05")
+        assert row["acquirer_name"] == "Acme Holdings, Inc."
+        # (10.05 - 10.00) / 10.00 = 0.005，量化到 8 位小数
+        assert row["delisting_return"] == Decimal("0.00500000")
+        assert "consideration_cash=10.05" in row["evidence"]
+        assert "consideration_docs=0001-25-000201" in row["evidence"]
+        assert "acquirer=Acme Holdings, Inc." in row["evidence"]
+
+    def test_stock_only_extraction_is_acquisition_stock_no_return(self):
+        row = self._classify(evidence=Evidence(
+            eightk_201=[_filing(form="8-K")],
+            consideration=ConsiderationExtraction(stock_ratio=Decimal("0.7136")),
+        ))
+        assert row["reason_code"] == "ACQUISITION_STOCK"
+        assert row["consideration_stock_ratio"] == Decimal("0.7136")
+        assert row["delisting_return"] is None  # 股票对价本迭代不算 return
+        assert "consideration_stock_ratio=0.7136" in row["evidence"]
+
+    def test_mixed_consideration_stays_merger_with_both_fields_no_return(self):
+        row = self._classify(evidence=Evidence(
+            eightk_201=[_filing(form="8-K")],
+            consideration=ConsiderationExtraction(
+                cash=Decimal("2.89"), stock_ratio=Decimal("0.1867"),
+            ),
+        ))
+        assert row["reason_code"] == "MERGER"
+        assert row["consideration_cash"] == Decimal("2.89")
+        assert row["consideration_stock_ratio"] == Decimal("0.1867")
+        assert row["delisting_return"] is None
+
+    def test_cash_extraction_without_final_price_writes_consideration_but_no_return(self):
+        row = self._classify(
+            evidence=Evidence(
+                eightk_201=[_filing(form="8-K")],
+                consideration=ConsiderationExtraction(cash=Decimal("10.00")),
+            ),
+            final_price=None, final_price_date=None,
+            price_bucket=BUCKET_NO_PRICE_HISTORY,
+        )
+        assert row["reason_code"] == "ACQUISITION_CASH"
+        assert row["consideration_cash"] == Decimal("10.00")
+        assert row["delisting_return"] is None
+
+    def test_empty_extraction_keeps_merger_with_note_in_evidence(self):
+        row = self._classify(evidence=Evidence(
+            eightk_201=[_filing(form="8-K")],
+            consideration=ConsiderationExtraction(
+                accessions=["0001-25-000201"],
+                note="ambiguous_cash_candidates=10.00,12.00",
+            ),
+        ))
+        assert row["reason_code"] == "MERGER"
+        assert row["delisting_return"] is None
+        assert "consideration_note=ambiguous_cash_candidates=10.00,12.00" in row["evidence"]
+
 
 class TestNeedsPricePattern:
     def test_plain_cs_needs_pattern(self):
@@ -366,11 +449,344 @@ class TestFetchForm25Rules:
 
 
 # ---------------------------------------------------------------------------
+# 8-K 对价抽取：现金正则金样本（realistic 8-K 句式）
+# ---------------------------------------------------------------------------
+
+class TestStripHtml:
+    def test_strips_tags_and_entities(self):
+        doc = ("<html><body><p>the right to receive&nbsp;$26.50 in <b>cash</b>,\n"
+               "without interest</p><script>var x=1;</script></body></html>")
+        assert strip_html(doc) == "the right to receive $26.50 in cash, without interest"
+
+    def test_unescapes_curly_quotes(self):
+        assert strip_html("Falcon Corp. (&#8220;Parent&#8221;)") == "Falcon Corp. (“Parent”)"
+
+
+class TestExtractCashAmounts:
+    def test_right_to_receive_in_cash_without_interest(self):
+        text_ = ("each Share was converted into the right to receive $26.50 in cash, "
+                 "without interest and less applicable withholding taxes")
+        assert extract_cash_amounts(text_) == [Decimal("26.50")]
+
+    def test_per_share_in_cash_with_thousands_comma(self):
+        text_ = "holders became entitled to receive $1,264.00 per share in cash"
+        assert extract_cash_amounts(text_) == [Decimal("1264.00")]
+
+    def test_cash_in_an_amount_equal_to_per_share(self):
+        text_ = "cash in an amount equal to $8.25 per share, without interest"
+        assert extract_cash_amounts(text_) == [Decimal("8.25")]
+
+    def test_amount_in_cash_equal_to_per_share(self):
+        text_ = "the right to receive an amount in cash equal to $12.00 per share"
+        assert extract_cash_amounts(text_) == [Decimal("12.00")]
+
+    def test_without_interest_between_amount_and_in_cash(self):
+        text_ = "the right to receive $12.00, without interest, in cash"
+        assert extract_cash_amounts(text_) == [Decimal("12.00")]
+
+    def test_aggregate_purchase_price_not_matched_as_per_share(self):
+        text_ = "for an aggregate purchase price of $1,200,000,000 in cash"
+        assert extract_cash_amounts(text_) == []
+
+    def test_aggregate_guard_blocks_right_to_receive_without_per_share(self):
+        # "right to receive ... in cash" 自身不含 per share 时，回看窗口出现
+        # aggregate 即判为总价语境——绝不当每股对价
+        text_ = "in the aggregate, holders will have the right to receive $50,000,000 in cash"
+        assert extract_cash_amounts(text_) == []
+
+    def test_aggregate_before_a_true_per_share_amount_is_kept(self):
+        # 匹配段自含 per share 时不受 aggregate 回看误伤
+        text_ = "for an aggregate consideration of $150,000,000, or $26.50 per share in cash"
+        assert extract_cash_amounts(text_) == [Decimal("26.50")]
+
+    def test_same_occurrence_matched_by_two_patterns_counts_once(self):
+        # "right to receive $X per share in cash" 同时命中 P1/P2——按金额位置去重
+        text_ = "the right to receive $26.50 per share in cash"
+        assert extract_cash_amounts(text_) == [Decimal("26.50")]
+
+    def test_repeated_occurrences_all_collected(self):
+        text_ = ("converted into the right to receive $26.50 in cash. As a result of "
+                 "the Merger, each Share represents the right to receive $26.50 in cash.")
+        assert extract_cash_amounts(text_) == [Decimal("26.50"), Decimal("26.50")]
+
+    def test_unrelated_dollar_amounts_ignored(self):
+        text_ = "the Company repaid $45,000,000 of outstanding debt at closing"
+        assert extract_cash_amounts(text_) == []
+
+
+class TestPickClearMode:
+    def test_empty_is_none(self):
+        assert pick_clear_mode([]) is None
+
+    def test_single_value_accepted(self):
+        assert pick_clear_mode([Decimal("26.50")]) == Decimal("26.50")
+
+    def test_clear_mode_across_docs(self):
+        amounts = [Decimal("26.50"), Decimal("26.50"), Decimal("27.00")]
+        assert pick_clear_mode(amounts) == Decimal("26.50")
+
+    def test_tie_is_indeterminate(self):
+        assert pick_clear_mode([Decimal("26.50"), Decimal("27.00")]) is None
+
+
+class TestCashSanityGate:
+    FINAL = Decimal("10.00")
+
+    def test_near_final_price_passes(self):
+        assert cash_within_sanity_gate(Decimal("10.05"), self.FINAL) is True
+
+    def test_boundaries_inclusive(self):
+        assert cash_within_sanity_gate(Decimal("2.00"), self.FINAL) is True    # 0.2x
+        assert cash_within_sanity_gate(Decimal("50.00"), self.FINAL) is True   # 5x
+
+    def test_below_floor_rejected(self):
+        assert cash_within_sanity_gate(Decimal("1.99"), self.FINAL) is False
+
+    def test_above_ceiling_rejected(self):
+        assert cash_within_sanity_gate(Decimal("500.00"), self.FINAL) is False
+
+
+class TestExtractAcquirerNames:
+    def test_merger_with_company_keeps_comma_suffix(self):
+        text_ = "entered into an Agreement and Plan of Merger with Acme Holdings, Inc., a Delaware corporation"
+        assert extract_acquirer_names(text_) == ["Acme Holdings, Inc."]
+
+    def test_acquired_by(self):
+        text_ = "the Company was acquired by Global Payments Inc. pursuant to the Merger Agreement"
+        assert extract_acquirer_names(text_) == ["Global Payments Inc."]
+
+    def test_wholly_owned_subsidiary_of(self):
+        text_ = "the Company became a wholly owned subsidiary of Blackstone Inc."
+        assert extract_acquirer_names(text_) == ["Blackstone Inc."]
+
+    def test_parent_defined_term_resolution(self):
+        text_ = "Falcon Bidco Corp. (“Parent”) caused Merger Sub to merge"
+        assert extract_acquirer_names(text_) == ["Falcon Bidco Corp."]
+
+    def test_corp_suffix_ends_name_before_next_sentence(self):
+        # 后缀 token 是名字的自然右边界——不误吞下一句的句首大写词
+        text_ = "the Company was acquired by Global Payments Inc. The transaction closed"
+        assert extract_acquirer_names(text_) == ["Global Payments Inc."]
+
+    def test_merger_sub_placeholder_rejected(self):
+        assert extract_acquirer_names("the merger with Merger Sub was completed") == []
+
+    def test_lowercase_generic_reference_not_captured(self):
+        assert extract_acquirer_names("the merger with the surviving corporation") == []
+
+    def test_parent_placeholder_alone_rejected(self):
+        assert extract_acquirer_names("became a wholly owned subsidiary of Parent") == []
+
+
+class TestExtractStockRatios:
+    def test_clean_ratio_match(self):
+        text_ = "0.7136 shares of Acquirer Inc. common stock for each share of Company common stock"
+        assert extract_stock_ratios(text_) == [Decimal("0.7136")]
+
+    def test_integer_share_counts_not_matched(self):
+        # 整数 "100 shares of" 是持仓/授权语境，换股比要求小数形态
+        text_ = "purchased 100 shares of common stock for each share plan participant"
+        assert extract_stock_ratios(text_) == []
+
+    def test_mixed_sentence_yields_cash_and_ratio(self):
+        text_ = ("the right to receive $3.50 per share in cash and 0.7136 shares of "
+                 "Acquirer Inc. common stock for each share of Company Common Stock")
+        assert extract_cash_amounts(text_) == [Decimal("3.50")]
+        assert extract_stock_ratios(text_) == [Decimal("0.7136")]
+
+
+# ---------------------------------------------------------------------------
+# 跨文档汇总（extract_consideration）与文档优先级
+# ---------------------------------------------------------------------------
+
+def _doc(accession, text_):
+    return (_filing(accession=accession, form="8-K"), text_)
+
+
+class TestExtractConsideration:
+    def test_mode_across_docs_with_gate_pass(self):
+        docs = [
+            _doc("A1", "the right to receive $26.50 in cash. Also the right to receive $26.50 in cash."),
+            _doc("A2", "stockholders received $27.00 per share in cash"),
+        ]
+        got = extract_consideration(docs, Decimal("26.40"))
+        assert got.cash == Decimal("26.50")   # 众数 2:1
+        assert got.accessions == ["A1", "A2"]
+        assert got.note is None
+
+    def test_tie_is_ambiguous_and_recorded(self):
+        docs = [
+            _doc("A1", "the right to receive $26.50 in cash"),
+            _doc("A2", "stockholders received $27.00 per share in cash"),
+        ]
+        got = extract_consideration(docs, Decimal("26.40"))
+        assert got.cash is None
+        assert "ambiguous_cash_candidates=26.50,27.00" in got.note
+
+    def test_sanity_gate_rejection_leaves_cash_null_with_note(self):
+        docs = [_doc("A1", "the right to receive $500.00 per share in cash")]
+        got = extract_consideration(docs, Decimal("10.00"))
+        assert got.cash is None
+        assert "cash_gated_out=500.00 vs final_price=10.00" in got.note
+
+    def test_no_final_price_skips_gate_but_keeps_cash(self):
+        docs = [_doc("A1", "the right to receive $26.50 in cash")]
+        got = extract_consideration(docs, None)
+        assert got.cash == Decimal("26.50")
+
+    def test_conflicting_acquirers_resolve_to_null(self):
+        docs = [
+            _doc("A1", "was acquired by Global Payments Inc. pursuant to the merger"),
+            _doc("A2", "the merger with Acme Holdings, Inc. was completed"),
+        ]
+        got = extract_consideration(docs, None)
+        assert got.acquirer is None
+        assert "ambiguous_acquirers=" in got.note
+
+    def test_same_acquirer_from_two_patterns_is_accepted(self):
+        docs = [_doc("A1", ("the merger with Falcon Bidco Corp. was completed. "
+                            "Falcon Bidco Corp. (“Parent”) paid the consideration"))]
+        got = extract_consideration(docs, None)
+        assert got.acquirer == "Falcon Bidco Corp."
+
+    def test_conflicting_stock_ratios_resolve_to_null(self):
+        docs = [
+            _doc("A1", "0.7136 shares of Acquirer Inc. common stock for each share"),
+            _doc("A2", "0.5000 shares of Acquirer Inc. common stock for each share"),
+        ]
+        got = extract_consideration(docs, None)
+        assert got.stock_ratio is None
+        assert "ambiguous_stock_ratios=" in got.note
+
+
+class TestPickMergerDocCandidates:
+    DELIST = date(2025, 6, 30)
+
+    def test_prefers_201_then_301_then_defm14a_capped_at_three(self):
+        evidence = Evidence(
+            eightk_201=[
+                _filing(accession="A201-far", filed=self.DELIST + timedelta(days=20), doc_url="https://x/201far"),
+                _filing(accession="A201-near", filed=self.DELIST + timedelta(days=2), doc_url="https://x/201near"),
+            ],
+            eightk_301=[_filing(accession="A301", filed=self.DELIST, doc_url="https://x/301")],
+            defm14a=[_filing(accession="ADEF", form="DEFM14A",
+                             filed=self.DELIST - timedelta(days=60), doc_url="https://x/def")],
+        )
+        picked = pick_merger_doc_candidates(evidence, self.DELIST)
+        assert [f.accession_number for f in picked] == ["A201-near", "A201-far", "A301"]
+
+    def test_defm14a_fills_when_fewer_8ks(self):
+        evidence = Evidence(
+            eightk_201=[_filing(accession="A201", doc_url="https://x/201")],
+            defm14a=[_filing(accession="ADEF", form="DEFM14A",
+                             filed=self.DELIST - timedelta(days=60), doc_url="https://x/def")],
+        )
+        assert [f.accession_number for f in pick_merger_doc_candidates(evidence, self.DELIST)] == ["A201", "ADEF"]
+
+    def test_same_accession_in_201_and_301_deduped(self):
+        # 一份 8-K 常同时带 items 2.01 与 3.01
+        shared = _filing(accession="A-BOTH", doc_url="https://x/both")
+        evidence = Evidence(eightk_201=[shared], eightk_301=[shared])
+        assert [f.accession_number for f in pick_merger_doc_candidates(evidence, self.DELIST)] == ["A-BOTH"]
+
+    def test_docs_without_url_excluded(self):
+        evidence = Evidence(eightk_201=[_filing(doc_url=None)])
+        assert pick_merger_doc_candidates(evidence, self.DELIST) == []
+
+
+# ---------------------------------------------------------------------------
+# --fetch-8k-docs 阶段（mock 抓取，不触网）
+# ---------------------------------------------------------------------------
+
+class TestFetchMergerConsiderations:
+    def _candidate(self, security_id=1, delist=date(2025, 6, 30), doc_url="https://x/8k.htm"):
+        security = _security(security_id=security_id, cik="0000000123", delist=delist)
+        evidence = Evidence(eightk_201=[_filing(form="8-K", doc_url=doc_url)])
+        return security, evidence
+
+    def test_funnel_counts_and_extraction(self):
+        security, evidence = self._candidate()
+        fetched_urls = []
+
+        def fake(url):
+            fetched_urls.append(url)
+            return "<p>the right to receive $26.50 in cash, without interest</p>"
+
+        stats = fetch_merger_considerations(
+            [security], {security.id: evidence}, {security.id: Decimal("26.40")},
+            fetch_text=fake,
+        )
+        assert fetched_urls == ["https://x/8k.htm"]
+        assert stats["candidates"] == 1
+        assert stats["docs_fetched"] == 1
+        assert stats["cash_extracted"] == 1
+        assert stats["cash_gated_out"] == 0
+        assert evidence.consideration.cash == Decimal("26.50")
+
+    def test_non_merger_security_is_not_a_candidate(self):
+        security = _security()
+        evidence = Evidence(form25=[_filing(doc_url="https://x/f25")])  # 无 8-K 2.01
+        calls = []
+        stats = fetch_merger_considerations(
+            [security], {security.id: evidence}, {security.id: Decimal("10.00")},
+            fetch_text=lambda url: calls.append(url) or "",
+        )
+        assert calls == []
+        assert stats["candidates"] == 0
+        assert evidence.consideration is None
+
+    def test_gated_out_counted_in_funnel(self):
+        security, evidence = self._candidate()
+        stats = fetch_merger_considerations(
+            [security], {security.id: evidence}, {security.id: Decimal("10.00")},
+            fetch_text=lambda url: "the right to receive $500.00 per share in cash",
+        )
+        assert stats["cash_extracted"] == 0
+        assert stats["cash_gated_out"] == 1
+        assert evidence.consideration.cash is None
+        assert "cash_gated_out" in evidence.consideration.note
+
+    def test_missing_doc_url_counted(self):
+        security, evidence = self._candidate(doc_url=None)
+        stats = fetch_merger_considerations(
+            [security], {security.id: evidence}, {security.id: Decimal("10.00")},
+            fetch_text=lambda url: "",
+        )
+        assert stats["no_doc_url"] == 1
+        assert evidence.consideration.note == "no_primary_document_url"
+
+    def test_offline_aborts_gracefully_after_consecutive_failures(self):
+        pairs = [self._candidate(security_id=i, doc_url=f"https://x/{i}") for i in range(1, 10)]
+        securities = [s for s, _ in pairs]
+        evidences = {s.id: e for s, e in pairs}
+
+        def _fail(url):
+            raise ConnectionError("offline")
+
+        stats = fetch_merger_considerations(
+            securities, evidences, {s.id: Decimal("10.00") for s in securities},
+            fetch_text=_fail,
+        )
+        assert stats["docs_failed"] == EIGHTK_DOC_FAILURE_ABORT  # 保险丝后停止
+        assert stats["candidates"] == 9  # 候选仍全量计数，漏斗可对账
+        assert stats["cash_extracted"] == 0
+        assert all(e.consideration is None for e in evidences.values())
+
+
+# ---------------------------------------------------------------------------
 # PostgreSQL 集成：端到端 dry-run / --apply / 幂等 / MANUAL 保护 / 残行清理
 # ---------------------------------------------------------------------------
 
 def _args(*argv):
     return create_parser().parse_args(list(argv))
+
+
+def test_parser_fetch_8k_docs_flag_defaults_off_and_composes():
+    assert _args().fetch_8k_docs is False
+    args = _args("--fetch-8k-docs", "--fetch-form25-docs", "--apply", "--limit", "5")
+    assert args.fetch_8k_docs is True
+    assert args.fetch_form25_docs is True
+    assert args.apply is True and args.limit == 5
 
 
 @pytest.mark.integration
@@ -558,6 +974,151 @@ class TestBuildDelistingEventsPg:
         assert row.final_price == Decimal("3.850000")
         assert row.final_price_date == delist - timedelta(days=1)
         assert "final_price_bucket" not in (row.evidence or "")
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL 集成：--fetch-8k-docs 对价写入 / ACQUISITION_CASH 升级 / 幂等
+# ---------------------------------------------------------------------------
+
+# 现金并购：单一收购方（两种触发短语归一到同一名字）、每股 $26.50、终价 25.00
+CASH_8K_HTML = (
+    "<html><body><p>On June 27, 2025, the Company completed the previously announced "
+    "merger with Falcon Bidco Corp. Each share of common stock issued and outstanding "
+    "was converted into the right to receive $26.50 in cash, without interest. "
+    "Falcon Bidco Corp. (&#8220;Parent&#8221;) paid the aggregate consideration from "
+    "cash on hand.</p></body></html>"
+)
+# 闸门拒绝：抽出的 $500.00 相对终价 10.00 出界 [0.2x, 5x]
+GATED_8K_HTML = (
+    "<html><body><p>each share was converted into the right to receive "
+    "$500.00 per share in cash</p></body></html>"
+)
+# 换股对价：只填 ratio，不算 return
+STOCK_8K_HTML = (
+    "<html><body><p>each share of Company common stock was converted into "
+    "0.7136 shares of Eagle Acquisition Corp. common stock for each share held. "
+    "The Company became a wholly owned subsidiary of Eagle Acquisition Corp.</p></body></html>"
+)
+
+
+@pytest.mark.integration
+class TestFetch8kConsiderationPg:
+    DELIST = date(2025, 6, 30)
+    DOCS = {
+        "https://sec.test/cash8k.htm": CASH_8K_HTML,
+        "https://sec.test/gate8k.htm": GATED_8K_HTML,
+        "https://sec.test/stock8k.htm": STOCK_8K_HTML,
+    }
+
+    def _seed(self, pg_db):
+        from data_models.models import DailyPrice, SecFiling, Security
+
+        with pg_db.get_session() as session:
+            specs = [
+                (21, "cash", "111", Decimal("25.00"), "https://sec.test/cash8k.htm"),
+                (22, "gate", "222", Decimal("10.00"), "https://sec.test/gate8k.htm"),
+                (23, "stok", "333", Decimal("30.00"), "https://sec.test/stock8k.htm"),
+            ]
+            for sid, symbol, cik, close, doc_url in specs:
+                session.add(Security(
+                    id=sid, symbol=symbol, current_symbol=symbol, market="US",
+                    type="CS", is_active=False, delist_date=self.DELIST,
+                    cik=cik, full_refresh_interval=30,
+                ))
+                session.add(DailyPrice(
+                    security_id=sid, date=self.DELIST - timedelta(days=3),
+                    close=close, volume=1000,
+                ))
+                session.add(SecFiling(
+                    source="SEC_EDGAR", cik=cik, form_type="8-K",
+                    accession_number=f"0001-25-9{sid:04d}",
+                    filing_date=self.DELIST + timedelta(days=3),
+                    items="2.01,9.01", primary_document_url=doc_url,
+                ))
+            session.commit()
+
+    def _patch_fetcher(self, monkeypatch):
+        import scripts.build_delisting_events as bde
+        monkeypatch.setattr(bde, "_edgar_fetch_text", lambda: self.DOCS.__getitem__)
+
+    def _rows(self, pg_db):
+        with pg_db.engine.connect() as conn:
+            return {
+                r.security_id: r
+                for r in conn.execute(text(
+                    "SELECT * FROM delisting_events ORDER BY security_id"
+                ))
+            }
+
+    def test_apply_writes_consideration_only_for_gated_hits(self, pg_db, monkeypatch):
+        self._seed(pg_db)
+        self._patch_fetcher(monkeypatch)
+        # 与 --fetch-form25-docs 组合可用（本 seed 无 Form25 候选，阶段空跑）
+        assert run(_args("--apply", "--fetch-form25-docs", "--fetch-8k-docs"), pg_db) == 0
+        rows = self._rows(pg_db)
+
+        # 现金独占：升级 ACQUISITION_CASH，写对价与实测 return
+        assert rows[21].reason_code == "ACQUISITION_CASH"
+        assert rows[21].reason_confidence == "HIGH"
+        assert rows[21].source == "8K"
+        assert rows[21].consideration_cash == Decimal("26.50")
+        assert rows[21].acquirer_name == "Falcon Bidco Corp."
+        # (26.50 - 25.00) / 25.00 = 0.06
+        assert rows[21].delisting_return == Decimal("0.06")
+        assert "consideration_docs=0001-25-90021" in rows[21].evidence
+        assert "consideration_cash=26.50" in rows[21].evidence
+
+        # 闸门拒绝：保持 MERGER，不写数值，evidence 留痕
+        assert rows[22].reason_code == "MERGER"
+        assert rows[22].consideration_cash is None
+        assert rows[22].delisting_return is None
+        assert "cash_gated_out=500.00 vs final_price=10.00" in rows[22].evidence
+
+        # 换股独占：ACQUISITION_STOCK，本迭代不算 return
+        assert rows[23].reason_code == "ACQUISITION_STOCK"
+        assert rows[23].consideration_stock_ratio == Decimal("0.7136")
+        assert rows[23].acquirer_name == "Eagle Acquisition Corp."
+        assert rows[23].consideration_cash is None
+        assert rows[23].delisting_return is None
+
+    def test_idempotent_rerun_with_8k_docs(self, pg_db, monkeypatch):
+        self._seed(pg_db)
+        self._patch_fetcher(monkeypatch)
+        assert run(_args("--apply", "--fetch-8k-docs"), pg_db) == 0
+        before = {
+            sid: (r.reason_code, r.consideration_cash, r.delisting_return,
+                  r.evidence, r.created_at)
+            for sid, r in self._rows(pg_db).items()
+        }
+        assert run(_args("--apply", "--fetch-8k-docs"), pg_db) == 0
+        after = {
+            sid: (r.reason_code, r.consideration_cash, r.delisting_return,
+                  r.evidence, r.created_at)
+            for sid, r in self._rows(pg_db).items()
+        }
+        assert after == before
+
+    def test_rerun_without_8k_docs_reverts_to_pure_classifier_output(self, pg_db, monkeypatch):
+        """full-rebuild 语义：不带 --fetch-8k-docs 重跑，对价字段随之清 NULL——
+        对价不是缓存而是每次运行的抽取产物，evidence 反映当次运行的证据面。"""
+        self._seed(pg_db)
+        self._patch_fetcher(monkeypatch)
+        assert run(_args("--apply", "--fetch-8k-docs"), pg_db) == 0
+        assert self._rows(pg_db)[21].consideration_cash == Decimal("26.50")
+
+        assert run(_args("--apply"), pg_db) == 0
+        row = self._rows(pg_db)[21]
+        assert row.reason_code == "MERGER"
+        assert row.consideration_cash is None
+        assert row.delisting_return is None
+
+    def test_limit_composes_with_8k_docs(self, pg_db, monkeypatch):
+        self._seed(pg_db)
+        self._patch_fetcher(monkeypatch)
+        assert run(_args("--apply", "--fetch-8k-docs", "--limit", "1"), pg_db) == 0
+        rows = self._rows(pg_db)
+        assert set(rows) == {21}
+        assert rows[21].reason_code == "ACQUISITION_CASH"
 
 
 # ---------------------------------------------------------------------------

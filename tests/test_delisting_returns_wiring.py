@@ -1,10 +1,13 @@
 """delisting_events.delisting_return 到研究层的接线测试。
 
-覆盖两段（docs/todo_crsp_grade_2026-07.md 任务 1 步骤 4）：
+覆盖三段（docs/todo_crsp_grade_2026-07.md 任务 1 步骤 4）：
 - run_baselines.resolve_terminal_returns：纯函数决策——实测非空时 Series 优先、
   CLI 标量降级为 fallback；实测为空 / 显式 opt-out 时行为与旧口径逐位一致。
 - data.load_delisting_returns：只取每证券最近一次退市事件的实测收益，NULL 行
   整体缺席（宁缺毋滥，由 fallback 兜底），绝不借用更早退市周期的收益。
+- fund_closure_par 开关：ETF 清盘（FUND_CLOSURE + final_price 在场 + 实测 NULL）
+  在读取层合成 0.0（事实表纪律：无实据不写数值，经验值活在读取层）；
+  opt-out 排除合成行；实测值永远优先于合成值。
 """
 from datetime import date
 from decimal import Decimal
@@ -159,3 +162,85 @@ def test_load_delisting_returns_excludes_null_and_takes_latest_episode(pg_db):
     assert got.dtype == "float64"
     # run_backtest 需要唯一 index 才能 reindex 到面板列
     assert got.index.is_unique
+
+
+# ---------------------------------------------------------------------------
+# fund_closure_par：ETF 清盘平价合成（读取层经验值，事实表保持 NULL）
+# ---------------------------------------------------------------------------
+
+def _fund_closure_event(security_id, delist_date, *, final_price, delisting_return=None):
+    return _event(
+        security_id, delist_date, delisting_return,
+        reason_code="FUND_CLOSURE",
+        reason_confidence="MEDIUM",
+        source="TICKER_EVENT",
+        final_price=final_price,
+        final_price_date=delist_date if final_price is not None else None,
+    )
+
+
+@pytest.mark.integration
+def test_fund_closure_par_synthesizes_zero_at_read_time(pg_db):
+    from research.data import load_delisting_returns
+
+    for sid, sym in [(1, "detf"), (2, "noprc"), (3, "dead")]:
+        _insert_security(pg_db, sid, sym)
+
+    pg_db.upsert_delisting_events([
+        # FUND_CLOSURE + final_price 在场 + 实测 NULL -> 默认合成 0.0
+        _fund_closure_event(1, date(2023, 4, 14), final_price=Decimal("25.10")),
+        # FUND_CLOSURE 但无 final_price：终价都没有，平价假设无锚点，不合成
+        _fund_closure_event(2, date(2023, 4, 14), final_price=None),
+        # 非 ETF 的 NULL 行照旧缺席
+        _event(3, date(2023, 4, 14), None),
+    ])
+
+    got = load_delisting_returns(pg_db.engine)
+    assert got.to_dict() == {1: 0.0}
+    assert got.dtype == "float64"
+
+
+@pytest.mark.integration
+def test_fund_closure_par_opt_out_excludes_synthesized_rows(pg_db):
+    from research.data import load_delisting_returns
+
+    _insert_security(pg_db, 1, "detf")
+    _insert_security(pg_db, 2, "dead")
+    pg_db.upsert_delisting_events([
+        _fund_closure_event(1, date(2023, 4, 14), final_price=Decimal("25.10")),
+        _event(2, date(2020, 3, 2), Decimal("-1")),   # 实测行不受开关影响
+    ])
+
+    got = load_delisting_returns(pg_db.engine, fund_closure_par=False)
+    assert got.to_dict() == {2: -1.0}
+
+
+@pytest.mark.integration
+def test_fund_closure_measured_return_never_overridden_by_par(pg_db):
+    from research.data import load_delisting_returns
+
+    _insert_security(pg_db, 1, "detf")
+    # 罕见但可能：某 ETF 清盘拿到了实测收益（如清算分配实据）——绝不被 0.0 覆盖
+    pg_db.upsert_delisting_events([
+        _fund_closure_event(1, date(2023, 4, 14),
+                            final_price=Decimal("25.10"),
+                            delisting_return=Decimal("-0.013")),
+    ])
+
+    assert load_delisting_returns(pg_db.engine).to_dict() == {1: -0.013}
+    assert load_delisting_returns(pg_db.engine, fund_closure_par=False).to_dict() == {1: -0.013}
+
+
+@pytest.mark.integration
+def test_fund_closure_par_respects_latest_episode_semantics(pg_db):
+    from research.data import load_delisting_returns
+
+    _insert_security(pg_db, 1, "retf")
+    # 两次退市：更早一次是可合成的 FUND_CLOSURE，最近一次是无实据的 UNKNOWN
+    # —— 面板终局是最近那次，不得借用旧周期的合成收益
+    pg_db.upsert_delisting_events([
+        _fund_closure_event(1, date(2015, 1, 5), final_price=Decimal("20.00")),
+        _event(1, date(2024, 9, 30), None),
+    ])
+
+    assert load_delisting_returns(pg_db.engine).empty

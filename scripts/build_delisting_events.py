@@ -28,9 +28,20 @@
             终价稳定贴整（半美元格点）且成交萎缩 → 疑似现金并购 ACQUISITION_CASH。
    - 其余  UNKNOWN（confidence NULL）——UNKNOWN 清单是一等输出（--unknown-csv 可导出）。
 
-3. delisting_return 只在有实据时写：现金并购 = (对价 - final_price)/final_price（本迭代
-   未做 8-K 对价抽取，恒 NULL）；BANKRUPTCY 的 -1.0 需要法院/文件级硬证据（本迭代不产出）。
-   自检：现金并购类 return 分布（p10/p50/p90）应聚在 0 附近，每次运行打印。
+3. 对价抽取（--fetch-8k-docs，可选网络阶段）：对 HIGH 层并购族候选（同 CIK 8-K
+   item 2.01 在 delist_date ±30 天内）抓取至多 3 份主文档（优先 item 2.01 的 8-K，
+   其次 item 3.01，再次 delist 前 120 天内的 DEFM14A），从原文抽每股现金对价 /
+   收购方 / 换股比。宁缺毋滥：
+   - 现金金额收集全部候选，只有存在明确众数才采信；再过 final_price 闸门
+     [0.2x, 5x]，出界记 evidence 不写数值；
+   - 现金独占 → 升级 ACQUISITION_CASH；换股独占 → ACQUISITION_STOCK；混合对价
+     保持 MERGER 并同时写两个对价字段（本迭代不为含股票对价的交易算 return）；
+   - acquirer 只认保守触发短语且全文档唯一，拿不准置 NULL。
+
+4. delisting_return 只在有实据时写：现金并购 = (对价 - final_price)/final_price，
+   仅现金独占且 final_price 在场时计算；BANKRUPTCY 的 -1.0 需要法院/文件级硬证据
+   （本迭代不产出）。自检：现金并购类 return 分布（p10/p50/p90）应聚在 0 附近，
+   每次运行连同抽取漏斗（candidates/docs fetched/cash extracted/gated out）打印。
 
 写路径 db_manager.upsert_delisting_events 为幂等全量重建语义（冲突时全 payload 列
 原位覆盖，未提供字段清 NULL），本脚本每行都给全所有列；source='MANUAL' 的存量行
@@ -40,10 +51,12 @@
     python scripts/build_delisting_events.py                          # dry-run（默认，不写库）
     python scripts/build_delisting_events.py --limit 100              # 测试子集
     python scripts/build_delisting_events.py --fetch-form25-docs      # 附加 Form 25 原文规则段解析
+    python scripts/build_delisting_events.py --fetch-8k-docs          # 附加 8-K/DEFM14A 对价抽取
     python scripts/build_delisting_events.py --apply                  # 写库（先确认 dry-run 输出）
 """
 import argparse
 import csv
+import html
 import json
 import os
 import re
@@ -83,6 +96,7 @@ FORM25_TYPES = ("25", "25/A", "25-NSE", "25-NSE/A")
 FORM25_WINDOW_BEFORE_DAYS = 90
 FORM25_WINDOW_AFTER_DAYS = 30
 EIGHTK_WINDOW_DAYS = 30
+DEFM14A_WINDOW_BEFORE_DAYS = 120
 
 # Form 25 的 12d2-2 规则段 → reason（任务交接口径：(a) 证券消灭/并购，
 # (b) 交易所摘牌不达标，(c) 发行人自愿退市）
@@ -104,6 +118,12 @@ PATTERN_CASH_VOLUME_SHRINK = 0.6       # 尾段均量 < 前段均量的 60%
 
 EVIDENCE_ACCESSION_CAP = 3             # evidence 里每类 accession 最多记 3 个
 FORM25_DOC_FAILURE_ABORT = 5           # 连续抓取失败即判定离线，跳过整个文档阶段
+EIGHTK_DOC_FAILURE_ABORT = 5           # --fetch-8k-docs 同款离线保险丝
+EIGHTK_DOCS_PER_SECURITY = 3           # 每只候选最多抓 3 份主文档
+# 对价现金 sanity 闸门：现金并购终价应已收敛到对价附近，出这个区间的抽取值
+# 大概率是误中（分红、总价、其他证券的价格），记 evidence 不写数值。
+CASH_SANITY_FLOOR_RATIO = 0.2
+CASH_SANITY_CEIL_RATIO = 5.0
 UPSERT_CHUNK_SIZE = 500
 
 
@@ -125,6 +145,9 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fetch-form25-docs", action="store_true",
                         help="抓取 Form 25 原文解析 12d2-2 规则段（需 SEC_USER_AGENT；\n"
                              "离线/失败自动跳过，不影响其余分层）。")
+    parser.add_argument("--fetch-8k-docs", action="store_true",
+                        help="抓取并购族候选的 8-K/DEFM14A 主文档抽对价（现金/换股比/收购方，\n"
+                             "需 SEC_USER_AGENT；离线/失败自动跳过；可与 --fetch-form25-docs 叠加）。")
     parser.add_argument("--unknown-csv", type=str, default=None,
                         help="把完整 UNKNOWN 清单导出到该 CSV 路径（一等输出，供人工与后续数据源迭代）。")
     return parser
@@ -159,11 +182,28 @@ class MergeEvent:
 
 
 @dataclass
+class ConsiderationExtraction:
+    """--fetch-8k-docs 阶段对一只候选证券的抽取结果（宁缺毋滥，拿不准全 NULL）。
+
+    note 记录不采信的原因（ambiguous_* / cash_gated_out / no_primary_document_url），
+    连同 accessions 一起进 evidence，保证重跑输出稳定、留人工复核线索。
+    """
+    cash: Decimal | None = None
+    stock_ratio: Decimal | None = None
+    acquirer: str | None = None
+    accessions: list[str] = field(default_factory=list)  # 实际解析过的文档
+    note: str | None = None
+
+
+@dataclass
 class Evidence:
     form25: list[Filing] = field(default_factory=list)
     eightk_201: list[Filing] = field(default_factory=list)
     merge_events: list[MergeEvent] = field(default_factory=list)
     form25_rule: str | None = None  # 'a' / 'b' / 'c'，仅 --fetch-form25-docs 解析成功时
+    eightk_301: list[Filing] = field(default_factory=list)   # 仅 --fetch-8k-docs 加载
+    defm14a: list[Filing] = field(default_factory=list)      # 仅 --fetch-8k-docs 加载
+    consideration: ConsiderationExtraction | None = None     # 仅 --fetch-8k-docs 产出
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +330,260 @@ def pick_form25_doc_candidate(evidence: Evidence, delist_date: date) -> Filing |
 
 
 # ---------------------------------------------------------------------------
+# 8-K/DEFM14A 对价抽取（--fetch-8k-docs）：纯函数层
+# ---------------------------------------------------------------------------
+
+def strip_html(doc: str) -> str:
+    """8-K/DEFM14A 是 HTML：去 script/style 与标签、解实体（含花引号）、归一空白
+    （含标签替换成空格后残留的"标点前空格"）。"""
+    text_ = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", doc)
+    text_ = re.sub(r"(?s)<[^>]+>", " ", text_)
+    text_ = html.unescape(text_)
+    text_ = re.sub(r"\s+", " ", text_)
+    return re.sub(r"\s+([,.;:)])", r"\1", text_).strip()
+
+
+# 金额：允许千分位逗号（"1,264.00"）
+_CASH_AMOUNT = r"(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)"
+
+# 每股现金对价的保守触发短语（任务口径：这组正则相当可靠）。
+# "without interest" 可出现在金额与 "in cash" 之间或末尾；"per share" 位置两可。
+_CASH_PATTERNS = [
+    # "right to receive $26.50 in cash(, without interest)" /
+    # "right to receive $26.50 per share in cash"
+    re.compile(
+        r"right\s+to\s+receive\s+\$\s?" + _CASH_AMOUNT
+        + r"(?:\s+per\s+share)?(?:\s*,?\s*without\s+interest\s*,?)?\s+in\s+cash",
+        re.IGNORECASE,
+    ),
+    # "$26.50 per share in cash"
+    re.compile(
+        r"\$\s?" + _CASH_AMOUNT
+        + r"\s+per\s+share(?:\s*,?\s*without\s+interest\s*,?)?\s+in\s+cash",
+        re.IGNORECASE,
+    ),
+    # "cash in an amount equal to $8.25 per share" /
+    # "an amount in cash equal to $12.00 per share"
+    re.compile(
+        r"cash\s+(?:in\s+an\s+amount\s+)?equal\s+to\s+\$\s?" + _CASH_AMOUNT + r"\s+per\s+share",
+        re.IGNORECASE,
+    ),
+]
+_AGGREGATE_GUARD_WINDOW = 60  # 匹配起点回看窗口
+
+
+def extract_cash_amounts(doc_text: str) -> list[Decimal]:
+    """全部每股现金对价候选（含重复出现——重复正是众数判定的信号）。
+
+    - 同一处文本被多个 pattern 命中只计一次（按金额 group 起点去重）；
+    - 匹配段落自身不含 "per share" 时回看 60 字符，出现 "aggregate" 即判为
+      总价语境丢弃（"aggregate purchase price of $X in cash" 绝不能当每股价）。
+    """
+    seen_positions: set[int] = set()
+    amounts: list[Decimal] = []
+    for pattern in _CASH_PATTERNS:
+        for match in pattern.finditer(doc_text):
+            pos = match.start(1)
+            if pos in seen_positions:
+                continue
+            if "per share" not in match.group(0).lower():
+                lookback = doc_text[max(0, match.start() - _AGGREGATE_GUARD_WINDOW):match.start()]
+                if re.search(r"aggregate", lookback, re.IGNORECASE):
+                    continue
+            seen_positions.add(pos)
+            try:
+                amount = Decimal(match.group(1).replace(",", ""))
+            except ArithmeticError:
+                continue
+            if amount > 0:
+                amounts.append(amount)
+    return amounts
+
+
+def pick_clear_mode(amounts: list[Decimal]) -> Decimal | None:
+    """明确众数：出现次数严格高于第二名（或唯一候选值）才采信，平票即不可判定。"""
+    if not amounts:
+        return None
+    ranked = Counter(amounts).most_common()
+    if len(ranked) == 1 or ranked[0][1] > ranked[1][1]:
+        return ranked[0][0]
+    return None
+
+
+def cash_within_sanity_gate(cash: Decimal, final_price: Decimal) -> bool:
+    """现金并购终价应已收敛到对价附近：闸门 [0.2x, 5x] final_price（含边界）。"""
+    return (
+        Decimal(str(CASH_SANITY_FLOOR_RATIO)) * final_price
+        <= cash
+        <= Decimal(str(CASH_SANITY_CEIL_RATIO)) * final_price
+    )
+
+
+# 公司名 token：首字符大写/数字，中间允许 &.-'’（"Corp."、"O'Reilly"、"S&P"）
+_COMPANY_TOKEN = r"[A-Z0-9][A-Za-z0-9&.\-'’]*"
+_COMPANY_CAPTURE = (
+    r"(" + _COMPANY_TOKEN + r"(?:\s+(?:" + _COMPANY_TOKEN + r"|of|and|&)){0,6}"
+    r"(?:,\s*(?:Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|LLC|"
+    r"L\.L\.C|L\.P|LP|plc|PLC|N\.V|S\.A)\.?)?)"
+)
+
+# 保守触发短语（大小写敏感的名字捕获——触发词自身写两种大小写即可）
+_ACQUIRER_PATTERNS = [
+    re.compile(r"[Mm]erger\s+with\s+" + _COMPANY_CAPTURE),
+    re.compile(r"[Aa]cquired\s+by\s+" + _COMPANY_CAPTURE),
+    re.compile(r"[Ww]holly[\s-]owned\s+subsidiary\s+of\s+" + _COMPANY_CAPTURE),
+    # 定义术语解析："Falcon Bidco Corp. (“Parent”)" —— 名字紧跟 Parent 定义
+    re.compile(_COMPANY_CAPTURE + r"\s*\((?:the\s+)?[“\"']Parent[”\"']\)"),
+]
+
+# 名字以公司后缀 token 结束是自然右边界（防误吞下一句的句首大写词）
+_CORP_SUFFIX_TOKENS = {
+    "inc", "incorporated", "corp", "corporation", "llc", "l.l.c", "ltd",
+    "limited", "plc", "lp", "l.p", "n.v", "s.a", "co",
+}
+# 定义术语/占位词不是收购方实名
+_ACQUIRER_BLOCKLIST = {
+    "parent", "purchaser", "buyer", "company", "the company", "sub",
+    "merger sub", "merger subsidiary", "acquiror", "acquirer",
+}
+_SENTENCE_LEADIN_TOKENS = {"The", "A", "An", "This", "It", "In", "On", "As", "At"}
+
+
+def _clean_company_name(raw: str) -> str | None:
+    """收敛捕获噪声：截断到首个公司后缀 token、去掉误吞的句首词、置信校验。"""
+    tokens = raw.strip().split()
+    for i, token in enumerate(tokens):
+        if token.lower().strip(".,") in _CORP_SUFFIX_TOKENS and i >= 1:
+            tokens = tokens[:i + 1]
+            break
+    while tokens and tokens[-1] in _SENTENCE_LEADIN_TOKENS:
+        tokens.pop()
+    name = " ".join(tokens).strip(" ,;")
+    if not 3 <= len(name) <= 100:
+        return None
+    normalized = name.lower().rstrip(".")
+    if normalized in _ACQUIRER_BLOCKLIST or normalized.startswith("merger sub"):
+        return None
+    return name
+
+
+def extract_acquirer_names(doc_text: str) -> list[str]:
+    """保守收购方候选（已清洗）；拿不准的匹配被 _clean_company_name 拒绝。"""
+    names: list[str] = []
+    for pattern in _ACQUIRER_PATTERNS:
+        for match in pattern.finditer(doc_text):
+            cleaned = _clean_company_name(match.group(1))
+            if cleaned:
+                names.append(cleaned)
+    return names
+
+
+# 换股比："0.7136 shares of Acquirer Inc. common stock ... for each share"
+# 要求小数形态（整数 "100 shares of" 是持仓/授权数语境，不是换股比）
+_STOCK_RATIO_RE = re.compile(
+    r"(\d+\.\d{1,6})\s+(?:validly\s+issued[\w\s,\-]{0,60}?)?shares?\s+of\s+"
+    r".{0,100}?for\s+each\s+share",
+    re.IGNORECASE,
+)
+
+
+def extract_stock_ratios(doc_text: str) -> list[Decimal]:
+    return [Decimal(m.group(1)) for m in _STOCK_RATIO_RE.finditer(doc_text)]
+
+
+def pick_merger_doc_candidates(evidence: Evidence, delist_date: date) -> list[Filing]:
+    """并购族候选的抓取清单：优先 item 2.01 的 8-K，其次 item 3.01，再次 DEFM14A；
+    只要带 primary_document_url 的，按贴近 delist_date 排序，同 accession 去重
+    （一份 8-K 常同时带 2.01/3.01 两个 item），至多 EIGHTK_DOCS_PER_SECURITY 份。"""
+    def by_proximity(filings: list[Filing]) -> list[Filing]:
+        return sorted(
+            (f for f in filings if f.primary_document_url),
+            key=lambda f: (abs((f.filing_date - delist_date).days), f.accession_number),
+        )
+
+    ordered = (
+        by_proximity(evidence.eightk_201)
+        + by_proximity(evidence.eightk_301)
+        + by_proximity(evidence.defm14a)
+    )
+    seen: set[str] = set()
+    picked: list[Filing] = []
+    for filing in ordered:
+        if filing.accession_number in seen:
+            continue
+        seen.add(filing.accession_number)
+        picked.append(filing)
+        if len(picked) >= EIGHTK_DOCS_PER_SECURITY:
+            break
+    return picked
+
+
+def extract_consideration(
+    fetched_docs: list[tuple[Filing, str]],
+    final_price: Decimal | None,
+    stats: dict[str, int] | None = None,
+) -> ConsiderationExtraction:
+    """跨文档汇总抽取（文本须已过 strip_html）。宁缺毋滥：
+
+    - 现金：全部候选金额求明确众数，再过 final_price 闸门 [0.2x, 5x]（final_price
+      缺席时闸门不适用——对价可写但 return 反正算不出）；
+    - 换股比：全文档唯一值才采信；
+    - 收购方：清洗归一后唯一名字才采信。
+    不采信的分支都在 note 里留痕（进 evidence，重跑输出稳定）。
+    """
+    stats = stats if stats is not None else Counter()
+    amounts: list[Decimal] = []
+    ratios: list[Decimal] = []
+    acquirers: dict[str, str] = {}  # 归一键 -> 首见原文
+    accessions: list[str] = []
+    for filing, doc_text in fetched_docs:
+        accessions.append(filing.accession_number)
+        amounts.extend(extract_cash_amounts(doc_text))
+        ratios.extend(extract_stock_ratios(doc_text))
+        for name in extract_acquirer_names(doc_text):
+            acquirers.setdefault(name.lower().rstrip("."), name)
+
+    notes: list[str] = []
+    cash = pick_clear_mode(amounts)
+    if amounts and cash is None:
+        notes.append("ambiguous_cash_candidates=" + ",".join(sorted({str(a) for a in amounts})))
+        stats["cash_ambiguous"] += 1
+    if cash is not None and final_price is not None and final_price > 0:
+        if not cash_within_sanity_gate(cash, final_price):
+            notes.append(
+                f"cash_gated_out={cash} vs final_price={final_price} "
+                f"(outside [{CASH_SANITY_FLOOR_RATIO}x, {CASH_SANITY_CEIL_RATIO}x])"
+            )
+            cash = None
+            stats["cash_gated_out"] += 1
+    if cash is not None:
+        stats["cash_extracted"] += 1
+
+    ratio: Decimal | None = None
+    distinct_ratios = sorted(set(ratios))
+    if len(distinct_ratios) == 1:
+        ratio = distinct_ratios[0]
+        stats["stock_extracted"] += 1
+    elif len(distinct_ratios) > 1:
+        notes.append("ambiguous_stock_ratios=" + ",".join(str(r) for r in distinct_ratios))
+
+    acquirer: str | None = None
+    if len(acquirers) == 1:
+        acquirer = next(iter(acquirers.values()))[:255]
+        stats["acquirer_extracted"] += 1
+    elif len(acquirers) > 1:
+        notes.append("ambiguous_acquirers=" + ";".join(sorted(acquirers.values())))
+
+    return ConsiderationExtraction(
+        cash=cash,
+        stock_ratio=ratio,
+        acquirer=acquirer,
+        accessions=accessions,
+        note="; ".join(notes) or None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # reason 分类器（纯函数决策表）
 # ---------------------------------------------------------------------------
 
@@ -319,6 +613,12 @@ def classify(
     source 取产生 reason 的证据层；8-K 与 Form 25 同时在场时 FORM25 为最强层。
     UNKNOWN 行若 evidence 里有 Form 25 accession，source 仍记 FORM25（证据在、
     定性不了——留给人工与后续数据源迭代）。
+
+    对价抽取（evidence.consideration，仅 --fetch-8k-docs 产出，且只发生在
+    HIGH 层 8-K 并购族候选上）：现金独占 → MERGER 升级 ACQUISITION_CASH，
+    换股独占 → ACQUISITION_STOCK，混合保持 MERGER 同时写两个对价字段；
+    delisting_return 只为"现金独占 + final_price 在场"计算，含股票对价的
+    交易本迭代不算 return。
     """
     tokens: list[str] = []
 
@@ -339,6 +639,19 @@ def classify(
         suffix = f"(+{len(evidence.eightk_201) - EVIDENCE_ACCESSION_CAP} more)" if len(evidence.eightk_201) > EVIDENCE_ACCESSION_CAP else ""
         tokens.append(f"8k_item201={listed}{suffix}")
 
+    consideration = evidence.consideration
+    if consideration is not None:
+        if consideration.accessions:
+            tokens.append("consideration_docs=" + ",".join(consideration.accessions))
+        if consideration.cash is not None:
+            tokens.append(f"consideration_cash={consideration.cash}")
+        if consideration.stock_ratio is not None:
+            tokens.append(f"consideration_stock_ratio={consideration.stock_ratio}")
+        if consideration.acquirer:
+            tokens.append(f"acquirer={consideration.acquirer}")
+        if consideration.note:
+            tokens.append(f"consideration_note={consideration.note}")
+
     reason_code: str | None = None
     confidence: str | None = None
     source: str | None = None
@@ -348,6 +661,12 @@ def classify(
         # 同 CIK 的并购完成公告（item 2.01）在退市日 ±30 天内
         reason_code, confidence = "MERGER", "HIGH"
         source = "FORM25" if evidence.form25 else "8K"
+        if consideration is not None:
+            if consideration.cash is not None and consideration.stock_ratio is None:
+                reason_code = "ACQUISITION_CASH"   # 现金独占抽取成功 → 升级
+            elif consideration.stock_ratio is not None and consideration.cash is None:
+                reason_code = "ACQUISITION_STOCK"
+            # 混合对价（cash + stock 同时在场）：保持 MERGER，两字段都写
     elif evidence.form25 and evidence.form25_rule:
         reason_code = FORM25_RULE_REASON[evidence.form25_rule]
         confidence = "HIGH"
@@ -384,18 +703,31 @@ def classify(
     if final_price is None and price_bucket:
         tokens.append(f"final_price_bucket={price_bucket}")
 
+    # delisting_return 只在有实据时写：现金独占对价 + final_price 在场。
+    # 含股票对价（独占或混合）本迭代不算 return；经验假设仍是读取层的事。
+    delisting_return: Decimal | None = None
+    if (
+        consideration is not None
+        and consideration.cash is not None
+        and consideration.stock_ratio is None
+        and final_price is not None
+        and final_price > 0
+    ):
+        delisting_return = (
+            (consideration.cash - final_price) / final_price
+        ).quantize(Decimal("1E-8"))
+
     return {
         "security_id": security.id,
         "delist_date": security.delist_date,
         "reason_code": reason_code,
         "reason_confidence": confidence,
-        "acquirer_name": None,               # 对价/收购方抽取留待 --fetch-8k-docs 迭代
-        "consideration_cash": None,
-        "consideration_stock_ratio": None,
+        "acquirer_name": consideration.acquirer if consideration else None,
+        "consideration_cash": consideration.cash if consideration else None,
+        "consideration_stock_ratio": consideration.stock_ratio if consideration else None,
         "final_price": final_price,
         "final_price_date": final_price_date,
-        # 本迭代无对价抽取与破产硬证据，恒 NULL；经验假设是读取层的事
-        "delisting_return": None,
+        "delisting_return": delisting_return,
         "source": source,
         "evidence": "|".join(tokens) if tokens else None,
     }
@@ -488,22 +820,55 @@ def load_form25_filings(session, security_ids: list[int]) -> dict[int, list[Fili
 
 def load_eightk_201_filings(session, security_ids: list[int]) -> dict[int, list[Filing]]:
     """同 CIK 的 8-K item 2.01（items 为逗号分隔码表，精确元素匹配防 '12.01' 误中）。"""
+    return _load_eightk_item_filings(session, security_ids, "2.01")
+
+
+def load_eightk_301_filings(session, security_ids: list[int]) -> dict[int, list[Filing]]:
+    """8-K item 3.01（退市/摘牌通知），--fetch-8k-docs 的次优文档来源。"""
+    return _load_eightk_item_filings(session, security_ids, "3.01")
+
+
+def _load_eightk_item_filings(session, security_ids: list[int], item: str) -> dict[int, list[Filing]]:
     if not security_ids:
         return {}
     rows = session.execute(text("""
-        SELECT s.id, f.accession_number, f.form_type, f.filing_date
+        SELECT s.id, f.accession_number, f.form_type, f.filing_date, f.primary_document_url
         FROM securities s
         JOIN sec_filings f ON ltrim(f.cik, '0') = ltrim(s.cik, '0')
         WHERE s.id = ANY(:ids)
           AND s.cik IS NOT NULL AND s.cik <> ''
           AND f.form_type = '8-K'
-          AND '2.01' = ANY(string_to_array(replace(coalesce(f.items, ''), ' ', ''), ','))
+          AND :item = ANY(string_to_array(replace(coalesce(f.items, ''), ' ', ''), ','))
           AND f.filing_date BETWEEN s.delist_date - :w AND s.delist_date + :w
         ORDER BY s.id, f.filing_date
-    """), {"ids": security_ids, "w": EIGHTK_WINDOW_DAYS}).all()
+    """), {"ids": security_ids, "w": EIGHTK_WINDOW_DAYS, "item": item}).all()
     filings: dict[int, list[Filing]] = {}
-    for security_id, accession, form_type, filing_date in rows:
-        filings.setdefault(security_id, []).append(Filing(accession, form_type, filing_date))
+    for security_id, accession, form_type, filing_date, doc_url in rows:
+        filings.setdefault(security_id, []).append(
+            Filing(accession, form_type, filing_date, doc_url)
+        )
+    return filings
+
+
+def load_defm14a_filings(session, security_ids: list[int]) -> dict[int, list[Filing]]:
+    """并购委托书 DEFM14A（delist 前 120 天窗口），对价抽取的兜底文档来源。"""
+    if not security_ids:
+        return {}
+    rows = session.execute(text("""
+        SELECT s.id, f.accession_number, f.form_type, f.filing_date, f.primary_document_url
+        FROM securities s
+        JOIN sec_filings f ON ltrim(f.cik, '0') = ltrim(s.cik, '0')
+        WHERE s.id = ANY(:ids)
+          AND s.cik IS NOT NULL AND s.cik <> ''
+          AND f.form_type = 'DEFM14A'
+          AND f.filing_date BETWEEN s.delist_date - :before AND s.delist_date
+        ORDER BY s.id, f.filing_date
+    """), {"ids": security_ids, "before": DEFM14A_WINDOW_BEFORE_DAYS}).all()
+    filings: dict[int, list[Filing]] = {}
+    for security_id, accession, form_type, filing_date, doc_url in rows:
+        filings.setdefault(security_id, []).append(
+            Filing(accession, form_type, filing_date, doc_url)
+        )
     return filings
 
 
@@ -550,8 +915,19 @@ def load_pattern_bars(session, security_id: int, final_price_date: date) -> list
 
 
 # ---------------------------------------------------------------------------
-# --fetch-form25-docs 阶段（可选、可离线降级）
+# --fetch-form25-docs / --fetch-8k-docs 阶段（可选、可离线降级）
 # ---------------------------------------------------------------------------
+
+def _edgar_fetch_text():
+    """SecEdgarSource 的节流 getter（8 req/s + retry + 自报 UA，全在 _get_text 里）；
+    离线/UA 未配置时返回 None，调用方优雅跳过整个文档阶段。"""
+    try:
+        from data_sources.sec_edgar_source import SecEdgarSource
+        return SecEdgarSource()._get_text
+    except Exception as exc:
+        logger.warning("SEC EDGAR source 不可用（{}），跳过文档抓取阶段。", exc)
+        return None
+
 
 def fetch_form25_rules(
     securities: list[DelistedSecurity],
@@ -566,13 +942,8 @@ def fetch_form25_rules(
     stats = {"candidates": 0, "fetched": 0, "parsed": 0, "failed": 0, "no_doc_url": 0}
 
     if fetch_text is None:
-        try:
-            from data_sources.sec_edgar_source import SecEdgarSource
-            edgar = SecEdgarSource()
-            # 节流 getter：8 req/s + retry + 自报 UA，全在 _get_text 里
-            fetch_text = edgar._get_text
-        except Exception as exc:
-            logger.warning("SEC EDGAR source 不可用（{}），跳过 Form 25 原文阶段。", exc)
+        fetch_text = _edgar_fetch_text()
+        if fetch_text is None:
             return stats
 
     consecutive_failures = 0
@@ -604,6 +975,69 @@ def fetch_form25_rules(
             stats["parsed"] += 1
             evidence.form25_rule = rule
     return stats
+
+
+def fetch_merger_considerations(
+    securities: list[DelistedSecurity],
+    evidences: dict[int, Evidence],
+    final_prices: dict[int, Decimal | None],
+    fetch_text=None,
+) -> dict[str, int]:
+    """--fetch-8k-docs 阶段：对 HIGH 层并购族候选（evidence.eightk_201 非空——
+    分类器会把它们归 MERGER HIGH，含 Form25 12d2-2(a) 叠加 8-K 的情形）抓至多
+    3 份主文档抽对价，结果写回 evidence.consideration。
+
+    fetch_text 可注入（测试 mock）；默认走 SecEdgarSource 的节流 getter；
+    离线/连续失败优雅中止，已抓到的文档照常解析（部分结果仍然可信）。
+    """
+    stats: Counter = Counter({
+        "candidates": 0, "docs_fetched": 0, "docs_failed": 0, "no_doc_url": 0,
+        "cash_extracted": 0, "cash_ambiguous": 0, "cash_gated_out": 0,
+        "stock_extracted": 0, "acquirer_extracted": 0,
+    })
+
+    if fetch_text is None:
+        fetch_text = _edgar_fetch_text()
+        if fetch_text is None:
+            return dict(stats)
+
+    consecutive_failures = 0
+    offline = False
+    for security in securities:
+        evidence = evidences.get(security.id)
+        if evidence is None or not evidence.eightk_201:
+            continue  # 候选 = HIGH 层 8-K item 2.01 并购族
+        stats["candidates"] += 1
+        if offline:
+            continue  # 仍计数 candidates，便于漏斗对账
+        docs = pick_merger_doc_candidates(evidence, security.delist_date)
+        if not docs:
+            stats["no_doc_url"] += 1
+            evidence.consideration = ConsiderationExtraction(note="no_primary_document_url")
+            continue
+        fetched: list[tuple[Filing, str]] = []
+        for filing in docs:
+            try:
+                raw = fetch_text(filing.primary_document_url)
+                consecutive_failures = 0
+            except Exception as exc:
+                stats["docs_failed"] += 1
+                consecutive_failures += 1
+                logger.warning("8-K/DEFM14A 原文抓取失败 {} ({}): {}",
+                               security.symbol, filing.accession_number, exc)
+                if consecutive_failures >= EIGHTK_DOC_FAILURE_ABORT:
+                    logger.warning("连续 {} 次抓取失败，判定离线，跳过剩余对价抽取。",
+                                   EIGHTK_DOC_FAILURE_ABORT)
+                    offline = True
+                    break
+                continue
+            stats["docs_fetched"] += 1
+            fetched.append((filing, strip_html(raw or "")))
+        if fetched:
+            evidence.consideration = extract_consideration(
+                fetched, final_prices.get(security.id), stats,
+            )
+    return dict(stats)
 
 
 # ---------------------------------------------------------------------------
@@ -676,6 +1110,7 @@ def report(
     price_buckets: Counter,
     doc_stats: dict[str, int] | None,
     unknown_csv: str | None,
+    consideration_stats: dict[str, int] | None = None,
 ) -> None:
     by_id = {s.id: s for s in securities}
     total = len(rows)
@@ -708,6 +1143,16 @@ def report(
         logger.info("  candidates={candidates} fetched={fetched} parsed={parsed} "
                     "failed={failed} no_doc_url={no_doc_url}", **doc_stats)
 
+    if consideration_stats is not None:
+        logger.info("")
+        logger.info("=== 8-K/DEFM14A 对价抽取漏斗（--fetch-8k-docs）===")
+        logger.info("  candidates={candidates} docs_fetched={docs_fetched} "
+                    "docs_failed={docs_failed} no_doc_url={no_doc_url}",
+                    **consideration_stats)
+        logger.info("  cash_extracted={cash_extracted} cash_ambiguous={cash_ambiguous} "
+                    "cash_gated_out={cash_gated_out} stock_extracted={stock_extracted} "
+                    "acquirer_extracted={acquirer_extracted}", **consideration_stats)
+
     unknown_rows = [r for r in rows if r["reason_code"] == "UNKNOWN"]
     logger.info("")
     logger.info("=== UNKNOWN 清单（一等输出，共 {} 只，示例前 30）===", len(unknown_rows))
@@ -728,7 +1173,7 @@ def report(
                                  row["final_price_date"], row["evidence"]])
         logger.info("  完整 UNKNOWN 清单已写入 {}", unknown_csv)
 
-    # 自检：现金并购类 delisting_return 应聚在 0 附近（本迭代未抽对价时为空，属预期）
+    # 自检：现金并购类 delisting_return 应聚在 0 附近（终价已收敛到对价）
     logger.info("")
     logger.info("=== delisting_return 自检（现金并购类应聚在 0 附近）===")
     merger_returns = [
@@ -743,7 +1188,7 @@ def report(
         if abs(p50) > 0.05:
             logger.warning("  p50 偏离 0 超过 5%——检查对价抽取/分类是否污染。")
     else:
-        logger.info("  无样本（本迭代未做 8-K 对价抽取，delisting_return 恒 NULL，属预期）。")
+        logger.info("  无样本（未启用 --fetch-8k-docs，或现金对价均未通过抽取/闸门）。")
 
 
 # ---------------------------------------------------------------------------
@@ -767,12 +1212,21 @@ def run(args, db_manager) -> int:
         form25_map = load_form25_filings(session, security_ids)
         eightk_map = load_eightk_201_filings(session, security_ids)
         merge_map = load_merge_events(session)
+        # --fetch-8k-docs 的次优/兜底文档来源只对候选（有 8-K 2.01 者）加载
+        eightk_301_map: dict[int, list[Filing]] = {}
+        defm14a_map: dict[int, list[Filing]] = {}
+        if args.fetch_8k_docs:
+            candidate_ids = sorted(eightk_map.keys())
+            eightk_301_map = load_eightk_301_filings(session, candidate_ids)
+            defm14a_map = load_defm14a_filings(session, candidate_ids)
 
     evidences: dict[int, Evidence] = {
         s.id: Evidence(
             form25=form25_map.get(s.id, []),
             eightk_201=eightk_map.get(s.id, []),
             merge_events=merge_map.get(s.id, []),
+            eightk_301=eightk_301_map.get(s.id, []),
+            defm14a=defm14a_map.get(s.id, []),
         )
         for s in securities
     }
@@ -801,6 +1255,17 @@ def run(args, db_manager) -> int:
         doc_stats = fetch_form25_rules(securities, evidences)
         logger.info("Form 25 原文阶段: {}", doc_stats)
 
+    consideration_stats = None
+    if args.fetch_8k_docs:
+        consideration_stats = fetch_merger_considerations(
+            securities, evidences,
+            final_prices={
+                sid: picked[0] if picked else None
+                for sid, picked in final_prices.items()
+            },
+        )
+        logger.info("8-K/DEFM14A 对价抽取阶段: {}", consideration_stats)
+
     # LOW 层形态 bar 只对可能落层的证券取数（依赖 form25_rule，须在文档阶段之后）
     patterns: dict[int, tuple[str, str] | None] = {}
     with db_manager.get_session() as session:
@@ -824,7 +1289,8 @@ def run(args, db_manager) -> int:
             price_pattern=patterns[s.id],
         ))
 
-    report(rows, securities, skipped_null_delist, price_buckets, doc_stats, args.unknown_csv)
+    report(rows, securities, skipped_null_delist, price_buckets, doc_stats,
+           args.unknown_csv, consideration_stats=consideration_stats)
 
     if not is_apply:
         logger.info("")
