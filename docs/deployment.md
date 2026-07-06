@@ -10,7 +10,7 @@
 | 部署目录 | `/home/wenruifeng/projects/stock` |
 | 运行用户 | `wenruifeng`（systemd 服务以该用户执行） |
 | Python | `.venv/bin/python`（注意：venv 内未安装 pytest） |
-| 数据库 | docker compose: `stock-postgres` (PG 17.5)（`stock-clickhouse` 容器已随 ClickHouse 层移除而退役，远端如仍在运行可 `docker compose up -d --remove-orphans` 收掉） |
+| 数据库 | docker compose: `stock-postgres` (PG 17.5) + `stock-clickhouse`（24.12，**自 2026-07 起承载 50.6 亿行分钟线 `stock.minute_bars`，绝不可移除**；HTTP 8123 供装载与研究读取） |
 | 定时 | `stock-daily-run.timer` → 每天 10:00 Asia/Shanghai 跑 `scheduled_update` |
 | GitHub | `https://github.com/vvrfxyz/stock`（**远端机器无法访问 github.com**） |
 

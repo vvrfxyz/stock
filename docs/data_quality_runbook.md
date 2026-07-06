@@ -87,3 +87,17 @@ tail -100 logs/cron_daily_run.log
 # pipeline_task_runs 查询
 python main.py health_report --days 7
 ```
+
+
+## 2026-07-06 新增质量门与调度变化
+
+- `check_data_integrity` 新增三探针：全史 OHLC 包含违规（基线 0，超出即阻塞）、
+  近窗 vwap 越界率（>10% 阻塞；~5% 属盘前盘后口径正常）、活跃 US CS/ETF 的
+  list_date NULL 计数（>50 阻塞——2026-07-06 每日同步抹除事故的回归防线）。
+- `scheduled_update` 每日新增 `update_massive_news_recent`（3 天窗）与
+  `health_report` 步；周六新增 `update_minute_bars_weekly`（分钟增量，~70 分钟）；
+  周日新增 `update_trading_calendars`（日历保鲜）；周末因子全量改
+  `--max-mismatch-rate 0.02`（vendor 口径存量 ~177 只，绝对断言会每周必红）。
+- `pipeline_task_runs`：失败步的 error_sample 现含 ERROR 日志尾部（不再只有
+  exit=1）；卡死 >12h 的 RUNNING 行开跑即标 ORPHANED。
+- audit_security_identity 的 exit=1 语义 = "审计有发现待人工"，不是故障。

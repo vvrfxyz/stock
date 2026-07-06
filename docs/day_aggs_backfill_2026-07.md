@@ -114,10 +114,9 @@ purge 删 yfinance 残留 1,636,213 行（13,417 只），水位校准 6,578 只
   孤本（1,235 只），103 万行是 flat/Massive 都没有的填缝（多为退市转 OTC
   时期；SIP 文件不含 OTC，yfinance 含）。双 NULL 指纹可随时在读取层过滤。
   没有任何证券完全依赖 yfinance 数据。
-- **20 年复权尚缺公司行动**：价格已有 20 年，但 `corporate_actions` 仍只有
-  Massive 免费档 730 天窗口，`computed_adjustment_factors` 可信下限仍为
-  ex_date >= 2024-05-14（见 CLAUDE.md 回测数据边界）。历史分红/拆股数据
-  需另立项目。
+- ~~20 年复权尚缺公司行动~~ **已解决（2026-07-06）**：corporate_actions 归档
+  回填补齐 2003+ 真 vendor 事件，`computed_adjustment_factors` 可信下限已移至
+  2003-01-01（见 `corp_actions_archive_2026-07.md`）。
 - 死票 CIK 在 `sec_filings`/`insider_transactions` 的覆盖仅 26%（当年只按
   活跃 universe 抓取），SEC 侧死票申报回填可另立项。
 

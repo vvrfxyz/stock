@@ -157,7 +157,16 @@ yfinance_untouchable = 0 是正确结果——day-aggs 导入时的 --purge-remn
   （(security_id, date) 主键保证它们所在的日子没有任何其他来源的 bar，
   vwap 回填实测零重叠）+ 27 只 yfinance-only 证券——删除等于丢失唯一数据，
   不是去冗余。读取层按双 NULL 指纹过滤即可。
-- NVDA 2024-06-10 high 脏值（daily 侧，vendor 数据），follow-up 订正。
+- ~~NVDA 2024-06-10 high 脏值~~ 已订正（2026-07-06，repair_ohlc_violations 分钟仲裁：195.95→123.10，另修同类离谱极值 44 行 + 包含违规 706 行，见 `data_infra_assessment_2026-07.md` 整改记录）。
 - 编排器中途发现两处环境问题并已修复：wenruifeng 无 docker 组权限 →
   装载器全面改走 ClickHouse HTTP（8123，与读取层一致，无 docker 依赖）；
   DDL 解析对注释开头语句块的过滤 bug。
+
+## 增量同步上线（2026-07-06 追记）
+
+方案篇的"分钟无 live 源、archive-only"结论已作废：free 档实测放行 1 分钟聚合
+（`/v2/aggs/ticker/{T}/range/1/minute/...`，含盘前盘后，50k 行/请求 ≈ 52 个交易日）。
+`scripts/update_minute_bars.py` 已上线：缺口 2026-04-24 起一次回填（10,733 只、
+72 分钟、10,680 只有数据、0 错误，source='massive_1m' 与归档 'flatfiles_1m' 区分
+血统），此后每周六调度增量（8 天回看重叠 1 天，ReplacingMergeTree 幂等）。
+任期 clamp + 零价过滤与归档装载同口径；绝不 DROP PARTITION（月分区里躺着归档）。

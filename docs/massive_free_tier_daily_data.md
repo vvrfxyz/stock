@@ -259,8 +259,11 @@ python main.py update_massive_news TSLA --force --lookback-days 7
 - Ratios。
 - 实时 trades/quotes。
 - Snapshots。
-- 分钟级 bars。
 - 非 `CS` / `ETF` 类型。
+
+（更正 2026-07-06：**1 分钟聚合实测可用**——`/v2/aggs/ticker/{T}/range/1/minute/...`
+HTTP 200，含盘前盘后，730 天窗口内有效；已由 `update_minute_bars.py` 周度增量
+写入 ClickHouse。本文档早前"分钟级不可用"的结论作废。）
 
 ## 结论
 
@@ -275,4 +278,4 @@ python main.py update_massive_news TSLA --force --lookback-days 7
 - Short data。
 - News/sentiment metadata。
 
-不足部分也很明确：分钟级、实时、财报/ratios 和更长历史窗口不在当前可用范围内。
+不足部分也很明确：实时、财报/ratios 和 730 天外的历史窗口不在当前可用范围内（分钟级已于 2026-07 实测可用，见上方更正）。

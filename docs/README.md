@@ -37,7 +37,7 @@
   Vendor endpoint 能力和 key 权限边界的归档证据，不是当前 ingestion contract。
 
 - [双库混合持久化架构方案（已归档）](./archive/polyglot_persistence_architecture.md)
-  PostgreSQL + ClickHouse 的设计存档；ClickHouse 层已于 2026-06 移除，待分钟级数据需求出现后再按此重建。
+  PostgreSQL + ClickHouse 的设计存档；ClickHouse 已于 2026-07 按此设计随分钟线回归（见 `minute_vw_backfill_2026-07.md`）。
 
 ## 当前事实层边界
 

@@ -40,6 +40,9 @@ sudo install -m 0644 deploy/systemd/stock-postgres-backup.service /etc/systemd/s
 sudo install -m 0644 deploy/systemd/stock-postgres-backup.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now stock-daily-run.timer stock-postgres-backup.timer
+# ！现状（2026-07-06）：stock-postgres-backup.timer 已按 owner 决定停用（磁盘约束，
+# 恢复模型改为"Mac 源归档重放 + SEC 重拉"）；存储扩容后 enable 即恢复（7 天保留
+# override 已在 /etc/systemd/system/stock-postgres-backup.service.d/）。
 systemctl list-timers stock-daily-run.timer stock-postgres-backup.timer
 ```
 

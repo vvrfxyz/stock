@@ -1,6 +1,6 @@
 # Architecture
 
-本项目按 Greenfield raw truth 原则设计：PostgreSQL 负责证券身份、元数据、事件事实和当前日线事实。全系统以 `security_id` 作为 durable identity，`symbol` 只是当前代码或历史代码属性。（ClickHouse 矩阵读取层已于 2026-06 移除，待分钟级数据需求出现后再重建；设计存档见 `archive/polyglot_persistence_architecture.md`。）
+本项目按 Greenfield raw truth 原则设计：PostgreSQL 负责证券身份、元数据、事件事实和当前日线事实。全系统以 `security_id` 作为 durable identity，`symbol` 只是当前代码或历史代码属性。（ClickHouse 已于 2026-07 随分钟级数据回归：`stock.minute_bars` 50.6 亿行分钟线，2003-09 起，归档+周度增量双源；设计见 `archive/polyglot_persistence_architecture.md`、工程记录见 `minute_vw_backfill_2026-07.md`。）
 
 ## 数据源与职责边界
 

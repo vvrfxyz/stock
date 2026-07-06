@@ -4,7 +4,7 @@ This file gives Claude Code a compact, current map of the repository.
 
 ## Project Overview
 
-This is a Greenfield US stock data pipeline. PostgreSQL is the system of record for metadata, events, and daily raw facts. (ClickHouse as a matrix-read layer was removed in 2026-06; it may return once minute-level data arrives — see `docs/archive/polyglot_persistence_architecture.md`.)
+This is a Greenfield US stock data pipeline. PostgreSQL is the system of record for metadata, events, and daily raw facts. ClickHouse（253 容器 `stock-clickhouse`）自 2026-07 起承载分钟线：`stock.minute_bars` 50.6 亿行（2003-09 起，归档 `flatfiles_1m` + 周度增量 `massive_1m`），读取走 `research/minute_bars.py`（HTTP 8123）；设计见 `docs/archive/polyglot_persistence_architecture.md` 与 `docs/minute_vw_backfill_2026-07.md`。
 
 Primary data source:
 

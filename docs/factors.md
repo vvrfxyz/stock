@@ -199,7 +199,7 @@ python -m research.evaluate --factors your_factor_name --start 2024-05-14
 
 ## 数据约束
 
-- **回测起始日不早于 2024-05-14**：`computed_adjustment_factors` 只覆盖 ex_date >= 该日的事件（Massive 免费档 730 天窗口）。更早的"复权价"未真正复权。
+- **回测起始日不早于 2003-01-01**：2026-07 corporate-actions 归档回填后，`computed_adjustment_factors` 覆盖 ex_date >= 2003-01-01（`docs/corp_actions_archive_2026-07.md`）。注意 evaluate 默认窗口仍为 2024-05-14 起（20 年全市场面板内存大，长窗口显式传 `--start`）；且非价格因子各有自身数据下限（short 2024-05+、13F 2013Q2+、市值类当前 2024-06+）。
 - **退市股因子缺口**：因子构建只跑 `is_active=True`，退市后有 SPLIT 事件但无因子行的证券须用 `securities_with_uncovered_events` 整体剔除。
 - **连库优先 `RESEARCH_DATABASE_URL`**：研究层默认连 253 生产库（只读），避免本地无数据时报错。
 
