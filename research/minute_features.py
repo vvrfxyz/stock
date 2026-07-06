@@ -7,6 +7,7 @@
   （Amaya et al. 2015 口径 sqrt(n)*Σr³/RV^1.5）/ 双幂变差（跳跃分离用）
 - rv_up / rv_down：上/下行半方差（Bollerslev-Li-Zhao 2020 的 RSJ = (rv_up-rv_down)/rv 用）
 - ext_volume_share：盘前盘后成交量占比（信息/关注度代理）
+- vol_last30_share：尾盘半小时成交量占常规时段比（EOD 资金流强度，反转条件化用）
 
 口径与 PIT：全部特征只用当日 ≤16:00 ET 的 bar，t 日收盘即可得，无前视。
 5 分钟子采样（分钟数 %5==0 的 bar 收盘价）抗微观结构噪声；n_bars<100 或
@@ -29,7 +30,8 @@ from research.minute_bars import clickhouse_url, query_df
 EXTRACT_SQL_TEMPLATE = """
 INSERT INTO stock.minute_daily_features
     (security_id, d, n_bars, rth_volume, rth_dollar, total_volume,
-     ret_first30, ret_last30, rv, rv_up, rv_down, rskew, bipower, ext_volume_share)
+     ret_first30, ret_last30, rv, rv_up, rv_down, rskew, bipower, ext_volume_share,
+     vol_last30_share)
 SELECT
     security_id, d,
     n_bars, rth_volume, rth_dollar, total_volume,
@@ -43,13 +45,15 @@ SELECT
     if(n_sub >= 30,
        arraySum(arrayMap((a, b) -> abs(a) * abs(b),
                 arraySlice(rets, 2), arraySlice(rets, 1, length(rets) - 1))), 0) AS bipower,
-    if(total_volume > 0, 1 - rth_volume / total_volume, 0) AS ext_volume_share
+    if(total_volume > 0, 1 - rth_volume / total_volume, 0) AS ext_volume_share,
+    if(rth_volume > 0, vol_last30 / rth_volume, 0) AS vol_last30_share
 FROM (
     SELECT
         security_id,
         toDate(ts, 'America/New_York') AS d,
         countIf(rth) AS n_bars,
         sumIf(volume, rth) AS rth_volume,
+        sumIf(volume, rth AND md >= 930) AS vol_last30,
         sumIf(volume * close, rth) AS rth_dollar,
         sum(volume) AS total_volume,
         argMinIf(open, ts, rth) AS open_930,

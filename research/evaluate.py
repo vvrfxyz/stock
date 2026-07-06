@@ -24,6 +24,7 @@ from research.factors.builtins import classic_price as _classic_price  # noqa: F
 from research.factors.builtins import days_to_cover as _days_to_cover  # noqa: F401
 from research.factors.builtins import delta_institutional_ownership as _delta_inst_own  # noqa: F401
 from research.factors.builtins import earnings_yield as _earnings_yield  # noqa: F401
+from research.factors.builtins import eod_pressure as _eod_pressure  # noqa: F401
 from research.factors.builtins import insider_net_buy as _insider_net_buy  # noqa: F401
 from research.factors.builtins import institutional_breadth as _institutional_breadth  # noqa: F401
 from research.factors.builtins import intraday_flow as _intraday_flow  # noqa: F401
