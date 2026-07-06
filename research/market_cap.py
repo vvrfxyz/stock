@@ -1,4 +1,13 @@
-"""研究层 PIT 市值面板：raw close × historical_shares.total_shares。"""
+"""研究层 PIT 市值面板：raw close × PIT 股本事件流。
+
+股本事件流两段拼接（seam 设计见 research/shares.py 模块 docstring）：
+vendor 段 = historical_shares（2024-06-30 起，400 天 / visible_date 锚过期），
+XBRL 段 = sec_fundamental_facts 股本概念（2009+，270 天 / period_end 锚过期，
+visible_delay_days=1 已烘焙进 visible_date）。段间差异以逐事件列表达：
+events 带 ``stale_after`` 列时 compute_market_cap_panel 改用逐事件过期
+（全局 max_staleness_days 仅作缺失兜底），带 ``split_anchor`` 列时拆股滚动
+锚取该列（缺失回退 visible_date）；不带这些列的旧事件帧行为逐位不变。
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -7,14 +16,17 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from research.factors.asof import event_table_to_asof_panel
+from research.shares import load_xbrl_shares_events, stitch_shares_events
 
 _SHARES_COLUMNS = ["security_id", "visible_date", "period_end_date", "total_shares"]
 _SPLIT_COLUMNS = ["security_id", "ex_date", "split_from", "split_to"]
+_STALE_AFTER_COLUMN = "stale_after"
+_SPLIT_ANCHOR_COLUMN = "split_anchor"
 _NS_PER_DAY = 86_400_000_000_000
 
 
-def _empty_shares_events() -> pd.DataFrame:
-    return pd.DataFrame(
+def _empty_shares_events(include_source: bool = False) -> pd.DataFrame:
+    df = pd.DataFrame(
         {
             "security_id": pd.Series(dtype=np.int64),
             "visible_date": pd.Series(dtype="datetime64[ns]"),
@@ -22,6 +34,9 @@ def _empty_shares_events() -> pd.DataFrame:
             "total_shares": pd.Series(dtype=np.int64),
         }
     )
+    if include_source:
+        df["source"] = pd.Series(dtype=object)
+    return df
 
 
 def _empty_split_events() -> pd.DataFrame:
@@ -46,17 +61,23 @@ def load_shares_events(
     engine: Engine,
     *,
     security_ids: list[int] | None = None,
+    include_source: bool = False,
 ) -> pd.DataFrame:
-    """加载 historical_shares 的 PIT 可见事件流。"""
+    """加载 historical_shares 的 PIT 可见事件流（vendor 段）。
+
+    include_source=True 时附加 ``source`` 列（MASSIVE/POLYGON），供
+    stitch_shares_events 做 MASSIVE > POLYGON 的双源去重；默认关闭以保持
+    既有消费方（short_interest 等）的列形状不变。
+    """
     if security_ids is not None and not security_ids:
-        return _empty_shares_events()
+        return _empty_shares_events(include_source)
     sql = text(
         """
-        select security_id, filing_date as visible_date, period_end_date, total_shares
+        select security_id, filing_date as visible_date, period_end_date, total_shares, source
         from historical_shares
         where total_shares is not null
           and (:security_ids is null or security_id = any(:security_ids))
-        order by security_id, filing_date, period_end_date
+        order by security_id, filing_date, period_end_date, source
         """
     )
     events = pd.read_sql_query(
@@ -66,10 +87,12 @@ def load_shares_events(
         parse_dates=["visible_date", "period_end_date"],
     )
     if events.empty:
-        return _empty_shares_events()
+        return _empty_shares_events(include_source)
     events = _to_ns(events, ("visible_date", "period_end_date"))
     events["security_id"] = events["security_id"].astype(np.int64)
     events["total_shares"] = events["total_shares"].astype(np.int64)
+    if include_source:
+        return events[_SHARES_COLUMNS + ["source"]]
     return events[_SHARES_COLUMNS]
 
 
@@ -241,21 +264,50 @@ def compute_market_cap_panel(
     """合成事件与 raw close 宽表，计算 PIT 市值宽表。
 
     提供 splits（corporate_actions 的 SPLIT 事件）时，把 as-of 股本快照按
-    (快照 visible 锚点日, t] 内的拆股比例滚动到观测日——否则拆股 ex 日到下一次
+    (快照拆股锚点日, t] 内的拆股比例滚动到观测日——否则拆股 ex 日到下一次
     股本快照之间市值恰错一个拆股比（raw close 已跳变、快照仍是旧股本）。
+
+    段间 seam（stitched 事件流，见 research/shares.py）以逐事件列表达：
+
+    - events 带 ``stale_after`` 列（该事件最后有效观测日，含当日）时改用
+      逐事件过期，行内缺失回退 visible_date + max_staleness_days；
+    - events 带 ``split_anchor`` 列时拆股滚动锚取该列（XBRL 段为 period_end
+      ——申报值不含测量日之后的拆股），行内缺失回退 visible_date。
+
+    不带这些列的旧事件帧走原路径，行为逐位不变。
     """
     dates = pd.DatetimeIndex(pd.to_datetime(list(dates))).astype("datetime64[ns]")
     prices = prices_wide.copy()
     prices.index = pd.DatetimeIndex(pd.to_datetime(prices.index)).astype("datetime64[ns]")
     prices.columns = _coerce_security_columns(prices.columns)
 
-    ev = events.reindex(columns=_SHARES_COLUMNS).copy()
+    extras = [
+        col
+        for col in (_STALE_AFTER_COLUMN, _SPLIT_ANCHOR_COLUMN)
+        if col in events.columns
+    ]
+    ev = events.reindex(columns=_SHARES_COLUMNS + extras).copy()
     if not ev.empty:
-        ev = _to_ns(ev, ("visible_date", "period_end_date"))
+        ev = _to_ns(ev, ("visible_date", "period_end_date", *extras))
         ev = ev[pd.notna(ev["security_id"]) & pd.notna(ev["visible_date"])]
         ev = ev[pd.notna(ev["total_shares"])]
         ev["security_id"] = ev["security_id"].astype(np.int64)
         ev["total_shares"] = ev["total_shares"].astype(np.float64)
+        if _STALE_AFTER_COLUMN in extras:
+            ev[_STALE_AFTER_COLUMN] = ev[_STALE_AFTER_COLUMN].fillna(
+                ev["visible_date"] + pd.Timedelta(days=max_staleness_days)
+            )
+        if _SPLIT_ANCHOR_COLUMN in extras:
+            ev[_SPLIT_ANCHOR_COLUMN] = ev[_SPLIT_ANCHOR_COLUMN].fillna(ev["visible_date"])
+
+    # 逐事件过期：stale_after 作锚、窗口 0 天 <=> date > stale_after 置 NaN，
+    # 与旧口径 visible_date 锚 + max_staleness_days 窗在 vendor 段完全等价。
+    if _STALE_AFTER_COLUMN in extras:
+        staleness_anchor = _STALE_AFTER_COLUMN
+        effective_staleness_days = 0
+    else:
+        staleness_anchor = "visible_date"
+        effective_staleness_days = max_staleness_days
 
     event_ids = pd.Index(ev["security_id"].unique(), dtype=np.int64) if not ev.empty else pd.Index([], dtype=np.int64)
     security_ids = event_ids.union(prices.columns).sort_values()
@@ -268,27 +320,32 @@ def compute_market_cap_panel(
         dates=dates,
         value_column="total_shares",
         visible_date_column="visible_date",
-        staleness_anchor_column="visible_date",
+        staleness_anchor_column=staleness_anchor,
         visible_delay_days=visible_delay_days,
-        max_staleness_days=max_staleness_days,
+        max_staleness_days=effective_staleness_days,
         security_universe=security_ids,
     )
 
     if splits is not None and not splits.empty and not ev.empty:
-        # 第二次 asof 取每格选中快照的 visible 锚点日（与 shares 面板同参数、
+        # 第二次 asof 取每格选中快照的拆股锚点日（与 shares 面板同参数、
         # 同排序键，逐格对应同一事件行）；只对有拆股的证券展开长表。
         anchor_ev = ev.copy()
+        anchor_source = (
+            anchor_ev[_SPLIT_ANCHOR_COLUMN]
+            if _SPLIT_ANCHOR_COLUMN in extras
+            else anchor_ev["visible_date"]
+        )
         anchor_ev["_anchor_days"] = (
-            anchor_ev["visible_date"].astype("int64") // _NS_PER_DAY
+            anchor_source.astype("int64") // _NS_PER_DAY
         ).astype(np.float64)
         anchor_days = event_table_to_asof_panel(
             anchor_ev,
             dates=dates,
             value_column="_anchor_days",
             visible_date_column="visible_date",
-            staleness_anchor_column="visible_date",
+            staleness_anchor_column=staleness_anchor,
             visible_delay_days=visible_delay_days,
-            max_staleness_days=max_staleness_days,
+            max_staleness_days=effective_staleness_days,
             security_universe=security_ids,
         )
         shares = _split_rollforward_shares(shares, anchor_days, splits)
@@ -303,10 +360,24 @@ def load_market_cap_panel(
     security_ids: list[int] | None = None,
     max_staleness_days: int = 400,
     visible_delay_days: int = 0,
+    include_xbrl: bool = True,
 ) -> pd.DataFrame:
-    """一站式加载 raw close、PIT shares 与 SPLIT 事件，返回市值宽表。"""
+    """一站式加载 raw close、PIT shares 与 SPLIT 事件，返回市值宽表。
+
+    include_xbrl=True（默认）时股本事件流为 vendor + XBRL 拼接（vendor 段优先，
+    见 research/shares.stitch_shares_events），把股本历史从 2024-06 推深到 2009+；
+    验收口径要求默认开启（size/earnings_yield 的 IC 序列不得出现 2024-06 断点）。
+    include_xbrl=False 退回纯 historical_shares 的旧行为。max_staleness_days /
+    visible_delay_days 仅约束 vendor 段；XBRL 段的 270 天 / period_end 过期与
+    +1 天可见延迟已烘焙在事件流内。
+    """
     dates = pd.DatetimeIndex(pd.to_datetime(list(dates))).astype("datetime64[ns]")
-    events = load_shares_events(engine, security_ids=security_ids)
+    events = load_shares_events(engine, security_ids=security_ids, include_source=include_xbrl)
+    if include_xbrl:
+        xbrl_events = load_xbrl_shares_events(engine, security_ids=security_ids)
+        events = stitch_shares_events(
+            events, xbrl_events, vendor_max_staleness_days=max_staleness_days
+        )
     splits = load_split_events(engine, security_ids=security_ids)
     prices = _load_raw_close_wide(engine, dates=dates, security_ids=security_ids)
     return compute_market_cap_panel(
@@ -326,6 +397,7 @@ def load_log_market_cap_panel(
     security_ids: list[int] | None = None,
     max_staleness_days: int = 400,
     visible_delay_days: int = 0,
+    include_xbrl: bool = True,
 ) -> pd.DataFrame:
     """返回 log(PIT 市值)，非正数与缺失值保留为 NaN。"""
     market_cap = load_market_cap_panel(
@@ -334,6 +406,7 @@ def load_log_market_cap_panel(
         security_ids=security_ids,
         max_staleness_days=max_staleness_days,
         visible_delay_days=visible_delay_days,
+        include_xbrl=include_xbrl,
     )
     with np.errstate(divide="ignore", invalid="ignore"):
         return np.log(market_cap.where(market_cap > 0))
