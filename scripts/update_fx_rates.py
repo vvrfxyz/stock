@@ -2,7 +2,7 @@
 
 用途：非 USD 分红在重建复权因子时折算成 USD（见 update_adjustment_factors）。
 - ECB：EUR 基参考汇率（CAD/NOK/ILS 等），全历史 CSV 一次请求 ~700KB。
-- FRED：ECB 未覆盖币种的 USD 基直连系列（DEXTAIUS = 1 USD 兑 TWD，TSM 分红依赖），
+- FRED：ECB 未覆盖币种的 USD 基直连系列（DEXTAUS = 1 USD 兑 TWD，TSM 分红依赖），
   原样入库为 (base=USD, quote=TWD, source=FRED)，倒数换算只在读取层做
   （utils/fx_rates.UsdFxConverter）。
 两源均幂等 upsert；FRED 需要 FRED_API_KEY（与 update_risk_free_rates 共用）。
@@ -25,9 +25,9 @@ from db_manager import DatabaseManager
 from utils.script_logging import setup_logging as configure_script_logging
 
 # FRED H.10 汇率系列注册表：series_id -> (base_currency, quote_currency)。
-# DEXTAIUS 口径为 1 USD = rate TWD；行按 vendor 口径原样存，绝不在写入侧取倒数。
+# DEXTAUS 口径为 1 USD = rate TWD；行按 vendor 口径原样存，绝不在写入侧取倒数。
 FRED_FX_SERIES: dict[str, tuple[str, str]] = {
-    "DEXTAIUS": ("USD", "TWD"),
+    "DEXTAUS": ("USD", "TWD"),
 }
 
 

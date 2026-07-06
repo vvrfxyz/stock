@@ -215,9 +215,9 @@ class TestBuildFredFxRows:
         observations = parse_fred_observations(
             {"observations": [{"date": "2026-06-11", "value": "32.5"},
                               {"date": "2026-06-12", "value": "."}]},
-            series_id="DEXTAIUS",
+            series_id="DEXTAUS",
         )
-        rows = build_fred_fx_rows("DEXTAIUS", observations)
+        rows = build_fred_fx_rows("DEXTAUS", observations)
         assert rows == [{
             "rate_date": D, "base_currency": "USD", "quote_currency": "TWD",
             "source": "FRED", "rate": Decimal("32.5"),
@@ -226,12 +226,12 @@ class TestBuildFredFxRows:
     def test_registry_only_contains_usd_base_pairs(self):
         # converter 的直连回退按 1/rate 折算，注册表口径必须恒为 USD 基
         assert all(base == "USD" for base, _quote in FRED_FX_SERIES.values())
-        assert FRED_FX_SERIES["DEXTAIUS"] == ("USD", "TWD")
+        assert FRED_FX_SERIES["DEXTAUS"] == ("USD", "TWD")
 
 
 class TestUsdFxConverterDirectUsdFallback:
     def test_direction_1000_twd_is_about_31_usd_not_32500(self):
-        # DEXTAIUS 口径：1 USD = 32.5 TWD ⇒ 1 TWD = 1/32.5 USD
+        # DEXTAUS 口径：1 USD = 32.5 TWD ⇒ 1 TWD = 1/32.5 USD
         fx = UsdFxConverter(_FxDbManager([_fx(D, "USD", "TWD", "32.5", "FRED")]))
         rate = fx.rate_to_usd("TWD", D)
         assert rate is not None
@@ -286,7 +286,7 @@ class TestUsdFxConverterDirectUsdFallback:
     def test_end_to_end_fred_rows_written_then_converted(self):
         # 写入侧原样存 32.5（TWD per USD），读取侧才取倒数——端到端方向锁定
         observations = parse_fred_observations(
-            {"observations": [{"date": "2026-06-11", "value": "32.5"}]}, series_id="DEXTAIUS",
+            {"observations": [{"date": "2026-06-11", "value": "32.5"}]}, series_id="DEXTAUS",
         )
-        fx = UsdFxConverter(_FxDbManager(build_fred_fx_rows("DEXTAIUS", observations)))
+        fx = UsdFxConverter(_FxDbManager(build_fred_fx_rows("DEXTAUS", observations)))
         assert abs(Decimal("1000") * fx.rate_to_usd("TWD", D) - Decimal("30.7692307692")) < Decimal("1e-6")

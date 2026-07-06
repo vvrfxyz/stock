@@ -1,7 +1,7 @@
 """fx_rates 的读取层：按日期取任意币种对 USD 的交叉汇率。
 
 ECB 以 EUR 为基准（1 EUR = rate CCY），CCY->USD = rate(EUR->USD) / rate(EUR->CCY)。
-ECB 未覆盖的币种（如 TWD）回退到 USD 基直连行（1 USD = rate CCY，如 FRED DEXTAIUS），
+ECB 未覆盖的币种（如 TWD）回退到 USD 基直连行（1 USD = rate CCY，如 FRED DEXTAUS），
 CCY->USD = 1 / rate；ECB 交叉路径始终优先。
 两条路径都仅在源的发布日有行情；取"当日或之前最近一个发布日"，超过 max_staleness_days
 视为无可用汇率（返回 None，调用方自行决定跳过语义）。
@@ -59,7 +59,7 @@ class UsdFxConverter:
             return usd_rate / ccy_rate
 
     def _direct_usd_base_rate(self, currency: str, on_date: date) -> Decimal | None:
-        # USD 基直连行口径：1 USD = rate CCY（如 FRED DEXTAIUS），折 USD 取倒数。
+        # USD 基直连行口径：1 USD = rate CCY（如 FRED DEXTAUS），折 USD 取倒数。
         rate = self._rate_asof(self._fallback_source, "USD", currency, on_date)
         if rate is None or rate == 0:
             return None
