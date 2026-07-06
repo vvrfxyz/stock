@@ -2593,3 +2593,37 @@ class TestReturnConfidenceGate:
         assert row["delisting_return"] is None
         # 对价证据照记（人工复核线索）
         assert "consideration_cash=9.51" in row["evidence"]
+
+
+class TestCashReturnSanityGate:
+    """现金独占 return 的统一紧闸门 [0.6x,1.5x]——漏抽换股腿的混合 deal 拦截。"""
+
+    def _row(self, cash, final):
+        security = DelistedSecurity(id=1, symbol="mrtx", type="CS", cik="1",
+                                    delist_date=date(2023, 12, 1), name="Mirati")
+        evidence = Evidence(
+            eightk_201=[_filing(form="8-K")],
+            consideration=ConsiderationExtraction(cash=Decimal(cash)),
+        )
+        return classify(security, evidence, final_price=Decimal(final),
+                        final_price_date=date(2023, 12, 1),
+                        price_bucket=None, price_pattern=None)
+
+    def test_cash_leg_of_missed_mixed_deal_gated_out(self):
+        # mrtx 型：混合 deal 只抽到现金腿 12.00，终价 58.70 → 0.2x 宽闸过但
+        # return 紧闸拦下；consideration_cash 照记，return NULL
+        row = self._row("12.00", "58.70")
+        assert row["reason_code"] == "ACQUISITION_CASH"
+        assert row["consideration_cash"] == Decimal("12.00")
+        assert row["delisting_return"] is None
+        assert "cash_return_gated_out=" in row["evidence"]
+
+    def test_normal_cash_deal_still_writes_return(self):
+        row = self._row("10.05", "10.00")
+        assert row["delisting_return"] == Decimal("0.00500000")
+
+    def test_gate_boundaries_inclusive(self):
+        assert self._row("6.00", "10.00")["delisting_return"] == Decimal("-0.40000000")
+        assert self._row("15.00", "10.00")["delisting_return"] == Decimal("0.50000000")
+        assert self._row("5.99", "10.00")["delisting_return"] is None
+        assert self._row("15.01", "10.00")["delisting_return"] is None

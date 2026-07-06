@@ -183,13 +183,16 @@ EIGHTK_DOCS_PER_SECURITY = 3           # 每只候选最多抓 3 份主文档
 # 股票腿/混合对价的 implied value 过同一闸门。
 CASH_SANITY_FLOOR_RATIO = 0.2
 CASH_SANITY_CEIL_RATIO = 5.0
-# 股票腿/混合腿的独立紧闸门：合法换股并购的 implied（ratio×acquirer_close±现金腿）
-# 与终价同样收敛（p50≈0 论证与现金同构），偏离 [0.6x, 1.5x] 必是抽取残缺——
-# 生产实测三种失败模式全部落在闸外：混合 deal 漏抽现金腿（implied≈0.3x，
-# mcrn/ceb/xls/ghdx）、优先股类误配普通股换股比（1.7-1.8x，ibkco/ibkcp）、
-# 收购方同名撞库解析错价（slct 的 First Bancorp NC vs First BanCorp PR）。
-STOCK_SANITY_FLOOR_RATIO = 0.6
-STOCK_SANITY_CEIL_RATIO = 1.5
+# return 写入的统一紧闸门：并购完成时终价收敛到对价（现金/换股/混合同构，
+# p50≈0 论证），implied（现金独占=cash；换股/混合=ratio×acquirer_close±cash）
+# 偏离 final_price 的 [0.6x, 1.5x] 必是抽取残缺——生产实测失败模式全落闸外：
+# 混合 deal 漏抽换股腿只剩现金腿（mrtx/cmd/iaa，-79%~-40% 伪值）、漏抽现金腿
+# 只剩换股腿（implied≈0.3x，mcrn/ceb/xls/ghdx）、优先股类误配普通股换股比
+# （1.7-1.8x，ibkco/ibkcp）、收购方同名撞库解析错价（slct）。真实现金并购
+# return 分布 p10≈-5%（一期实测），闸门余量 8 倍。对价字段的**记录**仍走
+# 宽闸门 CASH_SANITY（[0.2x,5x]）——记录宁多，return 宁缺。
+RETURN_SANITY_FLOOR_RATIO = 0.6
+RETURN_SANITY_CEIL_RATIO = 1.5
 # 破产三证之一：终价须低于 $0.1（近零终值——事实全损）
 BANKRUPTCY_FINAL_PRICE_CEILING = Decimal("0.1")
 # 收购方收盘价缺 final_price_date 当日 bar 时的回看天数（自然日）
@@ -1304,25 +1307,36 @@ def classify(
         and final_price > 0
     ):
         if consideration.cash is not None and consideration.stock_ratio is None:
-            # 现金独占（election 结构不影响：现金腿是文档实据）
-            delisting_return = (
-                (consideration.cash - final_price) / final_price
-            ).quantize(Decimal("1E-8"))
+            # 现金独占（election 结构不影响：现金腿是文档实据）。return 写入
+            # 过统一紧闸门——出界的多为混合 deal 漏抽换股腿，记录留 cash、不写数值。
+            if (
+                Decimal(str(RETURN_SANITY_FLOOR_RATIO)) * final_price
+                <= consideration.cash
+                <= Decimal(str(RETURN_SANITY_CEIL_RATIO)) * final_price
+            ):
+                delisting_return = (
+                    (consideration.cash - final_price) / final_price
+                ).quantize(Decimal("1E-8"))
+            else:
+                tokens.append(
+                    f"cash_return_gated_out={consideration.cash} vs final_price={final_price} "
+                    f"(outside [{RETURN_SANITY_FLOOR_RATIO}x, {RETURN_SANITY_CEIL_RATIO}x])"
+                )
         elif (
             consideration.stock_ratio is not None
             and acquirer_close is not None
             and not consideration.election
         ):
             # 换股独占：implied = ratio × acquirer_close；混合：再加现金腿。
-            # implied 过股票腿专属紧闸门 [0.6x, 1.5x]（常量注释记载三种生产实测
-            # 失败模式），出界记 evidence 不写数值。
+            # implied 过统一紧闸门（常量注释记载生产实测失败模式），出界记
+            # evidence 不写数值。
             implied = consideration.stock_ratio * acquirer_close
             if consideration.cash is not None:
                 implied += consideration.cash
             if (
-                Decimal(str(STOCK_SANITY_FLOOR_RATIO)) * final_price
+                Decimal(str(RETURN_SANITY_FLOOR_RATIO)) * final_price
                 <= implied
-                <= Decimal(str(STOCK_SANITY_CEIL_RATIO)) * final_price
+                <= Decimal(str(RETURN_SANITY_CEIL_RATIO)) * final_price
             ):
                 delisting_return = (
                     (implied - final_price) / final_price
@@ -1330,7 +1344,7 @@ def classify(
             else:
                 tokens.append(
                     f"stock_gated_out={implied} vs final_price={final_price} "
-                    f"(outside [{STOCK_SANITY_FLOOR_RATIO}x, {STOCK_SANITY_CEIL_RATIO}x])"
+                    f"(outside [{RETURN_SANITY_FLOOR_RATIO}x, {RETURN_SANITY_CEIL_RATIO}x])"
                 )
 
     return {
