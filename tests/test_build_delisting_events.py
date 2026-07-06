@@ -36,8 +36,11 @@ from scripts.build_delisting_events import (
     extract_stock_ratios,
     fetch_form25_rules,
     fetch_merger_considerations,
+    form25_class_matches_security,
     infer_price_pattern,
     needs_price_pattern,
+    normalize_form25_doc_url,
+    parse_form25_document,
     parse_form25_rule,
     pick_clear_mode,
     pick_merger_doc_candidates,
@@ -132,6 +135,196 @@ class TestClassifyPriceFailure:
 # ---------------------------------------------------------------------------
 # Form 25 规则段解析
 # ---------------------------------------------------------------------------
+
+# 25-NSE 原始 XML（真实形状：Great Ajax 的 notes 类 Form 25）
+FORM25_NSE_NOTES_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<edgarSubmission xmlns="http://www.sec.gov/edgar/form25">'
+    "<schemaVersion>X0101</schemaVersion>"
+    "<documentType>25-NSE</documentType>"
+    "<issuer><cik>0001614806</cik><issuerName>GREAT AJAX CORP</issuerName></issuer>"
+    "<descriptionClassSecurity>7.25% Convertible Senior Notes due 2024</descriptionClassSecurity>"
+    "<ruleProvision>17 CFR 240.12d2-2(a)(2)</ruleProvision>"
+    "</edgarSubmission>"
+)
+FORM25_NSE_CS_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<edgarSubmission xmlns="http://www.sec.gov/edgar/form25">'
+    "<schemaVersion>X0101</schemaVersion>"
+    "<documentType>25-NSE</documentType>"
+    "<issuer><cik>0000000123</cik><issuerName>ACQUIRED HOLDINGS INC</issuerName></issuer>"
+    "<descriptionClassSecurity>Common Stock, par value $0.01 per share</descriptionClassSecurity>"
+    "<ruleProvision>17 CFR 240.12d2-2(a)(3)</ruleProvision>"
+    "</edgarSubmission>"
+)
+
+# form '25' HTML 模板（镜像 Triumph Financial d29541d25.htm：全部条款列成选项，
+# checkbox 用 &#9744;/&#9746; 实体，选中的是 (c)）
+TRIUMPH_FORM25_HTML = (
+    "<html><body>"
+    "<p>Triumph Financial, Inc. (Exact name of Issuer as specified in its charter)</p>"
+    "<p>001-36722 (Commission File Number)</p>"
+    "<p>Common Stock, par value $0.01 per share</p>"
+    "<p>(Description of class of securities)</p>"
+    "<p>Please place an X in the box to designate the rule provision relied upon "
+    "to strike the class of securities from listing and registration:</p>"
+    "<p>&#9744; 17 CFR 240.12d2-2(a)(1). The entire class of the security has been redeemed.</p>"
+    "<p>&#9744; 17 CFR 240.12d2-2(a)(2). The entire class of the security has matured or been retired.</p>"
+    "<p>&#9744; 17 CFR 240.12d2-2(a)(3). The entire class of the security has been exchanged "
+    "for another security.</p>"
+    "<p>&#9744; 17 CFR 240.12d2-2(a)(4). The instrument representing the security has come "
+    "to evidence another security.</p>"
+    "<p>&#9744; 17 CFR 240.12d2-2(b). The Exchange has filed to strike the class from "
+    "listing and registration.</p>"
+    "<p>&#9746; Pursuant to 17 CFR 240.12d2-2(c), the Issuer has complied with the rules of "
+    "the Exchange governing an issuer&#8217;s voluntary withdrawal of the class from listing "
+    "and registration.</p>"
+    "</body></html>"
+)
+
+
+class TestNormalizeForm25DocUrl:
+    def test_strips_xsl_viewer_segment(self):
+        url = ("https://www.sec.gov/Archives/edgar/data/1614806/"
+               "000087666124000304/xslF25X02/primary_doc.xml")
+        assert normalize_form25_doc_url(url) == (
+            "https://www.sec.gov/Archives/edgar/data/1614806/"
+            "000087666124000304/primary_doc.xml"
+        )
+
+    def test_plain_html_url_unchanged(self):
+        url = "https://www.sec.gov/Archives/edgar/data/1539638/000119312523279813/d29541d25.htm"
+        assert normalize_form25_doc_url(url) == url
+
+
+class TestParseForm25Xml:
+    def test_rule_provision_and_class_extracted(self):
+        parsed = parse_form25_document(FORM25_NSE_NOTES_XML)
+        assert parsed.provision == "a2"
+        assert parsed.class_description == "7.25% Convertible Senior Notes due 2024"
+        assert parsed.branch == "xml"
+
+    def test_cs_class_xml(self):
+        parsed = parse_form25_document(FORM25_NSE_CS_XML)
+        assert parsed.provision == "a3"
+        assert parsed.class_description == "Common Stock, par value $0.01 per share"
+
+    def test_voluntary_c_provision(self):
+        xml = FORM25_NSE_CS_XML.replace("17 CFR 240.12d2-2(a)(3)", "17 CFR 240.12d2-2(c)")
+        assert parse_form25_document(xml).provision == "c"
+
+    def test_absent_rule_provision_graceful(self):
+        xml = FORM25_NSE_CS_XML.replace(
+            "<ruleProvision>17 CFR 240.12d2-2(a)(3)</ruleProvision>", "")
+        parsed = parse_form25_document(xml)
+        assert parsed.provision is None
+        assert parsed.branch == "xml"
+        assert parsed.class_description == "Common Stock, par value $0.01 per share"
+
+    def test_repeated_identical_provisions_accepted(self):
+        xml = FORM25_NSE_CS_XML.replace(
+            "</edgarSubmission>",
+            "<ruleProvision>17 CFR 240.12d2-2(a)(3)</ruleProvision></edgarSubmission>")
+        assert parse_form25_document(xml).provision == "a3"
+
+    def test_conflicting_provisions_indeterminate(self):
+        xml = FORM25_NSE_CS_XML.replace(
+            "</edgarSubmission>",
+            "<ruleProvision>17 CFR 240.12d2-2(c)</ruleProvision></edgarSubmission>")
+        parsed = parse_form25_document(xml)
+        assert parsed.provision is None
+        assert "multiple_families_checked=a3,c" in parsed.note
+
+
+class TestParseForm25HtmlCheckbox:
+    def test_triumph_template_entity_checkboxes_select_c(self):
+        # 实体形式 &#9746;/&#9744; 经 strip_html unescape 成 ☒/☐ 后可判定
+        parsed = parse_form25_document(TRIUMPH_FORM25_HTML)
+        assert parsed.provision == "c"
+        assert parsed.branch == "html"
+        assert parsed.class_description == "Common Stock, par value $0.01 per share"
+
+    def test_raw_unicode_checkboxes(self):
+        text_ = ("☐ 17 CFR 240.12d2-2(a)(1). The entire class has been redeemed. "
+                 "☒ Pursuant to 17 CFR 240.12d2-2(c), the Issuer has complied with the rules.")
+        assert parse_form25_document(text_).provision == "c"
+
+    def test_ascii_checkbox_variant(self):
+        text_ = ("[ ] 17 CFR 240.12d2-2(a)(1). The entire class has been redeemed. "
+                 "[X] Pursuant to 17 CFR 240.12d2-2(c), the Issuer has complied with the rules.")
+        assert parse_form25_document(text_).provision == "c"
+
+    def test_checked_subprovision_extracted(self):
+        text_ = ("☒ 17 CFR 240.12d2-2(a)(1). The entire class of the security has been redeemed. "
+                 "☐ Pursuant to 17 CFR 240.12d2-2(c), the Issuer has complied with the rules.")
+        assert parse_form25_document(text_).provision == "a1"
+
+    def test_multiple_checked_families_indeterminate(self):
+        text_ = ("☒ 17 CFR 240.12d2-2(a)(3). The entire class has been exchanged for another "
+                 "security. ☒ Pursuant to 17 CFR 240.12d2-2(c), the Issuer has complied.")
+        parsed = parse_form25_document(text_)
+        assert parsed.provision is None
+        assert "multiple_families_checked=a3,c" in parsed.note
+
+    def test_checked_same_family_collapses_to_bare_a(self):
+        text_ = ("☒ 17 CFR 240.12d2-2(a)(3). Exchanged for another security. "
+                 "☒ 17 CFR 240.12d2-2(a)(4). Instrument evidences another security.")
+        parsed = parse_form25_document(text_)
+        assert parsed.provision == "a"
+        assert "multiple_checked_same_family=a3,a4" in parsed.note
+
+    def test_all_unchecked_is_indeterminate(self):
+        text_ = ("☐ 17 CFR 240.12d2-2(b). The Exchange has filed to strike the class. "
+                 "☐ Pursuant to 17 CFR 240.12d2-2(c), the Issuer has complied.")
+        parsed = parse_form25_document(text_)
+        assert parsed.provision is None
+        assert parsed.note == "no_checked_provision"
+
+    def test_no_marker_legacy_multi_provision_is_indeterminate(self):
+        text_ = ("securities may be stricken under 17 CFR 240.12d2-2(a)(1), "
+                 "17 CFR 240.12d2-2(b) or 17 CFR 240.12d2-2(c)")
+        assert parse_form25_document(text_).provision is None
+
+    def test_procedural_c_subreference_collapses_to_family(self):
+        # (c) 的程序性子引用 "(c)(2)" 不产生新键——坍缩到族字母
+        text_ = "removal pursuant to Rule 12d2-2(c)(2) notice requirements"
+        assert parse_form25_document(text_).provision == "c"
+
+
+class TestForm25ClassGuard:
+    def test_notes_class_rejected_for_cs(self):
+        assert form25_class_matches_security(
+            "7.25% Convertible Senior Notes due 2024", "CS") is False
+
+    def test_preferred_rejected_for_cs(self):
+        assert form25_class_matches_security(
+            "6.00% Series A Cumulative Preferred Stock", "CS") is False
+
+    def test_warrants_rejected_for_cs(self):
+        assert form25_class_matches_security(
+            "Warrants to purchase Common Stock", "CS") is False
+
+    def test_common_stock_accepted(self):
+        assert form25_class_matches_security(
+            "Common Stock, par value $0.01 per share", "CS") is True
+
+    def test_class_a_accepted(self):
+        assert form25_class_matches_security("Class A Common Stock", "CS") is True
+
+    def test_ordinary_shares_accepted(self):
+        assert form25_class_matches_security("Ordinary Shares", "CS") is True
+
+    def test_poison_pill_parenthetical_rider_not_a_rejection(self):
+        assert form25_class_matches_security(
+            "Common Stock, $0.01 par value (and associated Preferred Stock Purchase Rights)",
+            "CS") is True
+
+    def test_missing_description_accepted(self):
+        assert form25_class_matches_security(None, "CS") is True
+
+    def test_etf_matching_is_loose(self):
+        assert form25_class_matches_security("7.00% Fund Preferred Units", "ETF") is True
+
 
 class TestParseForm25Rule:
     def test_single_citation(self):
@@ -247,6 +440,69 @@ class TestClassifyDecisionTable:
         row = self._classify(evidence=Evidence(form25=[_filing()], form25_rule=rule))
         assert (row["reason_code"], row["reason_confidence"], row["source"]) == (expected, "HIGH", "FORM25")
         assert f"form25_rule=12d2-2({rule})" in row["evidence"]
+
+    @pytest.mark.parametrize("rule,expected", [
+        ("a1", "LIQUIDATION"), ("a2", "LIQUIDATION"), ("a3", "MERGER"), ("a4", "MERGER"),
+    ])
+    def test_form25_subprovision_maps_reason(self, rule, expected):
+        row = self._classify(evidence=Evidence(form25=[_filing()], form25_rule=rule))
+        assert (row["reason_code"], row["reason_confidence"], row["source"]) == (expected, "HIGH", "FORM25")
+        assert f"form25_rule=12d2-2({rule[0]})({rule[1]})" in row["evidence"]
+
+    @pytest.mark.parametrize("rule", ["a1", "a2"])
+    def test_liquidation_rules_note_redemption_provision(self, rule):
+        # (a)(1)/(a)(2) 全类赎回/退休——CS 类多为 SPAC 赎回清算，evidence 留痕
+        row = self._classify(evidence=Evidence(form25=[_filing()], form25_rule=rule))
+        assert row["reason_code"] == "LIQUIDATION"
+        assert "redemption_provision" in row["evidence"]
+
+    def test_bare_a_maps_merger_with_ambiguity_note(self):
+        row = self._classify(evidence=Evidence(form25=[_filing()], form25_rule="a"))
+        assert row["reason_code"] == "MERGER"
+        assert "form25_bare_a=" in row["evidence"]
+
+    def test_8k_merger_outranks_form25_voluntary_c(self):
+        # 并购常伴自愿撤牌流程件：8-K item 2.01 在场时保持 MERGER，evidence 双证据并记
+        row = self._classify(evidence=Evidence(
+            form25=[_filing()], form25_rule="c",
+            eightk_201=[_filing(accession="0002-25-000002", form="8-K")],
+        ))
+        assert (row["reason_code"], row["reason_confidence"], row["source"]) == ("MERGER", "HIGH", "FORM25")
+        assert "form25_rule=12d2-2(c)" in row["evidence"]
+        assert "8k_item201=" in row["evidence"]
+
+    @pytest.mark.parametrize("rule", ["a1", "c"])
+    def test_etf_form25_a1_or_c_upgrades_fund_closure_to_high(self, rule):
+        row = self._classify(security=_security(type_="ETF"),
+                             evidence=Evidence(form25=[_filing()], form25_rule=rule))
+        assert (row["reason_code"], row["reason_confidence"], row["source"]) == ("FUND_CLOSURE", "HIGH", "FORM25")
+        assert "etf_form25_upgrade=" in row["evidence"]
+
+    def test_etf_form25_b_keeps_exchange_drop(self):
+        row = self._classify(security=_security(type_="ETF"),
+                             evidence=Evidence(form25=[_filing()], form25_rule="b"))
+        assert (row["reason_code"], row["reason_confidence"]) == ("EXCHANGE_DROP", "HIGH")
+        assert "etf_form25_upgrade=" not in row["evidence"]
+
+    def test_form25_rule_accession_and_class_recorded_in_evidence(self):
+        row = self._classify(evidence=Evidence(
+            form25=[_filing()], form25_rule="a3",
+            form25_rule_accession="0001-25-000025",
+            form25_class="Common Stock, par value $0.01 per share",
+        ))
+        assert "form25_rule_accession=0001-25-000025" in row["evidence"]
+        assert "form25_class=Common Stock, par value $0.01 per share" in row["evidence"]
+
+    def test_wrong_class_only_docs_fall_through_with_evidence(self):
+        # 类守卫：只有 notes/preferred 类 Form 25 可解析 → 不定性、降层如旧，留痕
+        row = self._classify(evidence=Evidence(
+            form25=[_filing()],
+            form25_skipped_classes=["0001-25-000025:7.25% Convertible Senior Notes due 2024"],
+        ))
+        assert row["reason_code"] == "UNKNOWN"
+        assert row["reason_confidence"] is None
+        assert row["source"] == "FORM25"
+        assert "form25_wrong_class_skipped=0001-25-000025:" in row["evidence"]
 
     def test_form25_without_rule_falls_to_next_tier_keeping_accession(self):
         # Form 25 单独在场且解析不出规则段：不允许拍脑袋定 VOLUNTARY，降层
@@ -406,7 +662,10 @@ class TestFetchForm25Rules:
             fetch_text=lambda url: "removal pursuant to Rule 12d2-2(b).",
         )
         assert evidence.form25_rule == "b"
-        assert stats == {"candidates": 1, "fetched": 1, "parsed": 1, "failed": 0, "no_doc_url": 0}
+        assert evidence.form25_rule_accession == "0001-25-000001"
+        assert stats == {"candidates": 1, "fetched": 1, "parsed": 1, "parsed_xml": 0,
+                         "parsed_html": 1, "wrong_class": 0, "indeterminate": 0,
+                         "failed": 0, "no_doc_url": 0}
 
     def test_skips_security_with_8k_evidence(self):
         security = _security()
@@ -446,6 +705,80 @@ class TestFetchForm25Rules:
                                    fetch_text=lambda url: template)
         assert evidence.form25_rule is None
         assert stats["fetched"] == 1 and stats["parsed"] == 0
+        assert stats["indeterminate"] == 1
+
+
+class TestFetchForm25RulesTwoBranch:
+    XSL_URL = ("https://www.sec.gov/Archives/edgar/data/1614806/"
+               "000087666124000304/xslF25X02/primary_doc.xml")
+    RAW_URL = ("https://www.sec.gov/Archives/edgar/data/1614806/"
+               "000087666124000304/primary_doc.xml")
+
+    def test_xsl_viewer_url_stripped_and_xml_parsed(self):
+        security = _security(cik="0000000123")
+        evidence = Evidence(form25=[_filing(doc_url=self.XSL_URL)])
+        fetched_urls = []
+
+        def fake(url):
+            fetched_urls.append(url)
+            return FORM25_NSE_CS_XML
+
+        stats = fetch_form25_rules([security], {security.id: evidence}, fetch_text=fake)
+        assert fetched_urls == [self.RAW_URL]  # 剥掉 /xslF25X02/ 抓原始 XML
+        assert evidence.form25_rule == "a3"
+        assert evidence.form25_rule_accession == "0001-25-000001"
+        assert evidence.form25_class == "Common Stock, par value $0.01 per share"
+        assert stats["parsed"] == 1
+        assert stats["parsed_xml"] == 1 and stats["parsed_html"] == 0
+        assert stats["wrong_class"] == 0
+
+    def test_notes_class_doc_does_not_classify_cs_security(self):
+        # 类守卫：仅有 notes 类 Form 25 可解析 → 不定性、留痕、按现状降层
+        security = _security()
+        evidence = Evidence(form25=[_filing(accession="AJX-NOTES", doc_url="https://x/notes.xml")])
+        stats = fetch_form25_rules([security], {security.id: evidence},
+                                   fetch_text=lambda url: FORM25_NSE_NOTES_XML)
+        assert evidence.form25_rule is None
+        assert stats["parsed"] == 0 and stats["wrong_class"] == 1
+        assert evidence.form25_skipped_classes == [
+            "AJX-NOTES:7.25% Convertible Senior Notes due 2024"
+        ]
+
+    def test_prefers_cs_class_doc_among_multiple(self):
+        # 一司多类各报一份 Form 25：最近的 notes 类被守卫拒绝，下一份 CS 类采信
+        delist = date(2025, 6, 30)
+        notes = _filing(accession="F-NOTES", filed=delist - timedelta(days=1),
+                        doc_url="https://x/notes")
+        cs = _filing(accession="F-CS", filed=delist - timedelta(days=5),
+                     doc_url="https://x/cs")
+        security = _security(delist=delist)
+        evidence = Evidence(form25=[notes, cs])
+        docs = {"https://x/notes": FORM25_NSE_NOTES_XML, "https://x/cs": FORM25_NSE_CS_XML}
+        stats = fetch_form25_rules([security], {security.id: evidence},
+                                   fetch_text=docs.__getitem__)
+        assert evidence.form25_rule == "a3"
+        assert evidence.form25_rule_accession == "F-CS"
+        assert stats["fetched"] == 2 and stats["parsed"] == 1 and stats["wrong_class"] == 1
+        assert evidence.form25_skipped_classes == [
+            "F-NOTES:7.25% Convertible Senior Notes due 2024"
+        ]
+
+    def test_html_template_checkbox_doc_parses_via_html_branch(self):
+        security = _security()
+        evidence = Evidence(form25=[_filing(doc_url="https://x/d29541d25.htm")])
+        stats = fetch_form25_rules([security], {security.id: evidence},
+                                   fetch_text=lambda url: TRIUMPH_FORM25_HTML)
+        assert evidence.form25_rule == "c"
+        assert evidence.form25_class == "Common Stock, par value $0.01 per share"
+        assert stats["parsed_html"] == 1 and stats["parsed_xml"] == 0
+
+    def test_etf_class_matching_is_loose(self):
+        security = _security(type_="ETF")
+        evidence = Evidence(form25=[_filing(doc_url="https://x/etf.xml")])
+        stats = fetch_form25_rules([security], {security.id: evidence},
+                                   fetch_text=lambda url: FORM25_NSE_NOTES_XML)
+        assert evidence.form25_rule == "a2"
+        assert stats["wrong_class"] == 0
 
 
 # ---------------------------------------------------------------------------

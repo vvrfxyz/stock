@@ -16,9 +16,20 @@
 2. reason 分类按证据强度分层（宁缺毋滥，归不出就是 UNKNOWN）：
    - HIGH   同 CIK 的 8-K item 2.01（并购完成）在 delist_date ±30 天内 → MERGER；
             Form 25/25-NSE（delist_date -90/+30 天）叠加 8-K 为最强证据；
-            Form 25 单独出现时只有解析出 12d2-2 规则段（--fetch-form25-docs）才定性：
-            (a) 证券消灭/并购 → MERGER，(b) 交易所摘牌 → EXCHANGE_DROP，
-            (c) 发行人自愿 → VOLUNTARY；解析不出则 accession 记 evidence、降层。
+            Form 25 单独出现时只有解析出 12d2-2 规则段（--fetch-form25-docs）才定性。
+            解析两分支：25-NSE 原始 XML 读结构化 <ruleProvision>（primary_document_url
+            指向 /xslF25X 渲染视图时剥掉该段取原文 XML）；form '25' HTML 模板把全部
+            条款列成选项，须靠 checkbox 标记（☒/U+2612 选中、☐/U+2610 未选，含
+            [X]/[x]/(X) ASCII 变体）——条款 token 回看 90 字符找最近标记，只收选中项。
+            规则映射：(a)(3)/(a)(4)/裸 (a) 证券消灭换股/并购 → MERGER，
+            (a)(1)/(a)(2) 全类赎回/退休 → LIQUIDATION（CS 类多为 SPAC 赎回清算，
+            evidence 记 redemption_provision），(b) 交易所摘牌 → EXCHANGE_DROP，
+            (c) 发行人自愿 → VOLUNTARY。类描述守卫：一司可按类各报一份 Form 25，
+            notes/preferred 类的文档绝不为 CS 证券定性（只剩非 CS 类时记 evidence
+            降层如旧；ETF 份额描述宽松放行，(a)(1)/(c) 把 FUND_CLOSURE 升 HIGH）。
+            8-K item 2.01 的 MERGER 证据强于 Form 25 (c)（并购常伴自愿撤牌），
+            两者同在保持 MERGER，evidence 双证据并记。解析不出则 accession 记
+            evidence、降层。
             证据 join 一律走 CIK 列（sec_filings.security_id 锚定同 CIK 最小 id，禁用）。
    - MEDIUM security_identity_events 的 MERGE 事件（身份合并，持仓延续到 keep 侧）
             → MERGER；type='ETF' → FUND_CLOSURE（发行人清盘模式；最终 NAV 分配常在
@@ -98,9 +109,21 @@ FORM25_WINDOW_AFTER_DAYS = 30
 EIGHTK_WINDOW_DAYS = 30
 DEFM14A_WINDOW_BEFORE_DAYS = 120
 
-# Form 25 的 12d2-2 规则段 → reason（任务交接口径：(a) 证券消灭/并购，
-# (b) 交易所摘牌不达标，(c) 发行人自愿退市）
-FORM25_RULE_REASON = {"a": "MERGER", "b": "EXCHANGE_DROP", "c": "VOLUNTARY"}
+# Form 25 的 12d2-2 规则段 → reason。子款：(a)(1) 全类赎回 / (a)(2) 到期退休
+# → LIQUIDATION（CS 类多为 SPAC 赎回清算）；(a)(3)/(a)(4) 全类换成另一证券 →
+# MERGER；裸 (a) 无子款（文档级歧义）按并购主口径 → MERGER；(b) 交易所摘牌
+# 不达标 → EXCHANGE_DROP；(c) 发行人自愿退市 → VOLUNTARY。
+FORM25_RULE_REASON = {
+    "a": "MERGER",
+    "a1": "LIQUIDATION",
+    "a2": "LIQUIDATION",
+    "a3": "MERGER",
+    "a4": "MERGER",
+    "b": "EXCHANGE_DROP",
+    "c": "VOLUNTARY",
+}
+FORM25_DOCS_PER_SECURITY = 3     # 一司可按类各报一份 Form 25（notes/preferred/CS）
+FORM25_CHECKBOX_LOOKBACK = 90    # HTML 分支：条款 token 回看窗口（字符）找最近 checkbox
 
 # source 取"用到的最强证据层"（FORM25 > 8K > TICKER_EVENT > PRICE_INFERRED > MANUAL）
 
@@ -200,7 +223,12 @@ class Evidence:
     form25: list[Filing] = field(default_factory=list)
     eightk_201: list[Filing] = field(default_factory=list)
     merge_events: list[MergeEvent] = field(default_factory=list)
-    form25_rule: str | None = None  # 'a' / 'b' / 'c'，仅 --fetch-form25-docs 解析成功时
+    # 'a' / 'a1'..'a4' / 'b' / 'c'，仅 --fetch-form25-docs 解析成功时
+    form25_rule: str | None = None
+    form25_rule_accession: str | None = None  # 采信文档的 accession（证据可追溯）
+    form25_rule_note: str | None = None       # 解析歧义留痕（多选中/无选中等）
+    form25_class: str | None = None           # 采信文档的证券类描述
+    form25_skipped_classes: list[str] = field(default_factory=list)  # 类守卫拒绝的非 CS 类文档
     eightk_301: list[Filing] = field(default_factory=list)   # 仅 --fetch-8k-docs 加载
     defm14a: list[Filing] = field(default_factory=list)      # 仅 --fetch-8k-docs 加载
     consideration: ConsiderationExtraction | None = None     # 仅 --fetch-8k-docs 产出
@@ -303,30 +331,193 @@ def infer_price_pattern(
 # Form 25 原文 12d2-2 规则段解析（--fetch-form25-docs）
 # ---------------------------------------------------------------------------
 
-# 引用形态两种：正文 "17 CFR 240.12d2-2(b)"；XML 标签风格 "rule12d2-2b"
-_RULE_CITATION_RE = re.compile(r"12d2[-_]2\s*\(\s*([abc])\s*\)", re.IGNORECASE)
+# 引用形态：正文 "17 CFR 240.12d2-2(a)(2)"（子款只对 (a) 有意义，(b)/(c) 的
+# 程序性子引用如 "(c)(2)(ii)" 一律坍缩到族字母）；legacy 标签风格 "rule12d2-2b"
+_RULE_CITATION_RE = re.compile(
+    r"12d2[-_]2\s*\(\s*([abc])\s*\)(?:\s*\(\s*([1-4])\s*\))?", re.IGNORECASE)
 _RULE_TAG_RE = re.compile(r"rule12d2[-_]?2([abc])\b", re.IGNORECASE)
+
+# 25-NSE 原始 XML 的结构化字段（最可靠的分支）
+_XML_RULE_PROVISION_RE = re.compile(
+    r"<\s*ruleProvision\s*>\s*(.*?)\s*<\s*/\s*ruleProvision\s*>", re.IGNORECASE | re.DOTALL)
+_XML_CLASS_DESC_RE = re.compile(
+    r"<\s*descriptionClassSecurity\s*>\s*(.*?)\s*<\s*/\s*descriptionClassSecurity\s*>",
+    re.IGNORECASE | re.DOTALL)
+
+# HTML checkbox 标记（strip_html 已把 &#9746;/&#9744; 实体 unescape 成单字符）。
+# 选中：☒/☑/[X]/[x]/(X)；未选：☐/[ ]/[_]。不收 '(x)'——法律文本的罗马数字
+# 列表项 "(x)" 会误中。
+_CHECKED_MARK_RE = re.compile(r"[☒☑]|\[[Xx]\]|\(X\)")
+_UNCHECKED_MARK_RE = re.compile(r"☐|\[\s*\]|\[_+\]")
+
+# Form 25 HTML 表头的类描述紧邻其说明文字 "(Description of class of securities)"
+_HTML_CLASS_LABEL_RE = re.compile(
+    r"\(\s*Description\s+of\s+class(?:es)?\s+of\s+securities\s*\)", re.IGNORECASE)
+
+# 类描述守卫：CS 证券绝不采信 notes/preferred/warrant 等非普通股类的 Form 25。
+# 判定前先剥括号附注——"Common Stock (and associated Preferred Stock Purchase
+# Rights)" 的毒丸附注不是独立类。
+_FORM25_NON_CS_CLASS_RE = re.compile(
+    r"\b(notes?|debentures?|preferred|preference|warrants?|bonds?|rights|units?|"
+    r"depositary)\b|\d+(?:\.\d+)?\s*%",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class Form25Parse:
+    """单份 Form 25 文档的解析结果。provision=None 即不可判定（宁缺毋滥）。"""
+    provision: str | None            # 'a' / 'a1'..'a4' / 'b' / 'c'
+    class_description: str | None = None
+    branch: str = "html"             # 'xml' | 'html'
+    note: str | None = None          # 歧义留痕（多族选中 / 同族多款坍缩 / 无选中）
+
+
+_XSL_VIEWER_SEGMENT_RE = re.compile(r"/xslF25X\d+/")
+
+
+def normalize_form25_doc_url(url: str) -> str:
+    """25-NSE 的 primary_document_url 常指向 XSL 渲染视图
+    （.../xslF25X02/primary_doc.xml）；剥掉 viewer 段即得原始 XML。"""
+    return _XSL_VIEWER_SEGMENT_RE.sub("/", url)
+
+
+def _provision_key(letter: str, sub: str | None) -> str:
+    """规范化条款键：只有 (a) 的子款参与语义区分，(b)/(c) 坍缩到族字母。"""
+    letter = letter.lower()
+    if letter == "a" and sub:
+        return letter + sub
+    return letter
+
+
+def format_provision(key: str) -> str:
+    """'a2' -> '(a)(2)'，'b' -> '(b)'（evidence 展示用）。"""
+    if len(key) == 2:
+        return f"({key[0]})({key[1]})"
+    return f"({key})"
+
+
+def _resolve_provisions(provisions: list[str]) -> tuple[str | None, str | None]:
+    """条款集合 -> (rule, note)。唯一即采信；同族多款坍缩到族字母（裸 (a) 按
+    MERGER 主口径）；跨族多款不可判定——宁缺毋滥。"""
+    distinct = sorted(set(provisions))
+    if not distinct:
+        return None, None
+    if len(distinct) == 1:
+        return distinct[0], None
+    families = {p[0] for p in distinct}
+    if len(families) > 1:
+        return None, "multiple_families_checked=" + ",".join(distinct)
+    return families.pop(), "multiple_checked_same_family=" + ",".join(distinct)
+
+
+def _checked_state(window: str) -> bool | None:
+    """回看窗口内最近一个 checkbox 标记的状态；无标记返回 None。"""
+    last_checked = None
+    for m in _CHECKED_MARK_RE.finditer(window):
+        last_checked = m.end()
+    last_unchecked = None
+    for m in _UNCHECKED_MARK_RE.finditer(window):
+        last_unchecked = m.end()
+    if last_checked is None and last_unchecked is None:
+        return None
+    if last_unchecked is None:
+        return True
+    if last_checked is None:
+        return False
+    return last_checked > last_unchecked
+
+
+def _extract_html_class_description(text_: str) -> str | None:
+    """HTML 表头：类描述紧靠 '(Description of class of securities)' 之前，
+    上一个括号说明段（如 '(Commission File Number)'）之后。"""
+    m = _HTML_CLASS_LABEL_RE.search(text_)
+    if m is None:
+        return None
+    prefix = text_[:m.start()].rstrip()
+    cut = prefix.rfind(")")
+    desc = (prefix[cut + 1:] if cut != -1 else prefix[-100:]).strip(" ,;:")
+    return desc[:255] or None
+
+
+def parse_form25_document(doc_text: str) -> Form25Parse:
+    """两分支解析一份 Form 25 原文。
+
+    - XML 分支（25-NSE 原始 XML）：<ruleProvision> 是结构化字段，直接抽；
+      可能出现 0/1/多次，多次跨族即不可判定。同时抓 <descriptionClassSecurity>。
+    - HTML 分支（form '25' 模板）：模板把全部条款列成选项，只有 checkbox
+      标记（☒ 选中 / ☐ 未选）指出适用项——每个条款 token 回看
+      FORM25_CHECKBOX_LOOKBACK 字符找最近标记，只收选中项。全文无任何
+      checkbox 标记的 legacy 文本退回"全文条款唯一才采信"的老口径。
+    """
+    # XML 分支
+    if re.search(r"<\s*(ruleProvision|descriptionClassSecurity)\b", doc_text, re.IGNORECASE):
+        provisions = []
+        for m in _XML_RULE_PROVISION_RE.finditer(doc_text):
+            cm = _RULE_CITATION_RE.search(m.group(1))
+            if cm:
+                provisions.append(_provision_key(cm.group(1), cm.group(2)))
+        class_desc = None
+        cd = _XML_CLASS_DESC_RE.search(doc_text)
+        if cd:
+            class_desc = html.unescape(cd.group(1)).strip()[:255] or None
+        provision, note = _resolve_provisions(provisions)
+        return Form25Parse(provision, class_desc, "xml", note)
+
+    # legacy 标签风格（"rule12d2-2b"）——须在 HTML 剥标签前匹配
+    tag_provisions = [m.group(1).lower() for m in _RULE_TAG_RE.finditer(doc_text)]
+    if tag_provisions:
+        provision, note = _resolve_provisions(tag_provisions)
+        return Form25Parse(provision, None, "html", note)
+
+    # HTML 分支
+    text_ = strip_html(doc_text)
+    citations = [
+        (m.start(), _provision_key(m.group(1), m.group(2)))
+        for m in _RULE_CITATION_RE.finditer(text_)
+    ]
+    class_desc = _extract_html_class_description(text_)
+    if not citations:
+        return Form25Parse(None, class_desc, "html", None)
+    if _CHECKED_MARK_RE.search(text_) or _UNCHECKED_MARK_RE.search(text_):
+        checked = []
+        for pos, key in citations:
+            window = text_[max(0, pos - FORM25_CHECKBOX_LOOKBACK):pos]
+            if _checked_state(window) is True:
+                checked.append(key)
+        provision, note = _resolve_provisions(checked)
+        if provision is None and note is None:
+            note = "no_checked_provision"
+        return Form25Parse(provision, class_desc, "html", note)
+    # 无任何 checkbox 标记的 legacy 文本：全文条款唯一才采信
+    provision, note = _resolve_provisions([key for _, key in citations])
+    return Form25Parse(provision, class_desc, "html", note)
 
 
 def parse_form25_rule(doc_text: str) -> str | None:
-    """从 Form 25 原文抽 12d2-2 规则段字母。
-
-    只有全文出现的规则字母唯一时才采信（HTML 模板会把 (a)(b)(c) 三段全列出来
-    当选项——多字母即不可判定，宁缺毋滥返回 None）。
-    """
-    letters = {m.group(1).lower() for m in _RULE_CITATION_RE.finditer(doc_text)}
-    letters |= {m.group(1).lower() for m in _RULE_TAG_RE.finditer(doc_text)}
-    if len(letters) == 1:
-        return letters.pop()
-    return None
+    """兼容入口：从 Form 25 原文抽 12d2-2 规则段键（'a'/'a1'..'c'）。"""
+    return parse_form25_document(doc_text).provision
 
 
-def pick_form25_doc_candidate(evidence: Evidence, delist_date: date) -> Filing | None:
-    """选最接近 delist_date 且带 primary_document_url 的 Form 25 去抓原文。"""
+def form25_class_matches_security(class_description: str | None,
+                                  security_type: str | None) -> bool:
+    """类守卫：CS 证券拒绝明确的非普通股类描述；ETF 份额描述五花八门宽松放行；
+    无类描述（legacy HTML 抽不出）无从否定，放行。"""
+    if (security_type or "").upper() == "ETF":
+        return True
+    if not class_description:
+        return True
+    primary = re.sub(r"\([^)]*\)", " ", class_description)
+    return _FORM25_NON_CS_CLASS_RE.search(primary) is None
+
+
+def pick_form25_doc_candidates(evidence: Evidence, delist_date: date) -> list[Filing]:
+    """按贴近 delist_date 排序的 Form 25 抓取清单（一司可按类各报一份——
+    notes/preferred/CS，类守卫在解析后拒绝非 CS 类），至多
+    FORM25_DOCS_PER_SECURITY 份。"""
     candidates = [f for f in evidence.form25 if f.primary_document_url]
-    if not candidates:
-        return None
-    return min(candidates, key=lambda f: abs((f.filing_date - delist_date).days))
+    candidates.sort(key=lambda f: (abs((f.filing_date - delist_date).days), f.accession_number))
+    return candidates[:FORM25_DOCS_PER_SECURITY]
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +802,8 @@ def classify(
     """决策表输出一行完整 payload（full-rebuild 语义：所有列显式给值）。
 
     source 取产生 reason 的证据层；8-K 与 Form 25 同时在场时 FORM25 为最强层。
+    8-K item 2.01 的 MERGER 定性压过 Form 25 规则段（含 (c)——并购常伴自愿撤牌
+    流程件），两证据同记 evidence。
     UNKNOWN 行若 evidence 里有 Form 25 accession，source 仍记 FORM25（证据在、
     定性不了——留给人工与后续数据源迭代）。
 
@@ -630,7 +823,21 @@ def classify(
         suffix = f"(+{len(evidence.form25) - EVIDENCE_ACCESSION_CAP} more)" if len(evidence.form25) > EVIDENCE_ACCESSION_CAP else ""
         tokens.append(f"form25={listed}{suffix}")
     if evidence.form25_rule:
-        tokens.append(f"form25_rule=12d2-2({evidence.form25_rule})")
+        tokens.append(f"form25_rule=12d2-2{format_provision(evidence.form25_rule)}")
+        if evidence.form25_rule_accession:
+            tokens.append(f"form25_rule_accession={evidence.form25_rule_accession}")
+        if evidence.form25_rule in ("a1", "a2"):
+            # (a)(1)/(a)(2) 全类赎回/退休——CS 类多为 SPAC 赎回清算
+            tokens.append("redemption_provision")
+        elif evidence.form25_rule == "a":
+            tokens.append("form25_bare_a=no sub-provision in doc, MERGER by dominant usage")
+    if evidence.form25_rule_note:
+        tokens.append(f"form25_note={evidence.form25_rule_note}")
+    if evidence.form25_class:
+        tokens.append(f"form25_class={evidence.form25_class}")
+    if evidence.form25_skipped_classes:
+        listed = ";".join(evidence.form25_skipped_classes[:EVIDENCE_ACCESSION_CAP])
+        tokens.append(f"form25_wrong_class_skipped={listed}")
     if evidence.eightk_201:
         listed = ",".join(
             f"{f.accession_number}:{f.filing_date.isoformat()}"
@@ -671,6 +878,10 @@ def classify(
         reason_code = FORM25_RULE_REASON[evidence.form25_rule]
         confidence = "HIGH"
         source = "FORM25"
+        if (security.type or "").upper() == "ETF" and evidence.form25_rule in ("a1", "c"):
+            # ETF 的全类赎回/自愿撤牌就是基金清盘——FUND_CLOSURE 升 HIGH
+            reason_code = "FUND_CLOSURE"
+            tokens.append("etf_form25_upgrade=fund closure confirmed by Form 25 rule provision")
 
     # --- MEDIUM ---
     if reason_code is None and evidence.merge_events:
@@ -936,10 +1147,20 @@ def fetch_form25_rules(
 ) -> dict[str, int]:
     """对"仅有 Form 25、无 8-K"的证券抓原文解析规则段，结果写回 evidence.form25_rule。
 
+    每只至多尝试 FORM25_DOCS_PER_SECURITY 份文档（一司可按类各报一份 Form 25）：
+    25-NSE 的 xsl 视图 URL 先剥成原始 XML 再抓；解析出条款后过类描述守卫——
+    notes/preferred 类的文档绝不为 CS 证券定性（计 wrong_class、记 evidence、
+    继续试下一份）；8-K 在场的证券整体跳过（更强证据已定性，分类器层面
+    8-K MERGER 也压过 Form 25 (c)）。
+
     fetch_text 可注入（测试 mock）；默认走 SecEdgarSource 的节流 getter。
     离线/UA 未配置/连续失败 —— 全部优雅跳过，只降层不报错。
     """
-    stats = {"candidates": 0, "fetched": 0, "parsed": 0, "failed": 0, "no_doc_url": 0}
+    stats = {
+        "candidates": 0, "fetched": 0, "parsed": 0, "parsed_xml": 0,
+        "parsed_html": 0, "wrong_class": 0, "indeterminate": 0,
+        "failed": 0, "no_doc_url": 0,
+    }
 
     if fetch_text is None:
         fetch_text = _edgar_fetch_text()
@@ -947,33 +1168,55 @@ def fetch_form25_rules(
             return stats
 
     consecutive_failures = 0
+    offline = False
     for security in securities:
+        if offline:
+            break
         evidence = evidences.get(security.id)
         if evidence is None or not evidence.form25 or evidence.eightk_201:
             continue  # 无 Form 25 或已有更强 8-K 证据，无需原文
         stats["candidates"] += 1
-        candidate = pick_form25_doc_candidate(evidence, security.delist_date)
-        if candidate is None:
+        candidates = pick_form25_doc_candidates(evidence, security.delist_date)
+        if not candidates:
             stats["no_doc_url"] += 1
             continue
-        try:
-            doc_text = fetch_text(candidate.primary_document_url)
-            consecutive_failures = 0
-        except Exception as exc:
-            stats["failed"] += 1
-            consecutive_failures += 1
-            logger.warning("Form 25 原文抓取失败 {} ({}): {}",
-                           security.symbol, candidate.accession_number, exc)
-            if consecutive_failures >= FORM25_DOC_FAILURE_ABORT:
-                logger.warning("连续 {} 次抓取失败，判定离线，跳过剩余 Form 25 原文。",
-                               FORM25_DOC_FAILURE_ABORT)
-                break
-            continue
-        stats["fetched"] += 1
-        rule = parse_form25_rule(doc_text or "")
-        if rule:
+        last_note: str | None = None
+        for candidate in candidates:
+            try:
+                doc_text = fetch_text(normalize_form25_doc_url(candidate.primary_document_url))
+                consecutive_failures = 0
+            except Exception as exc:
+                stats["failed"] += 1
+                consecutive_failures += 1
+                logger.warning("Form 25 原文抓取失败 {} ({}): {}",
+                               security.symbol, candidate.accession_number, exc)
+                if consecutive_failures >= FORM25_DOC_FAILURE_ABORT:
+                    logger.warning("连续 {} 次抓取失败，判定离线，跳过剩余 Form 25 原文。",
+                                   FORM25_DOC_FAILURE_ABORT)
+                    offline = True
+                    break
+                continue
+            stats["fetched"] += 1
+            parsed = parse_form25_document(doc_text or "")
+            if parsed.provision is None:
+                stats["indeterminate"] += 1
+                if parsed.note:
+                    last_note = f"{candidate.accession_number}:{parsed.note}"
+                continue
+            if not form25_class_matches_security(parsed.class_description, security.type):
+                stats["wrong_class"] += 1
+                evidence.form25_skipped_classes.append(
+                    f"{candidate.accession_number}:{parsed.class_description}")
+                continue
             stats["parsed"] += 1
-            evidence.form25_rule = rule
+            stats["parsed_xml" if parsed.branch == "xml" else "parsed_html"] += 1
+            evidence.form25_rule = parsed.provision
+            evidence.form25_rule_accession = candidate.accession_number
+            evidence.form25_rule_note = parsed.note
+            evidence.form25_class = parsed.class_description
+            break
+        if evidence.form25_rule is None and last_note:
+            evidence.form25_rule_note = last_note  # 不可判定的留痕（进 evidence 供人工）
     return stats
 
 
@@ -1141,7 +1384,9 @@ def report(
         logger.info("")
         logger.info("=== Form 25 原文阶段 ===")
         logger.info("  candidates={candidates} fetched={fetched} parsed={parsed} "
-                    "failed={failed} no_doc_url={no_doc_url}", **doc_stats)
+                    "(xml={parsed_xml} html={parsed_html}) wrong_class={wrong_class} "
+                    "indeterminate={indeterminate} failed={failed} no_doc_url={no_doc_url}",
+                    **doc_stats)
 
     if consideration_stats is not None:
         logger.info("")
