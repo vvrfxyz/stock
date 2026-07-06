@@ -31,9 +31,10 @@
 | shadow_asymmetry（K 线影线不对称） | 日线 | t=+1.30 @h5 | 死亡 | 短窗 t=2.0 被长窗证伪——短窗显著性教训的标本 | 同上 |
 | smart_money_gap（尾盘-开盘收益差） | 分钟 | t<1 | 死亡 | 无信号 | 同上 |
 | close_vwap_pressure（收盘对 vwap 偏离） | 日线 | t<1（短窗即死） | 死亡 | wave-1 即淘汰，未进长窗 | wave-1 |
-| **composite_v1（3 信号：low_vol + high_52w 逐日残差 + breadth，0.5 中性填补）** | 日线+13F | IC .0294 t=3.88 @h5；q5 净 Sharpe h21 0.728 | **可用候选（首个过预注册相对判据的合成）** | vs low_vol 单干：IC IR 0.150>0.137、q5 净 Sharpe 0.728>0.713、LS 减亏一半（-0.09 vs -0.23）双条件 PASS——方差缩减如预期。诚实注记：改进幅度小、窗口对成分选择是样本内、13F 2013Q2 起故无真 OOS 腿；4 信号版（含 delta_IO）判 FAIL 是符号反转成分的直接实证 | wave-6、composite_v1 报告 |
+| **composite_v1（3 信号：low_vol + high_52w 逐日残差 + breadth，0.5 中性填补）** | 日线+13F | IC .0294 t=3.88 @h5；q5 净 Sharpe h21 0.728 | **可用候选（首个过预注册相对判据的合成）** | vs low_vol 单干双条件 PASS（IC IR 0.150>0.137、q5 净 Sharpe 0.728>0.713）——但 wave-8 发现成分 breadth 是 size 马甲，**该增量大概率只是 size 暴露**；判决降为"待 size 关卡重审"（用 size 直接替换 breadth 重跑对照）。4 信号版 FAIL 是符号反转成分的直接实证 | wave-6/8 |
 | insider_cluster（多内部人非例行集群买入，CMP 例行过滤） | SEC Form 4 | IC 负向弱（t=-0.98~-1.37，全部 noisy） | **死亡（横截面 IC 口径，2026-07-07）** | 侦察队 40-50% 基率落空：条件横截面太薄（~294 只/日）且方向不符；其预警的"事件稀疏杀日频 rank IC"命中。事件研究（CAR）口径未测试——挂低优先级开放问题 | wave-7 |
-| institutional_breadth（13F 持仓机构数） | SEC 13F | **IC t=5.82/4.60/4.21/3.81，全 4 horizon 过 Bonferroni（2016-2026）** | **可用候选（全项目最强单因子）** | wave-6 前置长窗确认：IC .014-.033 单调随 horizon 增，LS 净后罕见为正（+0.02~+0.06）；覆盖 ~2,257/日。变现攻坚（超额空间预注册检验）待做——low_vol 的教训：排序强 ≠ alpha | wave-6、trials |
+| institutional_breadth（13F 持仓机构数） | SEC 13F | IC t=5.82~3.81 全过 Bonferroni，**但对 size 正交化后 partial IC = .0015（归零）** | **死亡（size 马甲，2026-07-07 当夜降档）** | 与 size 秩相关 **0.893**；"全项目最强单因子"称号存活 3 小时即被冗余关卡斩落——13F 机构数 ≈ 盘子大小，其全部 IC 是 2016-2026 大盘制度。变现实测同判（q5 对 spy t=-0.5；ex_q1 +0.76% t=1.4 不显著）。size 反向仍存活（size\|breadth=.0108）→ 吸收方向 size ⊃ breadth | wave-6/8 |
+| size（log 市值，方向=大盘为高分） | PIT 市值 | 2016-2026 IC .027 t=4.85；**2008-2015 弱化到 t=2.1@h1 且随 horizon 衰减到 0.14** | **制度因子（非 alpha）** | "大盘碾压小盘"是 2016 后的制度而非持久异象；它是本窗口一切"强因子"的隐藏主轴（吸收 breadth，解释等权组合对 spy 的系统性拖累）。部署无意义（=买超大盘）；价值在**作为冗余关卡的默认对照**与风险归因 | wave-8 |
 | delta_institutional_ownership（季度 IO 变化） | SEC 13F | 长窗 IC **为负**（t=-2.25~-2.44，均不过 Bonferroni） | **死亡（2026-07-07 降档：符号不稳）** | 短窗（2026-07-02 重评估）"存活"被长窗翻案且符号相反——2016-2026 机构增持预示**低**收益；作为复合成分实测拖垮 4 信号版（预注册判据 FAIL 的直接原因） | wave-6 |
 | days_to_cover（空头回补天数） | FINRA 空头 | 死亡（2026-07-02 重评估） | 死亡 | 重评估未存活 | 同上 |
 | size / earnings_yield / short_interest_ratio / short_volume_ratio / ownership_concentration / insider_net_buy | 各 PIT 源 | 基线因子，未做长窗攻坚 | 基线 | 作为框架验证与对照基线维护 | docs/factors.md |
@@ -60,24 +61,22 @@
 - **价格族冗余结构已裁决（2026-07-06，wave-4）**：六个价格系因子 ≈ **2.5 个独立信号**。
   low_vol 是主干（吸收 max_lottery r=.74/partial .0075，大半吸收 high_52w），
   momentum_12_1 ⊂ high_52w（partial .0021，GH2004 复现），eod_reversal_flow 完全正交
-  （与全部因子 |r|<0.03）。**任何新价格因子登记"新发现"前，必须先过"对 low_vol 与
-  high_52w 的 partial IC"这一关**（`research/factor_correlation.py` 十分钟跑完；
+  （与全部因子 |r|<0.03）。**任何新因子（不限价格族）登记"新发现"前，必须过三关对照的
+  partial IC：size、low_vol、high_52w**（`research/factor_correlation.py` 十分钟跑完；
   其 partial IC 是序列级近似，正式结论需逐日截面回归残差确认）。
+  战果记录：该关卡当夜斩落 institutional_breadth（对 size 归零）——凡"强得可疑"的
+  新因子，先问它是不是 size/vol/动量制度的马甲。
 
 ## 开放问题（下一轮候选，按预期肉厚排序）
 
-1. **wave-6 复合打分**（进行中）：4 信号（residual_vol、high_52w 逐日残差、13F 两因子）
-   0.5 中性填补合成；预注册判据=IC IR 与 h21 q5 净 Sharpe 双优于 low_vol 单干。
-   排序信息的变现出口现在全押在这里与 LS 结构上。
-2. **insider_cluster_conviction（wave-7 首选，审计侦察队推荐）**：21-63 日窗内多个
-   **非例行**内部人（Cohen-Malloy-Pomorski 例行过滤需逐人历史——我们 23 年 PIT Form 3/4/5
-   独有）同时买入的事件因子，买侧不对称；幸存者无偏 universe 是文献复现的关键差异点。
-   侦察队诚实基率：~40-50% 存活，全场最高。
-3. **peer_lead_lag（wave-7 备选）**：行业内大盘→小盘信息扩散（Hou 2007）；接收腿天然
-   是易死小盘——我们的退市全集是诚实估计的前提。风险：可能是 high_52w 马甲（partial 关卡）。
-4. **liquidity_lambda（基建型）**：分钟级 Kyle-λ + 暂态方差占比。标配死因子基率（20-25%）
-   但败局也产出逐股冲击成本面——升级 10bps 平价成本模型，反哺一切变现研究。
-5. **eod 隔夜腿精修**（低优先级）：开盘后 30 分钟 vwap 锚定剔弹跳；财报日掩蔽。
+1. **规模中性/市值加权部署形态**（夜间变现全景的直接推论）：四种等权形态对 spy 的
+   excess_geo 系统性为负——排序 alpha 疑被等权小盘暴露的结构性拖累吃掉。测：
+   市值加权 q5/ex_q1（市值面板 `research/market_cap.py` 现成）、按 size 分桶内排序。
+2. **breadth LS 攻坚**：它是总账唯一 LS 净后为正的因子（+0.02~+0.06 全 horizon）——
+   加借券现实约束（short_interest 作 borrow-stress 代理）与成本压力后还剩多少。
+3. **peer_lead_lag（侦察队第二候选）**：行业内大→小信息扩散；partial 关卡防 high_52w 马甲。
+4. **liquidity_lambda（基建型）**：分钟级冲击成本面；败局也升级 10bps 平价成本模型。
+5. insider_cluster 事件研究口径（CAR）；eod 隔夜腿精修——均低优先级。
 
 ## 登记流程（每轮研究收尾必做）
 
