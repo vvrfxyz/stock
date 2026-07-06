@@ -20,6 +20,7 @@ from sqlalchemy.engine import Engine
 from research.backtest import eligibility_mask, hold_between_rebalances, run_backtest
 from research.data import FACTOR_TRUST_FLOOR, load_adjusted_panel, research_engine, securities_with_uncovered_events
 from research.factors.builtins import bar_geometry as _bar_geometry  # noqa: F401
+from research.factors.builtins import classic_pillars as _classic_pillars  # noqa: F401
 from research.factors.builtins import classic_price as _classic_price  # noqa: F401
 from research.factors.builtins import days_to_cover as _days_to_cover  # noqa: F401
 from research.factors.builtins import delta_institutional_ownership as _delta_inst_own  # noqa: F401
