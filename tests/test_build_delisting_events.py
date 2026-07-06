@@ -566,6 +566,42 @@ class TestClassifyDecisionTable:
         assert "delisting_return~0 is CORRECT" in row["evidence"]
         assert row["delisting_return"] is None  # 只记 evidence，绝不写经验值
 
+    def test_8k_item301_alone_is_exchange_drop_medium(self):
+        # 退市/不达标通知（item 3.01）本身即 EXCHANGE_DROP 的 MEDIUM 证据
+        row = self._classify(evidence=Evidence(
+            eightk_301=[_filing(accession="0003-25-000003", form="8-K")],
+        ))
+        assert (row["reason_code"], row["reason_confidence"], row["source"]) == ("EXCHANGE_DROP", "MEDIUM", "8K")
+        assert "8k_item301=0003-25-000003" in row["evidence"]
+        assert row["delisting_return"] is None
+
+    def test_8k_item201_beats_item301(self):
+        row = self._classify(evidence=Evidence(
+            eightk_201=[_filing(form="8-K")],
+            eightk_301=[_filing(accession="0003-25-000003", form="8-K")],
+        ))
+        assert (row["reason_code"], row["reason_confidence"]) == ("MERGER", "HIGH")
+
+    def test_merge_event_beats_item301(self):
+        row = self._classify(evidence=Evidence(
+            merge_events=[MergeEvent(1, 2, "keep")],
+            eightk_301=[_filing(form="8-K")],
+        ))
+        assert (row["reason_code"], row["source"]) == ("MERGER", "TICKER_EVENT")
+
+    def test_etf_fund_closure_beats_item301(self):
+        row = self._classify(security=_security(type_="ETF"), evidence=Evidence(
+            eightk_301=[_filing(form="8-K")],
+        ))
+        assert row["reason_code"] == "FUND_CLOSURE"
+
+    def test_item301_beats_price_pattern(self):
+        row = self._classify(
+            evidence=Evidence(eightk_301=[_filing(form="8-K")]),
+            price_pattern=("EXCHANGE_DROP", "sub-dollar sustained decline"),
+        )
+        assert (row["reason_confidence"], row["source"]) == ("MEDIUM", "8K")
+
     def test_price_pattern_is_low_source_price_inferred_return_null(self):
         row = self._classify(price_pattern=("ACQUISITION_CASH", "stable near grid"))
         assert (row["reason_code"], row["reason_confidence"], row["source"]) == ("ACQUISITION_CASH", "LOW", "PRICE_INFERRED")

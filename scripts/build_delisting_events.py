@@ -913,6 +913,18 @@ def classify(
             "usually settles weeks after delist, final_price already converges to NAV so "
             "expected delisting_return~0 is CORRECT (not written: no per-fund evidence)"
         )
+    if reason_code is None and evidence.eightk_301:
+        # 同 CIK 的 8-K item 3.01（退市/不达标通知）在 [-45,+30] 窗口内，且无任何
+        # 并购证据（2.01/Form25 规则/身份合并都会在更高层截住）——交易所标准
+        # 驱动的摘牌通知本身就是 EXCHANGE_DROP 的直接证据
+        reason_code, confidence, source = "EXCHANGE_DROP", "MEDIUM", "8K"
+        listed = ",".join(
+            f"{f.accession_number}:{f.filing_date.isoformat()}"
+            for f in evidence.eightk_301[:EVIDENCE_ACCESSION_CAP]
+        )
+        suffix = (f"(+{len(evidence.eightk_301) - EVIDENCE_ACCESSION_CAP} more)"
+                  if len(evidence.eightk_301) > EVIDENCE_ACCESSION_CAP else "")
+        tokens.append(f"8k_item301={listed}{suffix}")
 
     # --- LOW（source=PRICE_INFERRED，delisting_return 恒 NULL）---
     if reason_code is None and price_pattern is not None:
@@ -1048,11 +1060,14 @@ def load_eightk_201_filings(session, security_ids: list[int]) -> dict[int, list[
 
 
 def load_eightk_301_filings(session, security_ids: list[int]) -> dict[int, list[Filing]]:
-    """8-K item 3.01（退市/摘牌通知），--fetch-8k-docs 的次优文档来源。"""
-    return _load_eightk_item_filings(session, security_ids, "3.01")
+    """8-K item 3.01（退市/摘牌通知）。窗口前沿放宽到 45 天：交易所通知常先于
+    正式退市（宽限期），后沿仍 30 天。既是 EXCHANGE_DROP 的 MEDIUM 证据层，
+    也是 --fetch-8k-docs 的次优文档来源。"""
+    return _load_eightk_item_filings(session, security_ids, "3.01", days_before=45)
 
 
-def _load_eightk_item_filings(session, security_ids: list[int], item: str) -> dict[int, list[Filing]]:
+def _load_eightk_item_filings(session, security_ids: list[int], item: str,
+                              days_before: int | None = None) -> dict[int, list[Filing]]:
     if not security_ids:
         return {}
     rows = session.execute(text("""
@@ -1063,9 +1078,11 @@ def _load_eightk_item_filings(session, security_ids: list[int], item: str) -> di
           AND s.cik IS NOT NULL AND s.cik <> ''
           AND f.form_type = '8-K'
           AND :item = ANY(string_to_array(replace(coalesce(f.items, ''), ' ', ''), ','))
-          AND f.filing_date BETWEEN s.delist_date - :w AND s.delist_date + :w
+          AND f.filing_date BETWEEN s.delist_date - :wb AND s.delist_date + :w
         ORDER BY s.id, f.filing_date
-    """), {"ids": security_ids, "w": EIGHTK_WINDOW_DAYS, "item": item}).all()
+    """), {"ids": security_ids, "w": EIGHTK_WINDOW_DAYS,
+           "wb": days_before if days_before is not None else EIGHTK_WINDOW_DAYS,
+           "item": item}).all()
     filings: dict[int, list[Filing]] = {}
     for security_id, accession, form_type, filing_date, doc_url in rows:
         filings.setdefault(security_id, []).append(
@@ -1471,12 +1488,12 @@ def run(args, db_manager) -> int:
         form25_map = load_form25_filings(session, security_ids)
         eightk_map = load_eightk_201_filings(session, security_ids)
         merge_map = load_merge_events(session)
-        # --fetch-8k-docs 的次优/兜底文档来源只对候选（有 8-K 2.01 者）加载
-        eightk_301_map: dict[int, list[Filing]] = {}
+        # item 3.01（退市/不达标通知）对全 population 加载：本身即 EXCHANGE_DROP
+        # 的 MEDIUM 证据层；同时也是 --fetch-8k-docs 的次优文档来源
+        eightk_301_map = load_eightk_301_filings(session, security_ids)
         defm14a_map: dict[int, list[Filing]] = {}
         if args.fetch_8k_docs:
             candidate_ids = sorted(eightk_map.keys())
-            eightk_301_map = load_eightk_301_filings(session, candidate_ids)
             defm14a_map = load_defm14a_filings(session, candidate_ids)
 
     evidences: dict[int, Evidence] = {
