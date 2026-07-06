@@ -38,6 +38,8 @@ from scripts.update_massive_shares import main as update_massive_shares_main
 from scripts.update_massive_events import main as update_massive_events_main
 from scripts.update_massive_short_data import main as update_massive_short_data_main
 from scripts.update_massive_news import main as update_massive_news_main
+from scripts.update_minute_bars import main as update_minute_bars_main
+from scripts.update_trading_calendars import main as update_trading_calendars_main
 from scripts.update_adjustment_factors import main as update_adjustment_factors_main
 from scripts.update_open_close_summary import main as update_open_close_summary_main
 from scripts.check_data_integrity import main as check_data_integrity_main
@@ -168,6 +170,11 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
             ["--market", market],
         ),
         ScheduledStep(
+            "update_massive_news_recent",
+            update_massive_news_main,
+            ["--market", market, "--all", "--lookback-days", "3"],
+        ),
+        ScheduledStep(
             "update_massive_actions_recent",
             update_actions_main,
             ["--market", market, "--all", "--recent-days", "14"],
@@ -194,6 +201,13 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
             "check_data_integrity",
             check_data_integrity_main,
             ["--limit", "5", "--window-days", "14"],
+        ),
+        # 自愈感知：健康报告每日跑，P0 非零退出让 daily run 变红（评估结论：
+        # health_report 写好从未被调度，新闻停更 53 天无人发现）。
+        ScheduledStep(
+            "health_report",
+            health_report_main,
+            [],
         ),
     ]
 
@@ -230,7 +244,23 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
                 ],
             )
         )
+        # 分钟线周度增量（free 档 1 分钟聚合，~10.5k 请求 ≈ 70 分钟）：
+        # 8 天回看与上周窗口重叠一天，ReplacingMergeTree 幂等。
+        steps.append(
+            ScheduledStep(
+                "update_minute_bars_weekly",
+                update_minute_bars_main,
+                ["--market", market, "--lookback-days", "8"],
+            )
+        )
     if run_date.weekday() == 6:
+        steps.append(
+            ScheduledStep(
+                "update_trading_calendars",
+                update_trading_calendars_main,
+                [],
+            )
+        )
         steps.append(
             ScheduledStep(
                 "update_fx_rates",
@@ -256,7 +286,10 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
             ScheduledStep(
                 "update_adjustment_factors_full",
                 update_adjustment_factors_main,
-                ["--market", market, "--all", "--fail-on-vendor-mismatch"],
+                # 2026-07 20 年回填后 vendor mismatch 基线 ~177/18037（导入前周末
+                # 基线即 162-169，属 vendor 侧口径差异存量）；绝对断言
+                # --fail-on-vendor-mismatch 会每周必红，改用比率阈值守增量。
+                ["--market", market, "--all", "--max-mismatch-rate", "0.02"],
             )
         )
         steps.append(
@@ -367,6 +400,16 @@ def run_scheduled_update(args):
     except Exception:
         logger.warning("无法连接数据库记录 task runs，继续执行调度。")
 
+    # 孤儿清扫：上一轮进程被 kill 会留下永远 RUNNING 的行，污染健康报告
+    # 且掩盖真实失败（评估发现 1 条卡了 >12h 的 RUNNING）。
+    if db_for_tracking:
+        try:
+            swept = db_for_tracking.sweep_stale_task_runs(older_than_hours=12)
+            if swept:
+                logger.warning("清扫孤儿 RUNNING task runs: {} 条（标记为 ORPHANED）。", swept)
+        except Exception as exc:
+            logger.warning("sweep_stale_task_runs 失败: {}: {}", type(exc).__name__, exc)
+
     failed_steps: list[str] = []
     for index, step in enumerate(steps, start=1):
         logger.info("--- [{}/{}] {} ---", index, len(steps), step.name)
@@ -382,12 +425,21 @@ def run_scheduled_update(args):
         exit_code = 0
         error_msg = None
         stats = None
+        # 步内 ERROR+ 日志尾部缓冲：exit=1 本身不含诊断信息（评估结论：
+        # 17% 失败率而 error_sample 只有 'exit=1'），把真实报错带进 task run。
+        step_errors: list[str] = []
+        sink_id = logger.add(
+            lambda message: step_errors.append(message.record["message"][:200]),
+            level="ERROR",
+            enqueue=False,
+        )
         try:
             stats = execute_script(step.main_func, step.args)
         except SystemExit as exc:
             exit_code = exc.code or 1
             stats = getattr(exc.code, "stats", None)
-            error_msg = f"exit={exc.code}"
+            error_tail = ("; ".join(step_errors[-2:]))[:300] if step_errors else ""
+            error_msg = f"exit={exc.code}" + (f" | {error_tail}" if error_tail else "")
             severity = "BLOCKING" if exc.code == 2 else "WARNING"
             failed_steps.append(f"{step.name}(exit={exc.code},{severity})")
             logger.error("步骤 {} 失败（exit={}, {}），继续执行后续步骤。", step.name, exc.code, severity)
@@ -396,6 +448,8 @@ def run_scheduled_update(args):
             error_msg = f"{type(exc).__name__}: {exc}"
             failed_steps.append(f"{step.name}({type(exc).__name__})")
             logger.opt(exception=exc).error("步骤 {} 发生未捕获异常，继续执行后续步骤: {}", step.name, exc)
+        finally:
+            logger.remove(sink_id)
         if db_for_tracking and task_run_id:
             try:
                 db_for_tracking.finish_task_run(

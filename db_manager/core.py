@@ -1,7 +1,7 @@
 """引擎/会话生命周期与底层批量写入基础设施。"""
 import os
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -172,3 +172,20 @@ class DatabaseManagerCore:
                         error_sample=note[:500] if note else None)
             )
             conn.commit()
+
+    def sweep_stale_task_runs(self, *, older_than_hours: int = 12) -> int:
+        """把停留 RUNNING 超时的孤儿行标记为 ORPHANED（进程被 kill 的残留）。
+
+        不删除：保留 started_at 供事后排查；status 换掉即不再污染
+        health_report 的"疑似被 kill"告警与成功率统计。"""
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=older_than_hours)
+        with self.engine.connect() as conn:
+            result = conn.execute(
+                update(PipelineTaskRun)
+                .where(PipelineTaskRun.status == "RUNNING",
+                       PipelineTaskRun.started_at < cutoff)
+                .values(status="ORPHANED", ended_at=datetime.now(timezone.utc),
+                        error_sample="orphaned: process killed before finish_task_run")
+            )
+            conn.commit()
+            return result.rowcount or 0

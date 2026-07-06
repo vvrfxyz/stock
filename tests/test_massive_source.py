@@ -398,3 +398,23 @@ class MassiveSourceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_reference_payload_strips_none_fields():
+    """回归防线（2026-07-06 list_date 全舰队抹除事故）：/v3/reference/tickers 列表
+    响应不带 list_date 等字段，payload 若把 None 原样下发，每日 universe 同步会把
+    details 回填的值抹掉。除 symbol 外 None 一律剥离。"""
+    from data_sources.massive_source import MassiveSource
+
+    source = MassiveSource.__new__(MassiveSource)  # 不触发网络初始化
+    payload = source._build_reference_payload({
+        "ticker": "AAPL",
+        "active": True,
+        "name": "Apple Inc.",
+        # 列表响应真实形态：无 list_date / delisted_utc / cik 等字段
+    })
+    assert payload["symbol"] == "aapl"
+    assert "list_date" not in payload
+    assert "delist_date" not in payload
+    assert "cik" not in payload
+    assert payload["is_active"] is True

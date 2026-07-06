@@ -318,7 +318,7 @@ class MassiveSource(DataSourceInterface):
 
     def _build_reference_payload(self, item: dict[str, Any]) -> dict[str, Any]:
         symbol = item["ticker"].lower()
-        return {
+        payload = {
             "symbol": symbol,
             "current_symbol": symbol,
             "is_active": item.get("active"),
@@ -339,6 +339,10 @@ class MassiveSource(DataSourceInterface):
             "composite_figi": item.get("composite_figi"),
             "share_class_figi": item.get("share_class_figi"),
         }
+        # /v3/reference/tickers 列表响应不带 list_date 等字段：None 原样下发会让
+        # 每日 universe 同步把 details 辛苦回填的值抹掉（2026-07-06 全舰队 list_date
+        # 被抹事故，防回收 clamp 因此失效）。与 _build_overview_payload 同口径剥离 None。
+        return {key: value for key, value in payload.items() if value is not None or key == "symbol"}
 
     def _build_overview_payload(self, symbol: str, item: dict[str, Any]) -> dict[str, Any]:
         address = item.get("address") or {}
@@ -504,6 +508,27 @@ class MassiveSource(DataSourceInterface):
         df["Volume"] = df["Volume"].apply(normalize_volume_value)
         df["trade_count"] = df["trade_count"].apply(normalize_volume_value)
         return df[["Open", "High", "Low", "Close", "Volume", "vwap", "trade_count", "otc"]]
+
+    def get_minute_aggs(
+        self,
+        symbol: str,
+        start: str,
+        end: str,
+    ) -> list[Dict[str, Any]]:
+        """未复权 1 分钟聚合（含盘前盘后 04:00-20:00 ET），原样返回 vendor 行。
+
+        50k 行/请求上限下，一个请求约可覆盖 52 个交易日（960 bar/日），
+        更长窗口由 _paginate_results 翻页。行字段：t(ms epoch UTC)/o/h/l/c/v/vw/n。
+        """
+        if not start or not end:
+            raise ValueError("Massive 分钟聚合请求必须提供 start 和 end 日期。")
+        path = f"/v2/aggs/ticker/{symbol.upper()}/range/1/minute/{start}/{end}"
+        params = {
+            "adjusted": "false",
+            "sort": "asc",
+            "limit": 50000,
+        }
+        return self._paginate_results(path, params=params)
 
     def get_grouped_daily_data(self, target_date: str, adjusted: bool = False, include_otc: bool = False) -> list[Dict[str, Any]]:
         params = {

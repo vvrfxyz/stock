@@ -34,6 +34,9 @@ def create_parser() -> argparse.ArgumentParser:
                         help="无事件大跳变的 |close/prev_close - 1| 阈值 (默认: 0.5)")
     parser.add_argument("--gap-min-sessions", type=int, default=3,
                         help="缺口检查中连续缺失交易日的最小会话数 (默认: 3，过滤个股正常停牌)")
+    parser.add_argument("--ohlc-baseline", type=int, default=0,
+                        help="全史 OHLC 包含违规的允许基线 (默认: 0，2026-07-06 repair_ohlc_violations "
+                             "已全量订正)；超出即阻塞")
     return parser
 
 
@@ -159,6 +162,78 @@ def check_ohlc_validity(session, limit: int, window_start: date) -> int:
         limit,
     )
     return len(rows)
+
+
+def check_active_list_date_coverage(session, limit: int) -> int:
+    """活跃 US CS/ETF 的 list_date 覆盖：NULL 数量超阈值即阻塞。
+
+    回归防线：2026-07-06 事故——/v3/reference/tickers 列表响应不带 list_date，
+    payload 把 None 原样下发导致每日 universe 同步抹掉全舰队 list_date，
+    防回收 clamp 全体失效。修复在 _build_reference_payload 的 None 剥离；
+    此检查保证同类回归 24 小时内变红。"""
+    sql = text(
+        """
+        SELECT COUNT(*) AS n
+        FROM securities
+        WHERE is_active IS TRUE AND upper(market) = 'US'
+          AND upper(type) IN ('CS', 'ETF') AND list_date IS NULL
+        """
+    )
+    n = session.execute(sql).scalar_one()
+    if n > 50:
+        logger.error("活跃 US CS/ETF 中 {} 只 list_date 为 NULL（阈值 50）——疑似每日同步再度抹除。", n)
+        return n
+    if n:
+        logger.info("活跃 US CS/ETF 中 {} 只 list_date 为 NULL（新上市未富化，正常）。", n)
+    return 0
+
+
+def check_ohlc_validity_full_history(session, limit: int, baseline: int) -> int:
+    """全史 OHLC 包含不变量计数（windowed 版只看近窗，历史脏行会永远漏网）。
+
+    与 baseline（repair_ohlc_violations 后已知的分钟无覆盖搁置行数）比较：
+    超出即有新violated行进入，阻塞；等于或低于只作通报。
+    """
+    sql = text(
+        """
+        SELECT COUNT(*) AS n
+        FROM daily_prices dp
+        WHERE dp.open IS NOT NULL AND dp.high IS NOT NULL
+          AND dp.low IS NOT NULL AND dp.close IS NOT NULL
+          AND (dp.high < dp.low
+               OR dp.high < GREATEST(dp.open, dp.close)
+               OR dp.low > LEAST(dp.open, dp.close))
+        """
+    )
+    n = session.execute(sql).scalar_one()
+    if n > baseline:
+        logger.error("全史 OHLC 包含违规 {} 行（> 已知搁置基线 {}），存在新增脏行。", n, baseline)
+        return n - baseline
+    logger.info("全史 OHLC 包含违规 {} 行（<= 搁置基线 {}，均为分钟无覆盖的历史遗留）。", n, baseline)
+    return 0
+
+
+def check_vwap_containment(session, limit: int, window_start: date) -> int:
+    """近窗 vwap 越界率通报（vwap 不在 [low, high]）：Massive 时代含盘前盘后成交，
+    越界属口径而非脏数据（评估实测 2025-03 为 4.2%），只报率不阻塞；
+    但越界率突增（>10%）视为 vendor 侧异常，阻塞。"""
+    sql = text(
+        """
+        SELECT COUNT(*) FILTER (WHERE vwap < low OR vwap > high) AS out_n, COUNT(*) AS n
+        FROM daily_prices
+        WHERE date >= :window_start AND vwap IS NOT NULL
+        """
+    )
+    row = session.execute(sql, {"window_start": window_start}).one()
+    if not row.n:
+        return 0
+    rate = row.out_n / row.n
+    if rate > 0.10:
+        logger.error("近窗 vwap 越界率 {:.2%}（{}/{}），远超盘后口径正常水平，疑 vendor 异常。",
+                     rate, row.out_n, row.n)
+        return row.out_n
+    logger.info("近窗 vwap 越界率 {:.2%}（{}/{}，盘前盘后成交口径所致，正常）。", rate, row.out_n, row.n)
+    return 0
 
 
 def check_calendar_gaps(session, limit: int, window_start: date, min_sessions: int) -> int:
@@ -375,6 +450,9 @@ def main(argv: list[str] | None = None) -> int:
             issues += check_price_latest_date_consistency(session, limit=args.limit)
             issues += check_symbol_normalization(session, limit=args.limit)
             issues += check_ohlc_validity(session, limit=args.limit, window_start=window_start)
+            issues += check_ohlc_validity_full_history(session, limit=args.limit, baseline=args.ohlc_baseline)
+            issues += check_vwap_containment(session, limit=args.limit, window_start=window_start)
+            issues += check_active_list_date_coverage(session, limit=args.limit)
             issues += check_recycled_symbol_overlap(session, limit=args.limit, window_start=window_start)
             check_calendar_gaps(
                 session, limit=args.limit, window_start=window_start, min_sessions=args.gap_min_sessions
