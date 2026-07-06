@@ -94,6 +94,14 @@ def create_parser() -> argparse.ArgumentParser:
         with_all=False,
     )
     parser.add_argument("--full-refresh", action="store_true", help="强制刷新 Massive 可覆盖的最近 2 年窗口。")
+    parser.add_argument(
+        "--include-inactive",
+        action="store_true",
+        help="配合显式 symbols 使用：放开 is_active 过滤，允许重拉退市证券的日线尾巴\n"
+             "（fetch 终点自动 clamp 到 delist_date，防 symbol 回收污染）。\n"
+             "不带 symbols 时拒绝执行——无界的退市全量扫描是 footgun，修复流程\n"
+             "应先用 SQL 生成队列符号清单再指名传入。",
+    )
     return parser
 
 
@@ -106,9 +114,12 @@ def get_securities_to_update(db_manager: DatabaseManager, args: argparse.Namespa
             )
         )
 
+    # --include-inactive 走既有 "unless_symbols" 语义：仅显式指名时放开
+    # is_active 过滤（type 过滤保持不放开）。run() 已保证此时必有 symbols。
     return select_us_securities(
         db_manager,
         args,
+        active_scope="unless_symbols" if args.include_inactive else "always",
         extra_filter=None if args.full_refresh else _pending_only,
         order_column="price_data_latest_date",
     )
@@ -125,7 +136,22 @@ def process_security(
     history_floor = get_massive_history_floor(end_trading_date)
 
     try:
-        end_date = end_trading_date.isoformat()
+        # 死票回收防护（上界，与下方 list_date 下界成对）：Massive 按 ticker 键控，
+        # delist_date 之后的同名 bar 可能属于回收该 symbol 的后继实体，一律不拉。
+        # 活跃证券不受影响；退市但 delist_date 未知的证券不 clamp（宁多拉勿猜）。
+        effective_end_date = end_trading_date
+        if (
+            not security.is_active
+            and security.delist_date is not None
+            and security.delist_date < effective_end_date
+        ):
+            logger.info(
+                "[{}] 回填终点从 {} clamp 到 delist_date {}（退市证券不拉 symbol 后继实体的行情）。",
+                symbol, effective_end_date, security.delist_date,
+            )
+            effective_end_date = security.delist_date
+
+        end_date = effective_end_date.isoformat()
         if full_refresh or security.price_data_latest_date is None:
             start_dt = history_floor
             is_full_run = True
@@ -145,13 +171,13 @@ def process_security(
             )
             start_dt = security.list_date
 
-        if start_dt > end_trading_date:
+        if start_dt > effective_end_date:
             return symbol, "SUCCESS_UP_TO_DATE", 0
 
         df = source.get_historical_data(symbol=symbol, start=start_dt.isoformat(), end=end_date, adjusted=False)
         if df.empty:
             actual_max_date = _sync_price_latest_date_from_existing_rows(security, db_manager)
-            if actual_max_date and actual_max_date >= end_trading_date:
+            if actual_max_date and actual_max_date >= effective_end_date:
                 return symbol, "SUCCESS_UP_TO_DATE", 0
             logger.info("[{}] Massive 在 {} - {} 未返回价格数据。", symbol, start_dt, end_date)
             return symbol, "SUCCESS_NO_NEW_DATA", 0
@@ -214,6 +240,13 @@ def process_security(
 
 
 def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseManager) -> int:
+    if args.include_inactive and not args.symbols:
+        logger.error(
+            "--include-inactive 必须配合显式 symbols 使用：无界的退市证券扫描是 footgun。"
+            "修复流程请先用 SQL 生成截断队列符号清单，再分批指名传入。"
+        )
+        return 1
+
     end_trading_date = get_last_completed_trading_date(args.market)
     securities = get_securities_to_update(db_manager, args, end_trading_date)
     if not securities:

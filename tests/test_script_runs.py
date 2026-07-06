@@ -42,6 +42,8 @@ def _security(**extra):
         info_last_updated_at=None,
         actions_last_updated_at=None,
         list_date=None,
+        is_active=True,
+        delist_date=None,
     )
     defaults.update(extra)
     return SimpleNamespace(**defaults)
@@ -158,6 +160,81 @@ class TestPricesRun:
         prices.run(prices.create_parser().parse_args([]), source, db)
         from utils.massive_config import get_massive_history_floor
         assert source.get_historical_data.call_args.kwargs["start"] == get_massive_history_floor(END_DATE).isoformat()
+
+    def test_inactive_delist_date_clamps_fetch_end(self, monkeypatch):
+        # 死票回收防护（上界）：退市证券的 fetch 终点必须停在 delist_date，
+        # 即便该 symbol 日后被回收，也拉不到后继实体的 bar。
+        # 场景即 2025-08-01 截断队列：水位冻结在 2025-08-01，delist_date 在其后。
+        sec = _security(
+            is_active=False,
+            delist_date=date(2026, 3, 2),
+            price_data_latest_date=date(2025, 8, 1),
+        )
+        monkeypatch.setattr(prices, "get_last_completed_trading_date", lambda market: END_DATE)
+        monkeypatch.setattr(prices, "get_securities_to_update", lambda db, args, end: [sec])
+        source, db = Mock(), Mock()
+        frame = pd.DataFrame(
+            {
+                "Open": [1.0], "High": [2.0], "Low": [0.5], "Close": [1.5],
+                "Volume": [100.0], "vwap": [1.2], "trade_count": [10.0], "otc": [None],
+            },
+            index=[date(2026, 3, 2)],
+        )
+        source.get_historical_data.return_value = frame
+        db.get_security_price_max_date.return_value = date(2026, 3, 2)
+
+        result = prices.run(
+            prices.create_parser().parse_args(["aapl", "--include-inactive"]), source, db
+        )
+        assert _exit_code(result) == 0
+        assert source.get_historical_data.call_args.kwargs["start"] == "2025-08-02"
+        assert source.get_historical_data.call_args.kwargs["end"] == "2026-03-02"
+        db.update_security_price_latest_date.assert_called_once_with(1, date(2026, 3, 2), is_full_run=False)
+
+    def test_active_security_end_not_clamped_even_with_delist_date(self, monkeypatch):
+        # clamp 条件是 inactive AND delist_date 非 NULL：活跃证券即便挂着
+        # delist_date（修复期中间态/脏元数据）也照常拉到最近完成交易日。
+        sec = _security(delist_date=date(2026, 3, 2))
+        monkeypatch.setattr(prices, "get_last_completed_trading_date", lambda market: END_DATE)
+        monkeypatch.setattr(prices, "get_securities_to_update", lambda db, args, end: [sec])
+        source, db = Mock(), Mock()
+        source.get_historical_data.return_value = self._frame()
+        db.get_security_price_max_date.return_value = date(2026, 6, 10)
+
+        result = prices.run(prices.create_parser().parse_args([]), source, db)
+        assert _exit_code(result) == 0
+        assert source.get_historical_data.call_args.kwargs["end"] == END_DATE.isoformat()
+
+    def test_inactive_already_at_delist_date_short_circuits(self, monkeypatch):
+        # 已修复的退市证券：水位 == delist_date，起点越过终点，直接 UP_TO_DATE 不发请求。
+        sec = _security(
+            is_active=False,
+            delist_date=date(2026, 3, 2),
+            price_data_latest_date=date(2026, 3, 2),
+        )
+        monkeypatch.setattr(prices, "get_last_completed_trading_date", lambda market: END_DATE)
+        monkeypatch.setattr(prices, "get_securities_to_update", lambda db, args, end: [sec])
+        source, db = Mock(), Mock()
+
+        result = prices.run(
+            prices.create_parser().parse_args(["aapl", "--include-inactive"]), source, db
+        )
+        assert _exit_code(result) == 0
+        source.get_historical_data.assert_not_called()
+        db.upsert_daily_prices.assert_not_called()
+
+    def test_include_inactive_without_symbols_refused(self, monkeypatch):
+        # 无界退市扫描是 footgun：--include-inactive 必须配合显式 symbols，否则退出码 1。
+        monkeypatch.setattr(prices, "get_last_completed_trading_date", lambda market: END_DATE)
+        monkeypatch.setattr(
+            prices, "get_securities_to_update",
+            lambda db, args, end: pytest.fail("拒绝路径不应进入证券选择"),
+        )
+        source, db = Mock(), Mock()
+
+        result = prices.run(prices.create_parser().parse_args(["--include-inactive"]), source, db)
+        assert _exit_code(result) == 1
+        source.get_historical_data.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -501,6 +501,7 @@ def run_update_massive_prices(args):
     logger.info("执行: 更新 Massive 日线价格")
     cli_args = []
     if args.full_refresh: cli_args.append('--full-refresh')
+    if getattr(args, 'include_inactive', False): cli_args.append('--include-inactive')
     if args.market: cli_args.extend(['--market', args.market])
     if args.limit > 0: cli_args.extend(['--limit', str(args.limit)])
     if args.workers: cli_args.extend(['--workers', str(args.workers)])
@@ -982,6 +983,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_massive_prices = subparsers.add_parser('update_massive_prices', help="单独更新 Massive 的日线价格")
     p_massive_prices.add_argument('symbols', nargs='*', help="要更新的股票代码列表。")
     p_massive_prices.add_argument('--full-refresh', action='store_true', help="强制全量刷新最近 2 年窗口。")
+    p_massive_prices.add_argument('--include-inactive', action='store_true',
+                                  help="配合显式 symbols：放开 is_active 过滤重拉退市证券（终点 clamp 到 delist_date）；无 symbols 时拒绝。")
     p_massive_prices.add_argument('--market', type=str, default='US', help="指定市场 (默认: US)。")
     p_massive_prices.add_argument('--limit', type=int, default=0, help="限制处理的股票数量。")
     p_massive_prices.add_argument('--workers', type=int, help="并发线程数。")

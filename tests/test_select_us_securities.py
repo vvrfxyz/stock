@@ -1,6 +1,6 @@
 """utils.massive_task.select_us_securities 的查询分支测试（sqlite 内存库即可）。"""
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +9,8 @@ from sqlalchemy.orm import sessionmaker
 
 from data_models.models import Security
 from utils.massive_task import select_us_securities
+
+import scripts.update_massive_prices as prices
 
 
 class FakeDbManager:
@@ -131,3 +133,53 @@ def test_order_column_override(db):
     result = select_us_securities(db, _args(), order_column="price_data_latest_date")
     # NULL 在前（msft/spy 按 symbol），有值的 aapl 最后
     assert _symbols(result)[-1] == "aapl"
+
+
+# ---------------------------------------------------------------------------
+# update_massive_prices 的选择语义：--include-inactive -> active_scope 映射
+#（2025-08-01 截断队列修复入口：显式指名时才放开 is_active 过滤）
+# ---------------------------------------------------------------------------
+
+PRICES_END_DATE = date(2026, 7, 3)
+
+
+def _prices_args(symbols=(), include_inactive=False, full_refresh=False, market="US", limit=0):
+    return SimpleNamespace(
+        symbols=list(symbols),
+        include_inactive=include_inactive,
+        full_refresh=full_refresh,
+        market=market,
+        limit=limit,
+    )
+
+
+def test_prices_default_excludes_inactive_even_when_named(db):
+    # 不带 flag 时行为与历史完全一致：退市证券即便被指名也不选。
+    result = prices.get_securities_to_update(
+        db, _prices_args(symbols=["dead", "aapl"]), PRICES_END_DATE
+    )
+    assert _symbols(result) == ["aapl"]
+
+
+def test_prices_include_inactive_lifts_active_filter_for_explicit_symbols(db):
+    result = prices.get_securities_to_update(
+        db, _prices_args(symbols=["dead", "aapl"], include_inactive=True), PRICES_END_DATE
+    )
+    assert _symbols(result) == ["aapl", "dead"]
+
+
+def test_prices_include_inactive_without_symbols_keeps_active_filter(db):
+    # run() 会在更早处拒绝无 symbols 的 --include-inactive；这里锁定选择层兜底：
+    # unless_symbols 语义下无 symbols 时 is_active 过滤依然生效，不会全库扫退市。
+    result = prices.get_securities_to_update(
+        db, _prices_args(include_inactive=True), PRICES_END_DATE
+    )
+    assert _symbols(result) == ["aapl", "msft", "spy"]
+
+
+def test_prices_include_inactive_keeps_type_filter(db):
+    # 只放开 is_active，type 过滤保持 always：warrant 类仍被排除。
+    result = prices.get_securities_to_update(
+        db, _prices_args(symbols=["warrants", "dead"], include_inactive=True), PRICES_END_DATE
+    )
+    assert _symbols(result) == ["dead"]
