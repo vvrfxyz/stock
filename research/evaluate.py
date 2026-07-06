@@ -136,26 +136,37 @@ def _newey_west_t(values: pd.Series, lag: int) -> float:
     return float(x.mean() / math.sqrt(long_run_var / t))
 
 
+def _masked_rowwise_corr(
+    x: np.ndarray, y: np.ndarray, valid: np.ndarray, min_coverage: int
+) -> np.ndarray:
+    """逐行 Pearson 相关（仅 valid 对参与；行内有效数 < min_coverage 或零方差 → NaN）。
+
+    与旧参照实现（逐日 .loc 提取 + Series.corr）数值一致，但为单遍 numpy——
+    2026-07 性能重构：旧路径每次调用做 T 次面板行提取（take_2d memmove 热点）。
+    """
+    xm = np.where(valid, x, np.nan)
+    ym = np.where(valid, y, np.nan)
+    n = valid.sum(axis=1).astype("float64")
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean_x = np.nansum(xm, axis=1) / n
+        mean_y = np.nansum(ym, axis=1) / n
+        dx = xm - mean_x[:, None]
+        dy = ym - mean_y[:, None]
+        sxx = np.nansum(dx * dx, axis=1)
+        syy = np.nansum(dy * dy, axis=1)
+        sxy = np.nansum(dx * dy, axis=1)
+        corr = sxy / np.sqrt(sxx * syy)
+    corr[(n < min_coverage) | (sxx == 0) | (syy == 0)] = np.nan
+    return corr
+
+
 def _rank_ic_series(factor: pd.DataFrame, forward_return: pd.DataFrame, min_coverage: int) -> pd.Series:
     aligned_factor, aligned_return = factor.align(forward_return, join="left", axis=None)
-    valid = aligned_factor.notna() & aligned_return.notna()
-    f_rank = aligned_factor.rank(axis=1, method="average", na_option="keep")
-    r_rank = aligned_return.rank(axis=1, method="average", na_option="keep")
-    rows: list[float] = []
-    for dt in f_rank.index:
-        mask = valid.loc[dt]
-        if int(mask.sum()) < min_coverage:
-            rows.append(np.nan)
-            continue
-        x = f_rank.loc[dt, mask]
-        y = r_rank.loc[dt, mask]
-        x_std = x.std(ddof=1)
-        y_std = y.std(ddof=1)
-        if x_std == 0 or y_std == 0 or pd.isna(x_std) or pd.isna(y_std):
-            rows.append(np.nan)
-        else:
-            rows.append(float(x.corr(y)))
-    return pd.Series(rows, index=f_rank.index, dtype="float64")
+    valid = (aligned_factor.notna() & aligned_return.notna()).to_numpy()
+    f_rank = aligned_factor.rank(axis=1, method="average", na_option="keep").to_numpy()
+    r_rank = aligned_return.rank(axis=1, method="average", na_option="keep").to_numpy()
+    corr = _masked_rowwise_corr(f_rank, r_rank, valid, min_coverage)
+    return pd.Series(corr, index=aligned_factor.index, dtype="float64")
 
 
 def _ic_decay_table(
@@ -164,13 +175,30 @@ def _ic_decay_table(
     horizons: tuple[int, ...],
     min_coverage: int,
 ) -> pd.DataFrame:
+    """IC 衰减表。性能关键：行平移与行内排名可交换（rank∘shift == shift∘rank），
+    每个 horizon 只排名一次，lag 平移用 numpy 视图——旧实现按 (horizon, lag)
+    重复整面板 shift+rank+逐日循环（max_lag+1 × horizons 次）。"""
     rows: list[dict[str, float | int]] = []
     max_lag = max(horizons) if horizons else 0
+    f_rank = factor.rank(axis=1, method="average", na_option="keep").to_numpy()
+    f_valid = factor.notna().to_numpy()
+    total = len(factor.index)
     for horizon in horizons:
         returns = forward_returns[horizon].reindex(index=factor.index, columns=factor.columns)
+        r_rank_full = returns.rank(axis=1, method="average", na_option="keep").to_numpy()
+        r_valid_full = returns.notna().to_numpy()
         for lag in range(max_lag + 1):
-            ic = _rank_ic_series(factor, returns.shift(-lag), min_coverage).mean()
-            rows.append({"horizon": horizon, "lag": lag, "ic": float(ic) if pd.notna(ic) else np.nan})
+            if lag == 0:
+                r_rank, r_valid = r_rank_full, r_valid_full
+            else:
+                r_rank = np.full_like(r_rank_full, np.nan)
+                r_rank[: total - lag] = r_rank_full[lag:]
+                r_valid = np.zeros_like(r_valid_full)
+                r_valid[: total - lag] = r_valid_full[lag:]
+            corr = _masked_rowwise_corr(f_rank, r_rank, f_valid & r_valid, min_coverage)
+            finite = corr[~np.isnan(corr)]
+            ic = float(finite.mean()) if len(finite) else np.nan
+            rows.append({"horizon": horizon, "lag": lag, "ic": ic})
     return pd.DataFrame(rows, columns=["horizon", "lag", "ic"])
 
 
@@ -214,6 +242,47 @@ def _quantile_weights_for_day(signal: pd.Series, eligible: pd.Series, n_quantile
     return out
 
 
+def _quantile_weight_matrices(
+    factor_slice: pd.DataFrame,
+    eligibility_slice: pd.DataFrame,
+    n_quantiles: int,
+) -> dict[str, np.ndarray]:
+    """再平衡日全体的分位权重矩阵（向量化版 _quantile_weights_for_day）。
+
+    与旧逐日实现语义逐位一致：rank(method='first') 平票按列序、
+    tradable<100 的行全零、LS 头尾各 ±0.5 且任一侧为空则全零。"""
+    tradable = eligibility_slice.fillna(False).astype(bool).to_numpy() & factor_slice.notna().to_numpy()
+    counts = tradable.sum(axis=1)
+    ranks = factor_slice.where(pd.DataFrame(
+        tradable, index=factor_slice.index, columns=factor_slice.columns)).rank(
+        axis=1, method="first").to_numpy()
+    valid_row = counts >= 100
+    denom = np.maximum(counts, 1)[:, None].astype("float64")
+    with np.errstate(invalid="ignore"):
+        labels = np.floor_divide((ranks - 1) * n_quantiles, denom) + 1
+    labels = np.where(np.isnan(ranks), 0, np.minimum(labels, n_quantiles)).astype("int64")
+    labels[~valid_row] = 0
+
+    out: dict[str, np.ndarray] = {}
+    for q in range(1, n_quantiles + 1):
+        members = labels == q
+        row_n = members.sum(axis=1)[:, None].astype("float64")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            weights = np.where(members, 1.0 / np.maximum(row_n, 1), 0.0)
+        weights[row_n[:, 0] == 0] = 0.0
+        out[f"q{q}"] = weights
+    high = labels == n_quantiles
+    low = labels == 1
+    n_high = high.sum(axis=1)[:, None].astype("float64")
+    n_low = low.sum(axis=1)[:, None].astype("float64")
+    both = (n_high[:, 0] > 0) & (n_low[:, 0] > 0)
+    long_short = (np.where(high, 0.5 / np.maximum(n_high, 1), 0.0)
+                  - np.where(low, 0.5 / np.maximum(n_low, 1), 0.0))
+    long_short[~both] = 0.0
+    out[f"ls_q{n_quantiles}_q1"] = long_short
+    return out
+
+
 def _quantile_metrics(
     factor: pd.DataFrame,
     eligibility: pd.DataFrame,
@@ -234,18 +303,22 @@ def _quantile_metrics(
     )
     rows: list[dict[str, Any]] = []
     labels = [f"q{i}" for i in range(1, n_quantiles + 1)] + [f"ls_q{n_quantiles}_q1"]
+    daily_values = adj_close.index.values
     for horizon in horizons:
         rebalance_index = factor.index[::horizon]
-        weights_by_label = {
-            label: pd.DataFrame(0.0, index=rebalance_index, columns=factor.columns, dtype="float64")
-            for label in labels
-        }
-        for dt in rebalance_index:
-            day_weights = _quantile_weights_for_day(factor.loc[dt], eligibility.loc[dt], n_quantiles)
-            for label, weights in day_weights.items():
-                weights_by_label[label].loc[dt] = weights
+        weight_mats = _quantile_weight_matrices(
+            factor.loc[rebalance_index], eligibility.loc[rebalance_index], n_quantiles)
+        # 复刻 hold_between_rebalances(reindex(daily).ffill().fillna(0))：
+        # 每个交易日取"最近一个不晚于它的再平衡日"的权重行，首个再平衡日前为 0。
+        pos = np.searchsorted(rebalance_index.values, daily_values, side="right") - 1
+        before_first = pos < 0
+        pos_safe = np.clip(pos, 0, None)
         for label in labels:
-            weights = hold_between_rebalances(weights_by_label[label], adj_close.index)
+            mat = weight_mats[label][pos_safe]
+            if before_first.any():
+                mat = mat.copy()
+                mat[before_first] = 0.0
+            weights = pd.DataFrame(mat, index=adj_close.index, columns=factor.columns)
             gross_result = run_backtest(f"{label}_h{horizon}_gross", weights, adj_close, cost_bps=0, hold_through_gaps=True)
             net_result = run_backtest(
                 f"{label}_h{horizon}_net", weights, adj_close, cost_bps=cost_bps, hold_through_gaps=True

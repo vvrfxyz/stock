@@ -22,6 +22,37 @@ import pandas as pd
 
 TRADING_DAYS = 252
 
+# run_backtest 的价格派生中间量只依赖 adj_close 本身；评估层对同一面板做
+# 数十次回测（分位 × horizon × 因子），逐次重算是 2026-07 实测的最大热点之一。
+# 以 (id, shape) 为键 + 对象身份复核缓存，最多驻留 2 份（评估面板 + 基准面板）。
+_DERIVED_CACHE: dict[tuple, dict] = {}
+
+
+def _derived_from_prices(adj_close: pd.DataFrame) -> dict:
+    key = (id(adj_close), adj_close.shape)
+    hit = _DERIVED_CACHE.get(key)
+    if hit is not None and hit["ref"] is adj_close:
+        return hit
+    ffilled = adj_close.ffill()
+    returns = ffilled.pct_change(fill_method=None)
+    valid_pair = adj_close.notna() & ffilled.shift(1).notna()
+    returns = returns.where(valid_pair)
+    missing = adj_close.isna()
+    prev_missing = missing.shift(1, fill_value=False)
+    entry = {
+        "ref": adj_close,
+        "returns": returns,
+        "returns_filled": returns.fillna(0.0),
+        "ever_future_price": adj_close.notna()[::-1].cummax()[::-1],
+        "gap_entry": missing & ~prev_missing,
+        "carry_zone": missing | (~missing & prev_missing),
+    }
+    if len(_DERIVED_CACHE) >= 2:
+        _DERIVED_CACHE.clear()
+    _DERIVED_CACHE[key] = entry
+    return entry
+
+
 
 @dataclass
 class BacktestResult:
@@ -96,20 +127,23 @@ def run_backtest(
     terminal_return: float | pd.Series | None = None,
     terminal_return_fallback: float | None = None,
 ) -> BacktestResult:
-    returns = _returns_with_gap_recovery(adj_close)
+    derived = _derived_from_prices(adj_close)
+    returns = derived["returns"]
     weights = weights.reindex(index=returns.index, columns=returns.columns).fillna(0.0)
 
     held = weights.shift(1).fillna(0.0)
-    terminal_missing_position_days = _terminal_missing_position_days(held, adj_close)
+    ever_future_price = derived["ever_future_price"]
+    terminal_mask = held.gt(0) & adj_close.isna() & ~ever_future_price
+    terminal_missing_position_days = int(terminal_mask.sum().sum())
     # 退市/终止收益政策：持仓后价格永久缺失时，默认 _returns_with_gap_recovery 给 NaN，
     # fillna(0.0) 后等于静默赚 0%。terminal_return 让调用方为"退市当日"注入一个收益假设
     # （如 -1.0=-100%）。只在永久缺失的第一天（退市事件日）注入一次，避免重复相乘炸掉数学。
     # 标量=统一假设；pd.Series（index=security_id，值=已实现退市收益）=按证券注入，
     # Series 缺失/NaN 的证券回退到 terminal_return_fallback（None 则不注入，保持旧口径）。
+    returns_filled = derived["returns_filled"]
     if terminal_return is not None and terminal_missing_position_days > 0:
-        ever_future_price = adj_close.notna()[::-1].cummax()[::-1]
-        terminal_mask = held.gt(0) & adj_close.isna() & ~ever_future_price
         first_terminal = terminal_mask & ~terminal_mask.shift(1, fill_value=False)
+        returns = returns.copy()
         if isinstance(terminal_return, pd.Series):
             # 向量化按列注入：把 Series 对齐到面板列（security_id），fallback 补洞后
             # 仍缺值的列不注入（等价于该证券沿用 terminal_return=None 的旧口径）。
@@ -119,11 +153,17 @@ def run_backtest(
             inject = first_terminal & per_security.notna()
             returns = returns.mask(inject, per_security, axis=1)
         else:
-            returns = returns.copy()
             returns[first_terminal] = terminal_return
+        returns_filled = returns.fillna(0.0)
     # 停牌期冻结持仓，避免复牌跨缺口收益被清零的权重吞掉（默认开启；可关以复现旧口径）。
-    effective_held = _hold_through_price_gaps(held, adj_close) if hold_through_gaps else held
-    gross = (effective_held * returns.fillna(0.0)).sum(axis=1)
+    if hold_through_gaps:
+        carry_zone = derived["carry_zone"]
+        entry_held = held.where(derived["gap_entry"])
+        frozen = entry_held.ffill().where(carry_zone)
+        effective_held = held.where(~carry_zone, frozen).fillna(held)
+    else:
+        effective_held = held
+    gross = (effective_held * returns_filled).sum(axis=1)
     turnover = (weights - weights.shift(1).fillna(0.0)).abs().sum(axis=1)
     cost = turnover * cost_bps / 10_000
     net = gross - cost
