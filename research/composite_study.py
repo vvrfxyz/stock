@@ -44,6 +44,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--start", type=date.fromisoformat, default=date(2016, 1, 4))
     parser.add_argument("--end", type=date.fromisoformat, default=date(2026, 7, 2))
+    parser.add_argument("--components", default=",".join(COMPONENTS),
+                        help="打分成分（低于 Bonferroni 的成分须剔除；事后翻符号=样本内挖掘，禁止）")
     parser.add_argument("--include-eod", action="store_true",
                         help="诊断口径：把 eod_reversal_flow 加回打分集（5 信号对照）")
     return parser.parse_args(argv)
@@ -87,13 +89,17 @@ def main(argv: list[str] | None = None) -> int:
 
     ctx = FactorContext(engine=engine, dates=dates, security_universe=universe,
                         as_of=pd.Timestamp(args.end))
-    names = list(COMPONENTS) + (["eod_reversal_flow"] if args.include_eod else [])
+    names = [x.strip() for x in args.components.split(",") if x.strip()]
+    if args.include_eod:
+        names.append("eod_reversal_flow")
+    assert "low_vol" in names, "主干 low_vol 必须在打分集"
     ranks: dict[str, pd.DataFrame] = {}
     for name in names:
         panel = get(name).compute(ctx).where(eligible)
         ranks[name] = panel.rank(axis=1, pct=True)
         print(f"  {name}: coverage={ranks[name].notna().sum(axis=1).median():.0f}/day", flush=True)
-    ranks["high_52w"] = _rowwise_ols_residual_rank(ranks["high_52w"], ranks["low_vol"])
+    if "high_52w" in names:
+        ranks["high_52w"] = _rowwise_ols_residual_rank(ranks["high_52w"], ranks["low_vol"])
 
     stack = np.stack([ranks[n].to_numpy() for n in names])          # (k, T, N)
     available = ~np.isnan(stack)

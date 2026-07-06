@@ -31,8 +31,10 @@
 | shadow_asymmetry（K 线影线不对称） | 日线 | t=+1.30 @h5 | 死亡 | 短窗 t=2.0 被长窗证伪——短窗显著性教训的标本 | 同上 |
 | smart_money_gap（尾盘-开盘收益差） | 分钟 | t<1 | 死亡 | 无信号 | 同上 |
 | close_vwap_pressure（收盘对 vwap 偏离） | 日线 | t<1（短窗即死） | 死亡 | wave-1 即淘汰，未进长窗 | wave-1 |
-| institutional_breadth（13F 持仓机构数） | SEC 13F | 存活（2026-07-02 重评估） | **可用候选** | 13F 族重评估后存活的两因子之一 | deep-review 2026-07-02、trials |
-| delta_institutional_ownership（季度 IO 变化） | SEC 13F | 存活（同上） | **可用候选** | 同上 | 同上 |
+| **composite_v1（3 信号：low_vol + high_52w 逐日残差 + breadth，0.5 中性填补）** | 日线+13F | IC .0294 t=3.88 @h5；q5 净 Sharpe h21 0.728 | **可用候选（首个过预注册相对判据的合成）** | vs low_vol 单干：IC IR 0.150>0.137、q5 净 Sharpe 0.728>0.713、LS 减亏一半（-0.09 vs -0.23）双条件 PASS——方差缩减如预期。诚实注记：改进幅度小、窗口对成分选择是样本内、13F 2013Q2 起故无真 OOS 腿；4 信号版（含 delta_IO）判 FAIL 是符号反转成分的直接实证 | wave-6、composite_v1 报告 |
+| insider_cluster（多内部人非例行集群买入，CMP 例行过滤） | SEC Form 4 | IC 负向弱（t=-0.98~-1.37，全部 noisy） | **死亡（横截面 IC 口径，2026-07-07）** | 侦察队 40-50% 基率落空：条件横截面太薄（~294 只/日）且方向不符；其预警的"事件稀疏杀日频 rank IC"命中。事件研究（CAR）口径未测试——挂低优先级开放问题 | wave-7 |
+| institutional_breadth（13F 持仓机构数） | SEC 13F | **IC t=5.82/4.60/4.21/3.81，全 4 horizon 过 Bonferroni（2016-2026）** | **可用候选（全项目最强单因子）** | wave-6 前置长窗确认：IC .014-.033 单调随 horizon 增，LS 净后罕见为正（+0.02~+0.06）；覆盖 ~2,257/日。变现攻坚（超额空间预注册检验）待做——low_vol 的教训：排序强 ≠ alpha | wave-6、trials |
+| delta_institutional_ownership（季度 IO 变化） | SEC 13F | 长窗 IC **为负**（t=-2.25~-2.44，均不过 Bonferroni） | **死亡（2026-07-07 降档：符号不稳）** | 短窗（2026-07-02 重评估）"存活"被长窗翻案且符号相反——2016-2026 机构增持预示**低**收益；作为复合成分实测拖垮 4 信号版（预注册判据 FAIL 的直接原因） | wave-6 |
 | days_to_cover（空头回补天数） | FINRA 空头 | 死亡（2026-07-02 重评估） | 死亡 | 重评估未存活 | 同上 |
 | size / earnings_yield / short_interest_ratio / short_volume_ratio / ownership_concentration / insider_net_buy | 各 PIT 源 | 基线因子，未做长窗攻坚 | 基线 | 作为框架验证与对照基线维护 | docs/factors.md |
 

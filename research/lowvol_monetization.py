@@ -60,6 +60,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--start", type=date.fromisoformat, default=date(2016, 1, 4))
     parser.add_argument("--end", type=date.fromisoformat, default=date(2026, 7, 2))
     parser.add_argument("--factor", default="low_vol", help="变现对象（冻结为 low_vol；改动即另一试验须登记）")
+    parser.add_argument("--leg", default="q5", choices=("q5", "ex_q1"),
+                        help="ex_q1 = 排除底部分位的等权组合（'规避尾部'部署形态，2026-07-07 预注册：\n"
+                             "对 EW-覆盖宇宙 alpha t>=2 即判尾部规避可部署；基准=同一覆盖宇宙全五分位等权）")
     return parser.parse_args(argv)
 
 
@@ -166,18 +169,37 @@ def main(argv: list[str] | None = None) -> int:
     adj_for_bt = adj_close.loc[dates]
 
     horizon, offsets = 21, (0, 4, 8, 12, 16)
-    weight_frames, per_offset = [], []
+    weight_frames, bench_frames, per_offset = [], [], []
     for off in offsets:
         reb = dates[off::horizon]
         mats = _quantile_weight_matrices(signal.loc[reb], eligible.loc[reb], 5)
-        w = _expand_daily(mats["q5"], reb, dates, universe)
+        if args.leg == "q5":
+            mat = mats["q5"]
+        else:  # ex_q1：覆盖宇宙（有信号且 eligible）剔除底部分位后等权
+            member = sum((mats[f"q{q}"] > 0) for q in (2, 3, 4, 5)).astype("float64")
+            n_row = member.sum(axis=1, keepdims=True)
+            mat = np.divide(member, n_row, out=np.zeros_like(member), where=n_row > 0)
+            all_member = sum((mats[f"q{q}"] > 0) for q in (1, 2, 3, 4, 5)).astype("float64")
+            n_all = all_member.sum(axis=1, keepdims=True)
+            bench_frames.append(_expand_daily(
+                np.divide(all_member, n_all, out=np.zeros_like(all_member), where=n_all > 0),
+                reb, dates, universe))
+        w = _expand_daily(mat, reb, dates, universe)
         weight_frames.append(w)
-        port = run_backtest(f"q5_o{off}", w, adj_for_bt, cost_bps=10.0, hold_through_gaps=True).daily_returns
+        port = run_backtest(f"{args.leg}_o{off}", w, adj_for_bt, cost_bps=10.0, hold_through_gaps=True).daily_returns
         per_offset.append({"offset": off, **{f"{k}_spy": v for k, v in _capm_stats(port, spy, rf).items()
                                              if k in ("alpha_ann", "alpha_nw_t")}})
     # 主组合：5 相位等资本平均（可实施的错峰调仓账本）
     avg_weights = sum(weight_frames) / len(weight_frames)
     ew_ex = panel_rets.where(eligible & (avg_weights <= 0)).mean(axis=1).rename("ew_ex_q5")
+    if args.leg == "ex_q1":
+        # 精确基准：同覆盖宇宙全五分位等权、同错峰同成本
+        avg_bench_w = sum(bench_frames) / len(bench_frames)
+        ew_covered = run_backtest("ew_covered", avg_bench_w, adj_for_bt,
+                                  cost_bps=10.0, hold_through_gaps=True).daily_returns.rename("ew_covered")
+        bench_specs = (("spy", spy), ("ew_covered_all_q", ew_covered))
+    else:
+        bench_specs = (("spy", spy), ("ew_incl_q5", ew_incl), ("ew_ex_q5", ew_ex))
 
     rows, cost_rows = [], []
     for cost in (0.0, 10.0, 25.0):
@@ -185,18 +207,19 @@ def main(argv: list[str] | None = None) -> int:
                               cost_bps=cost, hold_through_gaps=True)
         port = result.daily_returns
         if cost == 10.0:
-            for bname, bench in (("spy", spy), ("ew_incl_q5", ew_incl), ("ew_ex_q5", ew_ex)):
+            for bname, bench in bench_specs:
                 rows.append({"bench": bname, **_capm_stats(port, bench, rf)})
             ann_turn = float(result.turnover.mean() * TRADING_DAYS)
-            d = (port - ew_ex).dropna()
+            rel_bench = bench_specs[-1][1]
+            d = (port - rel_bench).dropna()
             d2 = (port - spy).dropna()
             yearly = pd.DataFrame({
-                "q5_minus_ew_ex": d.groupby(d.index.year).apply(lambda s: float((1 + s).prod() - 1)),
-                "q5_minus_spy": d2.groupby(d2.index.year).apply(lambda s: float((1 + s).prod() - 1)),
+                f"{args.leg}_minus_{bench_specs[-1][0]}": d.groupby(d.index.year).apply(lambda s: float((1 + s).prod() - 1)),
+                f"{args.leg}_minus_spy": d2.groupby(d2.index.year).apply(lambda s: float((1 + s).prod() - 1)),
             })
         cost_rows.append({"cost_bps": cost,
                           "alpha_ann_vs_spy": _capm_stats(port, spy, rf)["alpha_ann"],
-                          "alpha_ann_vs_ew_ex": _capm_stats(port, ew_ex, rf)["alpha_ann"]})
+                          "alpha_ann_vs_rel": _capm_stats(port, bench_specs[-1][1], rf)["alpha_ann"]})
 
     # q5 成分披露：非普通股已剔除；SPAC 型权重占比逐年
     spac_ids = flags.index[flags["spac_like"]]
@@ -209,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     bench_table = pd.DataFrame(rows).set_index("bench")
     offset_table = pd.DataFrame(per_offset).set_index("offset")
     cost_table = pd.DataFrame(cost_rows).set_index("cost_bps")
-    lines = [f"# low_vol 变现研究（{args.factor} q5 纯多头） {dates[0].date()} ~ {dates[-1].date()}",
+    lines = [f"# 变现研究（{args.factor} {args.leg}） {dates[0].date()} ~ {dates[-1].date()}",
              f"\nuniverse={len(universe)} CS→普通股过滤，days={len(dates)}；"
              f"主口径 h=21 五相位错峰；换手=双边名义额合计，cost=bps×双边；"
              f"年换手（双边，10bps 档）={ann_turn:.1f}x\n",
@@ -219,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
              "\n## q5 成分披露（SPAC 型名称权重）\n", _markdown_table(composition.round(4)),
              "\n## 逐年超额\n", _markdown_table(yearly.round(4))]
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out = os.path.join(OUTPUT_DIR, f"lowvol_monetization_{dates[0].date()}_{dates[-1].date()}.md")
+    out = os.path.join(OUTPUT_DIR, f"monetization_{args.factor}_{args.leg}_{dates[0].date()}_{dates[-1].date()}.md")
     with open(out, "w") as fh:
         fh.write("\n".join(lines))
     print(f"\n== 对基准 ==\n{bench_table.round(4).to_string()}", flush=True)
