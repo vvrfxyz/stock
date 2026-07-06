@@ -38,6 +38,7 @@ from research.factors.builtins import institutional_breadth as _institutional_br
 from research.factors.builtins import intraday_flow as _intraday_flow  # noqa: F401
 from research.factors.builtins import intraday_moments as _intraday_moments  # noqa: F401
 from research.factors.builtins import ownership_concentration as _ownership_concentration  # noqa: F401
+from research.factors.builtins import residual_vol as _residual_vol  # noqa: F401
 from research.factors.builtins import short_interest as _short_interest  # noqa: F401
 from research.factors.builtins import short_volume as _short_volume  # noqa: F401
 from research.factors.builtins import size as _size  # noqa: F401
