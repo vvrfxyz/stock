@@ -31,7 +31,7 @@ from sqlalchemy import text
 
 from research.backtest import eligibility_mask
 from research.data import research_engine
-from research.evaluate import _newey_west_t, _quantile_weight_matrices, default_nw_lag
+from research.evaluate import _markdown_table, _newey_west_t, _quantile_weight_matrices, default_nw_lag
 from research.factors.minute_loader import load_minute_feature_panel
 from research.factors.price_cache import adjusted_close_panel, raw_bar_panels
 
@@ -123,8 +123,8 @@ def main(argv: list[str] | None = None) -> int:
                     yearly_frames.setdefault(sig_name, pd.DataFrame())
                     yearly_frames[sig_name][comp_name] = s.groupby(s.index.year).mean() * 1e4
         table = pd.DataFrame(rows).set_index(["leg", "component"])
-        lines.append(f"## {sig_name}\n\n{table.round(3).to_markdown()}\n")
-        lines.append(f"### LS 逐年日均 bps\n\n{yearly_frames[sig_name].round(2).to_markdown()}\n")
+        lines.append(f"## {sig_name}\n\n{_markdown_table(table.round(3))}\n")
+        lines.append(f"### LS 逐年日均 bps\n\n{_markdown_table(yearly_frames[sig_name].round(2))}\n")
         print(f"\n== {sig_name} ==\n{table.round(3)}", flush=True)
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
