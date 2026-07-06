@@ -321,10 +321,28 @@ security_details    -- vendor 易变快照：name/address/branding/market_cap/
   四个失败桶 evidence 编码；HIGH=同 CIK 8-K item 2.01 / Form 25 12d2-2 规则段解析
   （`--fetch-form25-docs`），MEDIUM=identity MERGE/ETF 清盘，LOW=价格形态只定性；
   全量重建 upsert，MANUAL 行保护；health_report 新增退市结局 P1 探针。
-- **步骤 4 遗留**：delisting_return 本轮恒 NULL（8-K 对价抽取 `--fetch-8k-docs`
-  未做）——"return 非 NULL ≥50%" 验收线与 20 年动量对比实验待该阶段补齐。
-  backtest 引擎与 run_baselines 接线已就绪（逐只 Series+标量兜底，
-  `--no-delisting-returns` 复现旧口径）。
+- **最终验收（三轮迭代后，2026-07-06 晚）**：
+  - **reason 非 UNKNOWN 76.2%（5,711/7,494）✓ 过 70% 线**；final_price 92.8% ✓。
+    三轮迭代的三个杠杆：① Form 25 文档解析修复（25-NSE 的 primary_document_url
+    是 xslF25X0N 渲染器路径，剥掉后是带 `<ruleProvision>` 的原始 XML；HTML 版靠
+    ☒/☐ 勾选框检测——首版把"模板列出全部条款"误判为不确定，2,255 份只解析出
+    1 份）；② ADS/MLP 类守卫例外（文档类别的非普通股标记词 ⊆ 证券自身名称标记词
+    时放行——ADR 的 Form 25 类别就是 "American Depositary Shares"）；③ 8-K item
+    3.01 退市通知层（582 只 UNKNOWN 有交易所不达标/摘牌通知，纯 SQL MEDIUM 证据）。
+  - **现金并购 return 自检 ✓**：n=710，p10=-4.8% / p50=+0.02% / p90=+0.22%——
+    如文档预言聚在 0（终价已收敛到对价），抽取链正确性数据自证。
+  - 对价抽取漏斗：现金 742 / 换股比 173 / 收购方 369 / 门控剔除 32 / 歧义 40
+    （sanity gate [0.2x, 5x] final_price）。
+  - **delisting_return 覆盖未达 50% 线，如实记录**：表内实测 710（9.5%，全部
+    现金独占并购）+ 读取层 ETF 清盘 par 合成 ~1,071（`load_delisting_returns
+    (fund_closure_par=True)`，经验值按 schema 纪律放读取层不进事实表）≈ 23.7%。
+    缺口主体=换股/混合对价并购的 return（需收购方价格面板估 stock leg）与
+    无残值证据的破产（-1 只在有法院文件时写）。下迭代路径已在代码 followup 注明。
+  - UNKNOWN 1,783 只清单在 `logs/manual_backfill/delisting_unknown_final3.csv`
+    （其中 source=FORM25 的攥着证据定性不了——wrong_class 782 多为同 CIK 票据/
+    优先股类 Form 25，indeterminate 257 为无勾选标记的老文档）。
+- **步骤 4 遗留**：20 年动量对比实验（`--terminal-return none --no-delisting-returns`
+  旧口径 vs 逐只实测新口径）待跑；backtest 引擎与 run_baselines 接线已就绪。
 
 ### 任务 2（companies）——完成
 
