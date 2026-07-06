@@ -16,27 +16,26 @@ from datetime import timedelta
 from typing import ClassVar
 
 import pandas as pd
-from sqlalchemy import text
 
 from research.factors.protocol import FactorContext, register
 
 
 def _load_bar_panels(ctx: FactorContext, buffer_days: int, columns: str) -> pd.DataFrame:
-    start = (ctx.dates[0] - timedelta(days=buffer_days)).date()
+    # 共享缓存 + COPY 高速装载：全列一次拉取（columns 参数保留兼容测试签名，
+    # 实际列选择在缓存层完成——同窗口第二个因子零成本）
+    from research.factors.price_cache import _PANEL_CACHE, load_price_long_fast  # noqa
+    from research.factors.price_cache import _universe_fingerprint
+    from datetime import timedelta as _td
+
+    start = (ctx.dates[0] - _td(days=buffer_days)).date()
     end = ctx.dates[-1].date()
-    sql = text(f"""
-        select p.security_id, p.date, {columns}
-        from daily_prices p
-        where p.date between :start and :end
-          and p.security_id = any(:ids)
-        order by p.security_id, p.date
-    """)
-    with ctx.engine.connect() as conn:
-        frame = pd.read_sql_query(
-            sql, conn,
-            params={"start": start, "end": end, "ids": ctx.security_universe.tolist()})
-    frame["date"] = pd.to_datetime(frame["date"])
-    return frame
+    ids = ctx.security_universe.tolist()
+    key = ("raw_bars", str(ctx.engine.url), start, end, _universe_fingerprint(ids))
+    if key not in _PANEL_CACHE:
+        _PANEL_CACHE[key] = load_price_long_fast(
+            ctx.engine, start=start, end=end,
+            columns="open, high, low, close, volume, vwap", security_ids=ids)
+    return _PANEL_CACHE[key]
 
 
 @dataclass(frozen=True)

@@ -44,34 +44,41 @@ def load_price_long(
 
     默认包含 is_active=False 的证券：建库后退市的标的保留在库里，
     纳入它们可以减轻（但不能消除）幸存者偏差。
+
+    2026-07 性能改造：走 PostgreSQL COPY csv 通道直接喂 pandas C 解析器——
+    read_sql 逐行物化在 31M 行量级上慢 5-10 倍（wave-1 评估实测瓶颈）。
+    参数全部为内部受控值（date/内部 int id/白名单 type），内联安全。
     """
+    import io
+
     active_clause = "" if include_inactive else "and s.is_active"
-    id_clause = "and p.security_id = any(:security_ids)" if security_ids else ""
-    sql = text(
-        f"""
-        select p.security_id, p.date,
-               p.open::float8 as open, p.close::float8 as close,
-               p.volume::float8 as volume, p.vwap::float8 as vwap
-        from daily_prices p
-        join securities s on s.id = p.security_id
-        where p.date between :start and :end
-          and s.type = any(:types) {active_clause} {id_clause}
-        order by p.security_id, p.date
-        """
-    )
-    params: dict = {"start": start, "end": end, "types": list(types)}
+    id_clause = ""
     if security_ids:
-        params["security_ids"] = security_ids
-    chunks = list(pd.read_sql_query(
-        sql,
-        engine,
-        params=params,
-        chunksize=500_000,
-        parse_dates=["date"],
-    ))
-    if not chunks:
+        id_clause = f"and p.security_id in ({','.join(str(int(x)) for x in security_ids)})"
+    type_list = ",".join(f"'{t}'" for t in types)
+    copy_sql = f"""
+        COPY (
+            select p.security_id, p.date,
+                   p.open::float8 as open, p.close::float8 as close,
+                   p.volume::float8 as volume, p.vwap::float8 as vwap
+            from daily_prices p
+            join securities s on s.id = p.security_id
+            where p.date between '{start.isoformat()}' and '{end.isoformat()}'
+              and s.type in ({type_list}) {active_clause} {id_clause}
+            order by p.security_id, p.date
+        ) TO STDOUT WITH (FORMAT csv, HEADER true)
+    """
+    raw = engine.raw_connection()
+    try:
+        buffer = io.BytesIO()
+        with raw.cursor() as cursor:
+            cursor.copy_expert(copy_sql, buffer)
+    finally:
+        raw.close()
+    buffer.seek(0)
+    df = pd.read_csv(buffer, parse_dates=["date"])
+    if df.empty:
         return pd.DataFrame(columns=["security_id", "date", "open", "close", "volume", "vwap"])
-    df = pd.concat(chunks, ignore_index=True)
     df["security_id"] = df["security_id"].astype(np.int32)
     return df
 

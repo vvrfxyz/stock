@@ -11,24 +11,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
 from typing import ClassVar
 
 import pandas as pd
 
-from research.data import apply_adjustment, load_factor_events, load_price_long, to_wide
+from research.factors.price_cache import adjusted_close_panel
 from research.factors.protocol import FactorContext, register
 
 
 def _adj_close_panel(ctx: FactorContext, buffer_days: int) -> pd.DataFrame:
-    start = (ctx.dates[0] - timedelta(days=buffer_days)).date()
-    end = ctx.dates[-1].date()
-    prices = load_price_long(
-        ctx.engine, start=start, end=end,
-        types=("CS", "ETF"), security_ids=ctx.security_universe.tolist())
-    events = load_factor_events(ctx.engine, as_of=end)
-    prices = apply_adjustment(prices, events, as_of=end)
-    return to_wide(prices, "adj_close")
+    # 共享缓存 + COPY 高速装载：同 universe/窗口的多个因子只拉一次
+    return adjusted_close_panel(
+        ctx.engine, dates=ctx.dates,
+        security_ids=ctx.security_universe.tolist(), buffer_days=buffer_days)
 
 
 @dataclass(frozen=True)
