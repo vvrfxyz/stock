@@ -306,6 +306,36 @@ def report_institutional_holdings_completeness(session, today: date | None = Non
     return p1
 
 
+def report_delisting_outcomes(session) -> int:
+    """退市结局覆盖护栏（P1 warning，不阻塞）。
+
+    退市超过 90 天仍无 delisting_events 行、或 reason_code 仍为 UNKNOWN 的证券
+    数量——build_delisting_events 幂等重跑应逐步压低该值（新数据源/文档抽取迭代）。
+    join 按 (security_id, delist_date) 唯一键：delist_date 修订后的残行视同缺失。
+    """
+    _section("退市结局覆盖 (delisting_events)")
+    row = session.execute(text("""
+        SELECT count(*) FILTER (WHERE de.security_id IS NULL) AS missing,
+               count(*) FILTER (WHERE de.security_id IS NOT NULL
+                                AND coalesce(de.reason_code, 'UNKNOWN') = 'UNKNOWN') AS unresolved
+        FROM securities s
+        LEFT JOIN delisting_events de
+          ON de.security_id = s.id AND de.delist_date = s.delist_date
+        WHERE NOT s.is_active AND s.delist_date IS NOT NULL
+          AND upper(s.market) = 'US'
+          AND s.delist_date < current_date - 90
+    """)).one()
+    missing, unresolved = row[0] or 0, row[1] or 0
+    total = missing + unresolved
+    if total > 0:
+        logger.warning("  [P1] 退市 >90 天仍无结局归因: {} 只（无行 {} + UNKNOWN {}）",
+                       total, missing, unresolved)
+        logger.warning("       运行 scripts/build_delisting_events.py --apply 重建（幂等）。")
+        return 1
+    logger.info("  退市 >90 天的结局归因覆盖: OK")
+    return 0
+
+
 def report_staleness(session) -> int:
     """P2 advisory: 各数据域的新鲜度。"""
     _section("数据新鲜度 (P2 Advisory)")
@@ -347,6 +377,7 @@ def main(argv: list[str] | None = None) -> int:
                 ("price_consistency", lambda: report_price_data_consistency(session)),
                 ("institutional_holdings_completeness", lambda: report_institutional_holdings_completeness(session)),
                 ("identity_health", lambda: report_identity_health(session)),
+                ("delisting_outcomes", lambda: report_delisting_outcomes(session)),
                 ("pipeline_runs", lambda: report_pipeline_runs(session, args.days)),
                 ("staleness", lambda: report_staleness(session)),
             ]
@@ -362,6 +393,8 @@ def main(argv: list[str] | None = None) -> int:
                         p1_total += result
                     elif name == "identity_health":
                         p0_total += result
+                    elif name == "delisting_outcomes":
+                        p1_total += result
                     elif name == "pipeline_runs":
                         p1_total += result
                     elif name == "staleness":

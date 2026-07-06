@@ -171,6 +171,32 @@ def load_symbol_map(engine: Engine) -> pd.Series:
     return df.set_index("id")["symbol"]
 
 
+def load_delisting_returns(engine: Engine) -> pd.Series:
+    """逐证券实测退市收益（index=security_id int, values=float）。
+
+    来源 delisting_events.delisting_return（docs/todo_crsp_grade_2026-07.md 任务 1）。
+    同一证券多次退市（重新上市后再退）时只取**最近一次**退市事件：面板的终局
+    是最后那次退市，借用更早退市周期的收益属于口径错误——最近一次无实测值的
+    证券整体缺席，由 run_backtest 的 terminal_return_fallback 兜底（宁缺毋滥）。
+    表未填充时返回空 Series，调用方应退回全局标量假设。
+    """
+    sql = text(
+        """
+        select security_id, delisting_return::float8 as delisting_return
+        from (
+            select distinct on (security_id) security_id, delisting_return
+            from delisting_events
+            order by security_id, delist_date desc
+        ) latest
+        where delisting_return is not null
+        """
+    )
+    df = pd.read_sql_query(sql, engine)
+    series = df.set_index("security_id")["delisting_return"].astype("float64")
+    series.index = series.index.astype("int64")
+    return series
+
+
 def securities_with_uncovered_events(
     engine: Engine,
     *,

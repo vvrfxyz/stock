@@ -25,6 +25,7 @@ from research.backtest import BacktestResult, run_backtest
 from research.data import (
     apply_adjustment,
     load_adjusted_panel,
+    load_delisting_returns,
     load_factor_events,
     load_price_long,
     research_engine,
@@ -51,7 +52,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--benchmark", default="SPY")
     parser.add_argument("--terminal-return", default=None,
                         help="退市持仓的终局收益假设（如 -1.0=归零、-0.3=CRSP 经验值、"
-                             "none=显式沿用旧口径即退市赚 0%%）。面板起点早于 2024-05-14 时必填。")
+                             "none=显式沿用旧口径即退市赚 0%%）。面板起点早于 2024-05-14 时必填。"
+                             "delisting_events 有实测收益时它降级为未覆盖证券的 fallback。")
+    parser.add_argument("--no-delisting-returns", action="store_true",
+                        help="不读 delisting_events 的逐证券实测退市收益，只用 --terminal-return "
+                             "全局假设（复现旧口径运行）。")
     args = parser.parse_args(argv)
     # 退市终局强制显式化：长窗口面板含 6,000+ 退市股，默认"退市赚 0%"会系统性
     # 高估做多策略（评估 hard truth）。短窗口沿旧口径不变。
@@ -61,6 +66,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if isinstance(args.terminal_return, str):
         args.terminal_return = None if args.terminal_return.lower() == "none" else float(args.terminal_return)
     return args
+
+
+def resolve_terminal_returns(
+    realized: pd.Series,
+    cli_value: float | None,
+    use_realized: bool = True,
+) -> tuple[float | pd.Series | None, float | None]:
+    """决定传给 run_backtest 的 (terminal_return, terminal_return_fallback)。
+
+    规则（docs/todo_crsp_grade_2026-07.md 任务 1 步骤 4）：优先逐证券实测
+    delisting_return（Series），CLI 标量降级为未覆盖证券的 fallback；实测为空
+    （表未填充）或显式 opt-out 时，行为与旧口径完全一致——只传 CLI 标量、无 fallback。
+    """
+    if not use_realized or realized.empty:
+        return cli_value, None
+    return realized, cli_value
 
 
 def trim(result: BacktestResult, eval_start: date) -> BacktestResult:
@@ -111,13 +132,29 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Universe hash: {universe['universe_hash']}")
     print(f"平均可交易标的数: {eligible.sum(axis=1).mean():.0f}")
 
-    # TODO(wave 2 / delisting_events): 表落地后在此按 security_id 加载已实现退市收益，
-    # 以 pd.Series(index=security_id) 传 terminal_return、CLI 标量降级为 terminal_return_fallback。
-    # run_backtest 已支持 float | pd.Series | None（Series 只能编程式传入，CLI 行为不变）。
+    # 退市终局收益：优先 delisting_events 的逐证券实测 delisting_return，
+    # 查无（表未填充 / --no-delisting-returns）再落回全局 CLI 假设（旧口径不变）。
+    realized = pd.Series(dtype="float64") if args.no_delisting_returns else load_delisting_returns(engine)
+    terminal_return, terminal_fallback = resolve_terminal_returns(
+        realized, args.terminal_return, use_realized=not args.no_delisting_returns
+    )
+    if isinstance(terminal_return, pd.Series):
+        in_panel = int(terminal_return.index.isin(adj_close.columns).sum())
+        fallback_desc = ("无（未覆盖的退市持仓沿旧口径赚 0%）" if terminal_fallback is None
+                         else f"全局假设 {terminal_fallback:+.1%}")
+        print(f"退市收益模式: 实测 delisting_return {len(terminal_return)} 只"
+              f"（本面板内 {in_panel} 只），未覆盖 fallback: {fallback_desc}")
+    else:
+        why = ("--no-delisting-returns 显式关闭实测" if args.no_delisting_returns
+               else "delisting_events 无实测收益")
+        assumption = ("无假设（退市持仓沿旧口径赚 0%）" if terminal_return is None
+                      else f"全局假设 {terminal_return:+.1%}")
+        print(f"退市收益模式: {why}，全部退市持仓使用: {assumption}")
+
     results = [
-        run_backtest("momentum_12_1 (top10%, 月调)", momentum_12_1(adj_close, eligible), adj_close, cost_bps=args.cost_bps, terminal_return=args.terminal_return),
-        run_backtest("sma_50_200 趋势 (周调)", sma_trend(adj_close, eligible), adj_close, cost_bps=args.cost_bps, terminal_return=args.terminal_return),
-        run_backtest("5日反转 (bottom10%, 周调)", short_term_reversal(adj_close, eligible), adj_close, cost_bps=args.cost_bps, terminal_return=args.terminal_return),
+        run_backtest("momentum_12_1 (top10%, 月调)", momentum_12_1(adj_close, eligible), adj_close, cost_bps=args.cost_bps, terminal_return=terminal_return, terminal_return_fallback=terminal_fallback),
+        run_backtest("sma_50_200 趋势 (周调)", sma_trend(adj_close, eligible), adj_close, cost_bps=args.cost_bps, terminal_return=terminal_return, terminal_return_fallback=terminal_fallback),
+        run_backtest("5日反转 (bottom10%, 周调)", short_term_reversal(adj_close, eligible), adj_close, cost_bps=args.cost_bps, terminal_return=terminal_return, terminal_return_fallback=terminal_fallback),
     ]
 
     ew_weights = eligible.astype(float)
