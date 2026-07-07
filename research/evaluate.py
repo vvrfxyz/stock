@@ -31,6 +31,7 @@ from research.data import (
     uncovered_gate_version,
 )
 from research.factors.builtins import accruals as _accruals  # noqa: F401
+from research.factors.builtins import asset_growth as _asset_growth  # noqa: F401
 from research.factors.builtins import bar_geometry as _bar_geometry  # noqa: F401
 from research.factors.builtins import classic_pillars as _classic_pillars  # noqa: F401
 from research.factors.builtins import classic_price as _classic_price  # noqa: F401

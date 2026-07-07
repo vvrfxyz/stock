@@ -1,4 +1,4 @@
-"""wave-12 基本面族 H1-H3 因子语义测试（纯合成 / mock，无 DB）。
+"""wave-12 基本面族 H1-H4 因子语义测试（纯合成 / mock，无 DB）。
 
 覆盖：
 - asof_panel include_period_end 的 period_end 面板与值面板逐格 NaN 一致（纯函数）。
@@ -6,6 +6,8 @@
   assets<=0 置 NaN。
 - accruals：符号原样（NI>CFO 为正）/ period_end 对齐门槛 / assets<=0 置 NaN。
 - operating_profitability：单腿 / assets。
+- asset_growth（H4）：事件层 YoY 上一期值机制（配对窗 / 重述重发 / 单调护栏 /
+  prior<=0 置 NaN）+ 因子符号原样 + company 广播。
 - company_id 广播语义（锚证券值广播回成员；无 company_id 用自身值）。
 - 元属性（名字 / 无 adr_unsafe / register 可 get）。
 """
@@ -16,7 +18,13 @@ import pandas as pd
 import pytest
 
 from research.factors.protocol import FactorContext, get
-from research.fundamentals import asof_panel
+from research.fundamentals import asof_panel, build_yoy_ratio_events
+
+# 显式 import 触发四个因子的 register()，不依赖测试顺序副作用
+import research.factors.builtins.accruals  # noqa: E402,F401
+import research.factors.builtins.asset_growth  # noqa: E402,F401
+import research.factors.builtins.gross_profitability  # noqa: E402,F401
+import research.factors.builtins.operating_profitability  # noqa: E402,F401
 
 
 DATES = pd.DatetimeIndex(pd.to_datetime(["2023-06-15", "2023-09-15"]))
@@ -228,7 +236,8 @@ class TestOperatingProfitability:
 # --------------------------------------------------------------------------- #
 class TestMetadata:
     @pytest.mark.parametrize(
-        "name", ["gross_profitability", "accruals", "operating_profitability"]
+        "name",
+        ["gross_profitability", "accruals", "operating_profitability", "asset_growth"],
     )
     def test_registered_metadata(self, name):
         f = get(name)
@@ -238,3 +247,156 @@ class TestMetadata:
         assert f.pit_guarantee is True
         # 分子分母同源、不含股本/市值口径 -> 不设 adr_unsafe
         assert not hasattr(f, "adr_unsafe")
+
+
+# --------------------------------------------------------------------------- #
+# asset_growth（H4）：事件层 YoY 上一期值机制
+# --------------------------------------------------------------------------- #
+def _yoy_facts(*rows) -> pd.DataFrame:
+    """(security_id, concept, period_end, filed_date, value) -> facts 长表。"""
+    df = pd.DataFrame(
+        rows, columns=["security_id", "concept", "period_end", "filed_date", "value"]
+    )
+    for col in ("period_end", "filed_date"):
+        df[col] = pd.to_datetime(df[col]).astype("datetime64[ns]")
+    df["value"] = df["value"].astype("float64")
+    return df
+
+
+def _yoy_events(facts):
+    return build_yoy_ratio_events(
+        facts, source_metric="assets", out_metric="asset_growth"
+    )
+
+
+class TestYoYMechanism:
+    def test_basic_yoy_ratio(self):
+        facts = _yoy_facts(
+            (1, "Assets", "2022-12-31", "2023-02-15", 1000.0),
+            (1, "Assets", "2023-12-31", "2024-02-15", 1200.0),
+        )
+        ev = _yoy_events(facts)
+        assert len(ev) == 1
+        row = ev.iloc[0]
+        assert row["metric"] == "asset_growth"
+        assert row["period_end"] == pd.Timestamp("2023-12-31")
+        assert row["visible_date"] == pd.Timestamp("2024-02-15")  # max(两腿 filed)
+        assert row["value"] == pytest.approx(0.20)  # 1200/1000-1
+
+    def test_visible_date_is_max_of_both_legs(self):
+        # 上一期在自己年份的 10-K 先报（2023-02-15），当前期后报（2024-02-15）
+        # -> 首个联合事件可见日 = 后到腿 = 2024-02-15
+        facts = _yoy_facts(
+            (1, "Assets", "2022-12-31", "2023-02-15", 1000.0),
+            (1, "Assets", "2023-12-31", "2024-02-15", 1200.0),
+        )
+        ev = _yoy_events(facts)
+        assert ev.iloc[0]["visible_date"] == pd.Timestamp("2024-02-15")
+
+    def test_restatement_of_prior_leg_reemits(self):
+        # 上一期 Assets 被重述（2022-12-31: 1000 -> 800），YoY 在重述 filed_date 重发
+        facts = _yoy_facts(
+            (1, "Assets", "2022-12-31", "2023-02-15", 1000.0),
+            (1, "Assets", "2023-12-31", "2024-02-15", 1200.0),
+            (1, "Assets", "2022-12-31", "2024-05-01", 800.0),  # 重述
+        )
+        ev = _yoy_events(facts).sort_values("visible_date").reset_index(drop=True)
+        assert len(ev) == 2
+        assert ev.loc[0, "value"] == pytest.approx(0.20)  # 1200/1000-1
+        assert ev.loc[0, "visible_date"] == pd.Timestamp("2024-02-15")
+        assert ev.loc[1, "value"] == pytest.approx(0.50)  # 1200/800-1
+        assert ev.loc[1, "visible_date"] == pd.Timestamp("2024-05-01")
+
+        # as-of 语义：重述前看旧值，重述后看新值（visible_delay=1）
+        dates = pd.DatetimeIndex(
+            pd.to_datetime(["2024-01-01", "2024-03-01", "2024-06-01"])
+        )
+        panel = asof_panel(ev, dates=dates, max_staleness_days=None)["asset_growth"]
+        col = panel[1]
+        assert np.isnan(col.iloc[0])  # 首个事件可见前
+        assert col.iloc[1] == pytest.approx(0.20)  # 重述前
+        assert col.iloc[2] == pytest.approx(0.50)  # 重述后
+
+    def test_restatement_of_current_leg_reemits(self):
+        facts = _yoy_facts(
+            (1, "Assets", "2022-12-31", "2023-02-15", 1000.0),
+            (1, "Assets", "2023-12-31", "2024-02-15", 1200.0),
+            (1, "Assets", "2023-12-31", "2024-05-01", 1500.0),  # 当前腿重述
+        )
+        ev = _yoy_events(facts).sort_values("visible_date").reset_index(drop=True)
+        assert ev["value"].tolist() == pytest.approx([0.20, 0.50])  # 1200 -> 1500
+
+    def test_no_prior_year_no_event(self):
+        facts = _yoy_facts((1, "Assets", "2023-12-31", "2024-02-15", 1200.0))
+        assert _yoy_events(facts).empty
+
+    def test_quarter_gap_not_paired_as_prior_year(self):
+        # 只有相隔 91 天的两期 -> 不在 [330,400] 窗内 -> 不产 YoY
+        facts = _yoy_facts(
+            (1, "Assets", "2023-09-30", "2023-11-01", 1000.0),
+            (1, "Assets", "2023-12-31", "2024-02-15", 1200.0),
+        )
+        assert _yoy_events(facts).empty
+
+    def test_quarterly_reporter_pairs_same_quarter_last_year(self):
+        # 季度报：2023-12-31 与 2022-12-31 配对（~365 天），非上一季度
+        facts = _yoy_facts(
+            (1, "Assets", "2022-12-31", "2023-02-15", 1000.0),
+            (1, "Assets", "2023-09-30", "2023-11-01", 1150.0),
+            (1, "Assets", "2023-12-31", "2024-02-15", 1200.0),
+        )
+        ev = _yoy_events(facts)
+        assert len(ev) == 1
+        assert ev.iloc[0]["period_end"] == pd.Timestamp("2023-12-31")
+        assert ev.iloc[0]["value"] == pytest.approx(0.20)  # 1200/1000-1
+
+    def test_prior_non_positive_gives_no_event(self):
+        facts = _yoy_facts(
+            (1, "Assets", "2022-12-31", "2023-02-15", 0.0),
+            (1, "Assets", "2023-12-31", "2024-02-15", 1200.0),
+        )
+        assert _yoy_events(facts).empty
+
+    def test_monotonic_guard_drops_late_old_period_reemit(self):
+        # 迟到的更旧 cur_pe 重述（2021 assets 改动 -> 2022 的 YoY 重发）不得倒退 as-of 序列
+        facts = _yoy_facts(
+            (1, "Assets", "2021-12-31", "2022-02-15", 900.0),
+            (1, "Assets", "2022-12-31", "2023-02-15", 1000.0),
+            (1, "Assets", "2023-12-31", "2024-02-15", 1200.0),
+            (1, "Assets", "2021-12-31", "2024-06-01", 500.0),  # 迟到重述老年份
+        )
+        ev = _yoy_events(facts)
+        dates = pd.DatetimeIndex(pd.to_datetime(["2024-07-01"]))
+        panel = asof_panel(ev, dates=dates, max_staleness_days=None)["asset_growth"]
+        # 2023 的 YoY（period_end 2023-12-31, 值 0.20）仍是最新，未被 2022 迟到重述倒退
+        assert panel[1].iloc[0] == pytest.approx(0.20)
+
+
+class TestAssetGrowthFactor:
+    def _patch_panel(self, monkeypatch, panel, membership):
+        import research.factors.builtins.asset_growth as mod
+
+        def fake_lyp(engine, *, dates, source_metric, out_metric, security_ids=None, **kw):
+            return panel.reindex(index=pd.DatetimeIndex(pd.to_datetime(dates)))
+
+        monkeypatch.setattr(mod, "load_yoy_ratio_panel", fake_lyp)
+        import research.factors.builtins._fundamental_ratio as fr
+
+        monkeypatch.setattr(fr, "load_security_company_map", lambda engine, **kw: membership)
+
+    def test_sign_unflipped_and_reindex(self, monkeypatch):
+        # 高增长为正、收缩为负（compute 不翻符号）
+        panel = _panel({1: [0.30, 0.30], 2: [-0.15, -0.15]})
+        self._patch_panel(monkeypatch, panel, _empty_membership())
+        out = get("asset_growth").compute(_ctx([1, 2]))
+        assert out.loc[DATES[0], 1] == pytest.approx(0.30)
+        assert out.loc[DATES[0], 2] == pytest.approx(-0.15)
+
+    def test_company_broadcast(self, monkeypatch):
+        membership = _membership([(10, 100), (11, 100)])
+        panel = _panel({10: [0.25, 0.25], 12: [0.40, 0.40]})  # 锚 10 有值，11 缺
+        self._patch_panel(monkeypatch, panel, membership)
+        out = get("asset_growth").compute(_ctx([10, 11, 12]))
+        assert out.loc[DATES[0], 10] == pytest.approx(0.25)
+        assert out.loc[DATES[0], 11] == pytest.approx(0.25)  # 广播自公司锚 10
+        assert out.loc[DATES[0], 12] == pytest.approx(0.40)  # 无公司，自身值

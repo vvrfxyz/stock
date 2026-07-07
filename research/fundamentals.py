@@ -156,6 +156,13 @@ _DURATION_CLASSES: dict[str, tuple[int, int]] = {
 _PRIOR_FY_TOLERANCE_DAYS = 7  # YTD 的 period_start - 1 天 与上一财年 period_end 的容差
 _PRIOR_YTD_TOLERANCE_DAYS = 14  # 去年同期 YTD 的 period_end 与 (period_end - 365) 的容差
 
+# YoY 同期配对窗（asset_growth 等"上一年度期值"机制）：当前 period_end 减 365 天为锚，
+# ±35 天容差 => 上一期 period_end 落在当前的 [330, 400] 天之前。窗口理由：
+# 下界 330 排除上一季度末（Q/H/N 间隔 90/180/270 天）误配为"上一年"；上界 400 覆盖
+# 52/53 周财历漂移（可达 371 天）、闰年与迟一期的年报，同时排除隔两期（≥450 天）。
+_YOY_TARGET_DAYS = 365
+_YOY_TOLERANCE_DAYS = 35
+
 _EVENT_COLUMNS = ["security_id", "concept", "period_end", "visible_date", "value"]
 
 _NS_PER_DAY = 86_400_000_000_000  # period_end -> 自纪元天数（float 精确，用于跨 metric 对齐）
@@ -467,6 +474,135 @@ def build_metric_events(
     ].reset_index(drop=True)
 
 
+def build_yoy_ratio_events(
+    facts: pd.DataFrame,
+    *,
+    source_metric: str,
+    out_metric: str,
+    target_days: int = _YOY_TARGET_DAYS,
+    tolerance_days: int = _YOY_TOLERANCE_DAYS,
+) -> pd.DataFrame:
+    """同 metric「当前期值 / 上一年度同期值 − 1」的 vintage 感知事件流。
+
+    事件层 YoY（**非** as-of 面板取 t−252 近似——那会混入申报时点噪声）：
+
+    - **两腿锁同 concept**：配对与 vintage 合并都 by=[security, concept]，当前期与
+      上一期必是同一 concept 的申报（避免口径漂移；assets 单 concept，天然满足）。
+    - **配对**：当前 period_end 减 target_days 为锚，direction=nearest、tolerance_days
+      容差取最近的上一期 period_end（默认落在 [330,400] 天之前，见常量注释）；
+      强制 cur_pe > prior_pe。无匹配（首年、季度缺口）不产事件。
+    - **vintage 合并**：把两腿各自的 vintage 序列按 filed_date 并成阶梯函数
+      （任一腿 ffill），两腿齐备后产事件——首个联合事件的 visible_date =
+      max(两腿首报 filed)（后到腿触发）；**任一腿新 vintage（重述）即在其
+      filed_date 重发事件**；比值未变的 vintage 不重复发。
+    - **病理**：上一期值 <= 0 -> 比值 NaN（不产事件）；除法不产生 inf。
+    - **单调 period_end 护栏**：与 build_metric_events 同——迟到的更旧 cur_pe 事件
+      （老年份 YoY 的重述）不得让 as-of 序列倒退，丢弃；当前期的重述（period_end
+      相等）保留。
+
+    输出 schema 同 build_metric_events：(security_id, metric=out_metric, period_end=cur_pe,
+    visible_date, value)，可直接喂 asof_panel。
+    """
+    lookup = _concept_lookup((source_metric,))
+    facts = facts.copy()
+    if "metric" not in facts.columns:
+        facts = facts.merge(
+            lookup[["concept", "metric", "rank", "kind"]], on="concept", how="inner"
+        )
+    facts = _to_ns(facts, ("period_end", "filed_date"))
+    rows = facts[facts["metric"] == source_metric][
+        ["security_id", "concept", "period_end", "filed_date", "value"]
+    ].copy()
+    empty = _EMPTY_EVENTS.assign(metric=pd.Series(dtype=object))[
+        ["security_id", "metric", "period_end", "visible_date", "value"]
+    ]
+    if rows.empty:
+        return empty
+    # 同一 (security, concept, period) 同日多次申报只保留最后一条（与 build_metric_events 同）
+    rows = rows.sort_values(
+        ["security_id", "concept", "period_end", "filed_date"]
+    ).drop_duplicates(["security_id", "concept", "period_end", "filed_date"], keep="last")
+
+    # 期间层配对（vintage 无关）：当前 period_end -> 最近的上一年度 period_end
+    periods = rows[["security_id", "concept", "period_end"]].drop_duplicates()
+    cur = periods.rename(columns={"period_end": "cur_pe"}).copy()
+    cur["prior_target"] = cur["cur_pe"] - pd.Timedelta(days=target_days)
+    prior = periods.rename(columns={"period_end": "prior_pe"})
+    matched = pd.merge_asof(
+        cur.sort_values("prior_target"),
+        prior.sort_values("prior_pe"),
+        left_on="prior_target",
+        right_on="prior_pe",
+        by=["security_id", "concept"],
+        direction="nearest",
+        tolerance=pd.Timedelta(days=tolerance_days),
+    )
+    matched = matched.dropna(subset=["prior_pe"])
+    matched = matched[matched["cur_pe"] > matched["prior_pe"]]
+    if matched.empty:
+        return empty
+    matched = matched.reset_index(drop=True)
+    matched["pair_id"] = matched.index
+
+    # 两腿 vintage 序列合并为阶梯函数
+    parts = []
+    for role, pe_col in (("cur", "cur_pe"), ("prior", "prior_pe")):
+        part = matched[["pair_id", "security_id", "concept", pe_col]].merge(
+            rows,
+            left_on=["security_id", "concept", pe_col],
+            right_on=["security_id", "concept", "period_end"],
+        )
+        parts.append(
+            pd.DataFrame(
+                {
+                    "pair_id": part["pair_id"],
+                    "filed": part["filed_date"],
+                    "role": role,
+                    "value": part["value"],
+                }
+            )
+        )
+    long = pd.concat(parts, ignore_index=True)
+    wide = (
+        long.sort_values(["pair_id", "filed"])
+        .pivot_table(index=["pair_id", "filed"], columns="role", values="value", aggfunc="last")
+        .reset_index()
+        .sort_values(["pair_id", "filed"])
+    )
+    for role in ("cur", "prior"):
+        if role not in wide.columns:
+            wide[role] = np.nan
+    wide[["cur", "prior"]] = wide.groupby("pair_id")[["cur", "prior"]].ffill()
+    wide = wide.dropna(subset=["cur", "prior"])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(wide["prior"] > 0, wide["cur"] / wide["prior"] - 1.0, np.nan)
+    wide["ratio"] = ratio
+    wide = wide.dropna(subset=["ratio"])
+    if wide.empty:
+        return empty
+    # 同一 pair 内比值未变化的 vintage 不重复发
+    wide = wide[wide["ratio"] != wide.groupby("pair_id")["ratio"].shift()]
+
+    meta = matched[["pair_id", "security_id", "concept", "cur_pe"]]
+    out = wide.merge(meta, on="pair_id")
+    events = pd.DataFrame(
+        {
+            "security_id": out["security_id"].astype(np.int64),
+            "metric": out_metric,
+            "period_end": out["cur_pe"],
+            "visible_date": out["filed"],
+            "value": out["ratio"].astype(np.float64),
+        }
+    )
+    # 单调 period_end 护栏（镜像 build_metric_events）：迟到的更旧 cur_pe 不得倒退 as-of 序列
+    events = events.sort_values(["security_id", "metric", "visible_date", "period_end"])
+    running_max = events.groupby(["security_id", "metric"])["period_end"].cummax()
+    events = events[events["period_end"] >= running_max]
+    return events[
+        ["security_id", "metric", "period_end", "visible_date", "value"]
+    ].reset_index(drop=True)
+
+
 def asof_panel(
     events: pd.DataFrame,
     *,
@@ -548,3 +684,43 @@ def load_fundamental_panel(
         visible_delay_days=visible_delay_days,
         include_period_end=include_period_end,
     )
+
+
+def load_yoy_ratio_panel(
+    engine: Engine,
+    *,
+    dates: list[date] | pd.DatetimeIndex,
+    source_metric: str,
+    out_metric: str,
+    types: tuple[str, ...] = DEFAULT_RESEARCH_TYPES,
+    security_ids: list[int] | None = None,
+    max_staleness_days: int = 270,
+    visible_delay_days: int = 1,
+) -> pd.DataFrame:
+    """一站式：拉某 flow/instant 事实 -> YoY 比值事件流 -> as-of 面板（单张宽表）。
+
+    走 build_yoy_ratio_events（事件层 YoY，vintage 感知），不是 as-of 面板差分近似。
+    max_staleness_days 默认 270（与基本面族一致——US CS 报 Assets 是季度口径，
+    10-Q 资产负债表使当前腿 period_end 逐季刷新，270 天足够；纯年报公司在报间隔
+    过 270 天置 NaN 与同族 assets 口径一致，不引入新洞）。YoY 事件 period_end 锚
+    当前期末。
+    """
+    facts = load_fundamental_facts(
+        engine, metrics=(source_metric,), types=types, security_ids=security_ids
+    )
+    events = build_yoy_ratio_events(
+        facts, source_metric=source_metric, out_metric=out_metric
+    )
+    panels = asof_panel(
+        events,
+        dates=pd.DatetimeIndex(pd.to_datetime(list(dates))),
+        max_staleness_days=max_staleness_days,
+        visible_delay_days=visible_delay_days,
+    )
+    empty = pd.DataFrame(
+        index=pd.DatetimeIndex(pd.to_datetime(list(dates))),
+        columns=pd.Index([], dtype="int64"),
+        dtype="float64",
+    )
+    return panels.get(out_metric, empty)
+
