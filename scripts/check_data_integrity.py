@@ -19,6 +19,13 @@ from utils.massive_config import ALLOWED_US_SECURITY_TYPES
 from utils.script_logging import setup_logging as configure_script_logging
 
 
+# 全史 OHLC 不变量违规基线（ratchet 语义）：2026-07-06 repair_ohlc_violations 全量
+# 订正后生产实测为 0（containment + 非正价 + 负成交量三类合计清零，NVDA 拆股日脏 high
+# 亦经 --scan-absurd-extremes 订正）。等于基线只通报，超出即有新脏行进入并阻塞。
+# 上调前须先跑 scripts/repair_ohlc_violations.py 把已知遗留清零，再把实测值写回这里。
+OHLC_VIOLATION_BASELINE = 0
+
+
 def setup_logging():
     configure_script_logging("check_data_integrity")
 
@@ -35,9 +42,9 @@ def create_parser() -> argparse.ArgumentParser:
                         help="无事件大跳变的 |close/prev_close - 1| 阈值 (默认: 0.5)")
     parser.add_argument("--gap-min-sessions", type=int, default=3,
                         help="缺口检查中连续缺失交易日的最小会话数 (默认: 3，过滤个股正常停牌)")
-    parser.add_argument("--ohlc-baseline", type=int, default=0,
-                        help="全史 OHLC 包含违规的允许基线 (默认: 0，2026-07-06 repair_ohlc_violations "
-                             "已全量订正)；超出即阻塞")
+    parser.add_argument("--ohlc-baseline", type=int, default=OHLC_VIOLATION_BASELINE,
+                        help="全史 OHLC 包含违规的允许基线 (默认: {}，2026-07-06 repair_ohlc_violations "
+                             "已全量订正)；超出即阻塞".format(OHLC_VIOLATION_BASELINE))
     return parser
 
 
@@ -190,27 +197,77 @@ def check_active_list_date_coverage(session, limit: int) -> int:
 
 
 def check_ohlc_validity_full_history(session, limit: int, baseline: int) -> int:
-    """全史 OHLC 包含不变量计数（windowed 版只看近窗，历史脏行会永远漏网）。
+    """全史 OHLC 不变量计数 + 来源指纹分解（windowed 版只看近窗，历史脏行会永远漏网）。
 
-    与 baseline（repair_ohlc_violations 后已知的分钟无覆盖搁置行数）比较：
-    超出即有新violated行进入，阻塞；等于或低于只作通报。
+    覆盖的不变量：high<low、high<open、high<close、low>open、low>close、
+    非正价（open/high/low/close <= 0）、负成交量。
+
+    来源指纹（CLAUDE.md Data Integrity Notes）：
+    - yfinance 遗留：vwap/trade_count 双 NULL（2003 前深历史 + OTC 填缝）；
+    - flatfiles(SIP)：trade_count 有（day-aggs 归档 + vwap 回填后仍带 trade_count）；
+    - massive：trade_count NULL 但 vwap 有（2023H2 起为主）。
+
+    ratchet 语义：与 baseline（repair_ohlc_violations 后已知搁置行数，见
+    OHLC_VIOLATION_BASELINE）比较——超出即有新增脏行进入，阻塞并按来源×类型
+    打出分解，便于定位是哪条摄入链路回归；等于或低于只作通报。
     """
     sql = text(
         """
-        SELECT COUNT(*) AS n
-        FROM daily_prices dp
-        WHERE dp.open IS NOT NULL AND dp.high IS NOT NULL
-          AND dp.low IS NOT NULL AND dp.close IS NOT NULL
-          AND (dp.high < dp.low
-               OR dp.high < GREATEST(dp.open, dp.close)
-               OR dp.low > LEAST(dp.open, dp.close))
+        WITH flagged AS (
+            SELECT
+                (dp.high < dp.low)                                   AS v_hl,
+                (dp.high < dp.open)                                  AS v_ho,
+                (dp.high < dp.close)                                 AS v_hc,
+                (dp.low > dp.open)                                   AS v_lo,
+                (dp.low > dp.close)                                  AS v_lc,
+                (dp.open <= 0 OR dp.high <= 0
+                 OR dp.low <= 0 OR dp.close <= 0)                    AS v_np,
+                (dp.volume < 0)                                      AS v_nv,
+                CASE
+                    WHEN dp.vwap IS NULL AND dp.trade_count IS NULL THEN 'yfinance'
+                    WHEN dp.trade_count IS NOT NULL                 THEN 'flatfiles'
+                    ELSE 'massive'
+                END                                                  AS source
+            FROM daily_prices dp
+            WHERE dp.open IS NOT NULL AND dp.high IS NOT NULL
+              AND dp.low IS NOT NULL AND dp.close IS NOT NULL
+        )
+        SELECT source,
+               COUNT(*) FILTER (WHERE v_hl) AS high_lt_low,
+               COUNT(*) FILTER (WHERE v_ho) AS high_lt_open,
+               COUNT(*) FILTER (WHERE v_hc) AS high_lt_close,
+               COUNT(*) FILTER (WHERE v_lo) AS low_gt_open,
+               COUNT(*) FILTER (WHERE v_lc) AS low_gt_close,
+               COUNT(*) FILTER (WHERE v_np) AS nonpositive,
+               COUNT(*) FILTER (WHERE v_nv) AS neg_volume,
+               COUNT(*) AS any_violation
+        FROM flagged
+        WHERE v_hl OR v_ho OR v_hc OR v_lo OR v_lc OR v_np OR v_nv
+        GROUP BY source
+        ORDER BY source
         """
     )
-    n = session.execute(sql).scalar_one()
+    rows = session.execute(sql).all()
+    n = sum(r.any_violation for r in rows)
+
     if n > baseline:
-        logger.error("全史 OHLC 包含违规 {} 行（> 已知搁置基线 {}），存在新增脏行。", n, baseline)
+        logger.error("全史 OHLC 不变量违规 {} 行（> 已知搁置基线 {}），存在新增脏行。", n, baseline)
+    elif n:
+        logger.info("全史 OHLC 不变量违规 {} 行（<= 搁置基线 {}，均为分钟无覆盖的历史遗留）。", n, baseline)
+    else:
+        logger.success("✅ 全史 OHLC 不变量: OK（0 违规）")
+
+    # 无论是否阻塞，只要有违规就打出来源×类型分解，便于定位回归链路。
+    for r in rows:
+        logger.warning(
+            "  · 来源={} 合计={} | high<low={} high<open={} high<close={} "
+            "low>open={} low>close={} 非正价={} 负量={}",
+            r.source, r.any_violation, r.high_lt_low, r.high_lt_open, r.high_lt_close,
+            r.low_gt_open, r.low_gt_close, r.nonpositive, r.neg_volume,
+        )
+
+    if n > baseline:
         return n - baseline
-    logger.info("全史 OHLC 包含违规 {} 行（<= 搁置基线 {}，均为分钟无覆盖的历史遗留）。", n, baseline)
     return 0
 
 
