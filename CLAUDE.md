@@ -6,6 +6,8 @@ This file gives Claude Code a compact, current map of the repository.
 
 This is a Greenfield US stock data pipeline. PostgreSQL is the system of record for metadata, events, and daily raw facts. ClickHouse（253 容器 `stock-clickhouse`）自 2026-07 起承载分钟线：`stock.minute_bars` 50.6 亿行（2003-09 起，归档 `flatfiles_1m` + 周度增量 `massive_1m`），读取走 `research/minute_bars.py`（HTTP 8123）；设计见 `docs/archive/polyglot_persistence_architecture.md` 与 `docs/minute_vw_backfill_2026-07.md`。
 
+**Owner 资金现实（2026-07-07）**：实盘本金 **2 万美元**，散户不是机构。一切研究的变现/部署判定按散户口径：容量与市场冲击不是约束（每仓数百美元）；真实成本 = 价差一半（零佣金，小盘往返 20-80bps 压测）；约束是集中度（只能持 20-40 只，分位组合转化打折）与信号厚度本身。"容量太小"不构成否决理由，小盘栖息地是优势；机构口径结论须标注并按散户参数复审（模板 `research/retail_reality_study.py`）。
+
 Primary data source:
 
 - Massive: US ticker universe, ticker details, ticker events, dividends, splits, daily bars, grouped daily bars, open/close summary, shares/float, short data, and news.
