@@ -23,6 +23,8 @@ from dotenv import load_dotenv
 
 from research.backtest import BacktestResult, run_backtest
 from research.data import (
+    DEFAULT_RESEARCH_TYPES,
+    RESEARCH_TYPES_WITH_ADR,
     apply_adjustment,
     load_adjusted_panel,
     load_delisting_returns,
@@ -52,6 +54,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-dollar-volume", type=float, default=2_000_000.0)
     parser.add_argument("--min-price", type=float, default=3.0)
     parser.add_argument("--benchmark", default="SPY")
+    parser.add_argument("--include-adr", action="store_true",
+                        help="宇宙并入 ADR 家族（ADRC/ADRP/ADRR）；默认 CS-only。")
     parser.add_argument("--terminal-return", default=None,
                         help="退市持仓的终局收益假设（如 -1.0=归零、-0.3=CRSP 经验值、"
                              "none=显式沿用旧口径即退市赚 0%%）。面板起点早于 2024-05-14 时必填。"
@@ -104,10 +108,14 @@ def main(argv: list[str] | None = None) -> int:
               "更早的价格未复权，结果不可信。")
     engine = research_engine()
 
-    print(f"加载 CS 面板 {args.start} ~ {args.end} ...")
-    panel = load_adjusted_panel(engine, start=args.start, end=args.end)
+    types = RESEARCH_TYPES_WITH_ADR if args.include_adr else DEFAULT_RESEARCH_TYPES
+    print(f"加载 {'/'.join(types)} 面板 {args.start} ~ {args.end} ...")
+    panel = load_adjusted_panel(engine, start=args.start, end=args.end, types=types)
     adj_close = panel["adj_close"]
 
+    # gate 默认 straddle_v2 口径：只剔"跨立"价格序列的未覆盖事件（2310->794）。
+    # run_baselines 不写 trials 库，无需像 evaluate 那样把口径掺进 params_hash；
+    # 复现旧口径传 require_straddle=False。
     bad_ids = securities_with_uncovered_events(engine, start=args.start, end=args.end)
     drop = [c for c in adj_close.columns if c in set(bad_ids)]
     if drop:

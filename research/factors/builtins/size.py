@@ -15,6 +15,8 @@ class SizeFactor:
     lookback_days: ClassVar[int] = 0
     lag_days: ClassVar[int] = 1
     pit_guarantee: ClassVar[bool] = True
+    # §E.3：ADR 的 ADS/公司股本口径混杂，市值/股本比率禁入直至归一化
+    adr_unsafe: ClassVar[bool] = True
 
     def compute(self, ctx: FactorContext) -> pd.DataFrame:
         log_mcap = load_log_market_cap_panel(

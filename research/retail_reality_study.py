@@ -48,6 +48,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _pick_with_continuity(members: np.ndarray, holdings: int, rng: np.random.Generator) -> np.ndarray:
+    """持仓延续抽样：保留仍在成员集（q5）的旧持仓，只随机补充离场者。
+
+    复刻真实散户行为、保留 q5 的天然黏性——每期独立重抽会虚增年换手到 24 倍、
+    40bps 下多付 ~10%/年（2026-07-07 首版 bug，实测子组合中位被打到 3.7% vs
+    整分位 10.7%；修复后中位 8.6%，已回写 research_ledger）。
+    """
+    picks = np.zeros_like(members)
+    held_idx = np.array([], dtype=int)
+    for r in range(len(members)):
+        idx = np.flatnonzero(members[r])
+        if len(idx) == 0:
+            continue
+        take = min(holdings, len(idx))
+        keep = held_idx[np.isin(held_idx, idx)][:take]
+        pool = np.setdiff1d(idx, keep, assume_unique=False)
+        add = rng.choice(pool, size=min(take - len(keep), len(pool)), replace=False) \
+            if take > len(keep) and len(pool) else np.array([], dtype=int)
+        held_idx = np.concatenate([keep, add])
+        picks[r, held_idx] = True
+    return picks
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     engine = research_engine()
@@ -130,13 +153,8 @@ def main(argv: list[str] | None = None) -> int:
     daily_rets = adj_for_bt.pct_change(fill_method=None).to_numpy()
     pos0 = np.searchsorted(reb0.values, dates.values, side="right") - 1
     for _ in range(args.n_sims):
-        picks = np.zeros_like(members0)
-        for r in range(len(reb0)):
-            idx = np.flatnonzero(members0[r])
-            if len(idx) == 0:
-                continue
-            take = min(args.holdings, len(idx))
-            picks[r, rng.choice(idx, size=take, replace=False)] = True
+        # 持仓延续：保留仍在 q5 的旧持仓，只补充离场者（语义与首版 bug 见 _pick_with_continuity）
+        picks = _pick_with_continuity(members0, args.holdings, rng)
         w = _weights_from(picks)[np.clip(pos0, 0, None)]
         w[pos0 < 0] = 0.0
         held = np.vstack([np.zeros((1, w.shape[1])), w[:-1]])

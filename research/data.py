@@ -22,6 +22,14 @@ DEFAULT_METHODOLOGY_VERSION = "raw_actions_v1"
 # MASSIVE 源事件与因子链覆盖到 2003；更早无价格、无事件，仍是硬地板。
 FACTOR_TRUST_FLOOR = date(2003, 1, 1)
 
+# 研究面板默认证券类型：CS-only 是零污染铁律（docs/adr_expansion_plan_2026-07.md §A.2），
+# ADR 家族经 --include-adr 显式 opt-in 并入（§E.6 工程，2026-07-07）。
+# 股本口径敏感因子（size/earnings_yield/short_interest_ratio）在 evaluate 层
+# 对 ADR 列另有 adr_unsafe 门（ADS 与公司股本混杂，禁入直至归一化，§E.3）。
+DEFAULT_RESEARCH_TYPES: tuple[str, ...] = ("CS",)
+ADR_TYPES: tuple[str, ...] = ("ADRC", "ADRP", "ADRR")
+RESEARCH_TYPES_WITH_ADR: tuple[str, ...] = DEFAULT_RESEARCH_TYPES + ADR_TYPES
+
 # daily_prices 中允许研究层拉取的价格列白名单（列名内联进 COPY SQL，必须受控）。
 PRICE_COLUMNS = ("open", "close", "volume", "vwap")
 
@@ -52,7 +60,7 @@ def load_price_long(
     *,
     start: date,
     end: date,
-    types: tuple[str, ...] = ("CS",),
+    types: tuple[str, ...] = DEFAULT_RESEARCH_TYPES,
     include_inactive: bool = True,
     security_ids: list[int] | None = None,
     columns: tuple[str, ...] = PRICE_COLUMNS,
@@ -184,7 +192,7 @@ def load_adjusted_panel(
     *,
     start: date,
     end: date,
-    types: tuple[str, ...] = ("CS",),
+    types: tuple[str, ...] = DEFAULT_RESEARCH_TYPES,
     as_of: date | None = None,
     include_inactive: bool = True,
 ) -> dict[str, pd.DataFrame]:
@@ -307,12 +315,18 @@ def resolve_terminal_returns(
     return realized, cli_value
 
 
+def uncovered_gate_version(require_straddle: bool = True) -> str:
+    """gate 口径版本串（进 evaluate 的 params_hash，新旧口径 trial 不互相顶替）。"""
+    return "straddle_v2" if require_straddle else "legacy_v1"
+
+
 def securities_with_uncovered_events(
     engine: Engine,
     *,
     start: date,
     end: date,
     methodology_version: str = DEFAULT_METHODOLOGY_VERSION,
+    require_straddle: bool = True,
 ) -> list[int]:
     """窗口内存在 corporate_actions 事件但无对应因子覆盖的证券。
 
@@ -327,10 +341,28 @@ def securities_with_uncovered_events(
       MASSIVE 对应行的孤行就是复权链上的洞——2003 归档导入的值冲突挂起
       （import_corporate_actions_archive R13）、未确认保留的合成行、归档漏抓的
       证券都靠这个分支机器剔除，人工裁决落库后本函数自动放行。
+
+    跨立精化（require_straddle=True，默认，'straddle_v2' 口径）：只有"跨立"该证券
+    价格序列的未覆盖事件才计为洞。原理——复权因子只作用于 ex_date 之前的价格行：
+    事件前无任何价格行则无可调整行、不产生假跳空；事件后无任何价格行则缺失因子
+    均匀作用于全序列（同乘一个常数），收益率不变。跨立性只依赖每证券 daily_prices
+    的 min(date)/max(date)（exists(date<ex) <=> min<ex；exists(date>=ex) <=> max>=ex，
+    内部缺口不影响存在性），故对洞证券集合做一次 join 聚合即可，不必逐行 EXISTS
+    扫 3,100 万行价格表。无任何价格行的证券同样放行（面板里本就没有它的列）。
+    实测（生产库，窗口 2003-01-01..2026-07-07）：剔除数 2,310 -> 794。
+
+    跨立按证券**全历史**价格边界判定，不按 start/end 裁剪价格行——有意的保守选择：
+    若按窗口裁剪，*_study.py 调用点（gate 传名义窗口、价格/信号面板却带
+    buffer_days=200 前推暖机段）会漏剔"假跳空落在暖机段内"的污染证券；全史边界下
+    窗口跨立蕴含全史跨立、绝不漏剔，代价只是窗口边缘可能多剔个别窗口内本就干净的
+    证券（如 ex_date 恰在窗口首日且历史价格全在窗口前），且与 2026-07 生产探针的
+    验收口径位级对齐。
+
+    require_straddle=False 完全复现旧口径（'legacy_v1'：任何未覆盖事件都剔除），
+    供旧结果复现与对账。
     """
-    sql = text(
-        """
-        select distinct ca.security_id
+    uncovered_sql = """
+        select ca.security_id, ca.ex_date
         from corporate_actions ca
         where ca.ex_date between :start and :end
           and ca.action_type in ('SPLIT', 'DIVIDEND')
@@ -350,8 +382,26 @@ def securities_with_uncovered_events(
                  and m.ex_date = ca.ex_date
                  and upper(m.source) = 'MASSIVE'))
           )
-        """
-    )
+    """
+    if require_straddle:
+        sql = text(
+            f"""
+            with uncovered as ({uncovered_sql}),
+            bounds as (
+                select p.security_id, min(p.date) as min_date, max(p.date) as max_date
+                from daily_prices p
+                where p.security_id in (select distinct security_id from uncovered)
+                group by p.security_id
+            )
+            select distinct u.security_id
+            from uncovered u
+            join bounds b on b.security_id = u.security_id
+            where b.min_date < u.ex_date
+              and b.max_date >= u.ex_date
+            """
+        )
+    else:
+        sql = text(f"select distinct security_id from ({uncovered_sql}) uncovered")
     with engine.connect() as conn:
         rows = conn.execute(sql, {"start": start, "end": end, "mv": methodology_version}).fetchall()
     return [r[0] for r in rows]

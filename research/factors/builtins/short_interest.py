@@ -18,6 +18,8 @@ class ShortInterestFactor:
     lookback_days: ClassVar[int] = 0
     lag_days: ClassVar[int] = SHORT_INTEREST_VISIBLE_DELAY_DAYS
     pit_guarantee: ClassVar[bool] = True
+    # §E.3：ADR 的 ADS/公司股本口径混杂，市值/股本比率禁入直至归一化
+    adr_unsafe: ClassVar[bool] = True
 
     def compute(self, ctx: FactorContext) -> pd.DataFrame:
         panel = load_short_interest_ratio_panel(

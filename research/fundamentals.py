@@ -36,6 +36,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from research.factors.asof import event_table_to_asof_panel
+from research.data import DEFAULT_RESEARCH_TYPES
 
 
 @dataclass(frozen=True)
@@ -68,20 +69,44 @@ METRICS: dict[str, MetricSpec] = {
                 "RealEstateRevenueNet",
                 "OilAndGasRevenue",
                 "FinancialServicesRevenue",
+                # ifrs-full（20-F/40-F 的 ADR 申报方；us-gaap 公司不报这组名，
+                # coalesce 排尾无碰撞。金额仍限 unit=USD——TWD/EUR 申报的 FPI
+                # 在 FX 归一化前拿不到值，宁缺毋混币种）
+                "Revenue",
+                "RevenueFromContractsWithCustomers",
             ),
             "flow",
         ),
-        MetricSpec("net_income_ttm", ("NetIncomeLoss",), "flow"),
-        MetricSpec("operating_income_ttm", ("OperatingIncomeLoss",), "flow"),
+        MetricSpec(
+            "net_income_ttm",
+            (
+                "NetIncomeLoss",
+                # ifrs-full：us-gaap NetIncomeLoss 是归母口径，对应优先归母、总量兜底
+                "ProfitLossAttributableToOwnersOfParent",
+                "ProfitLoss",
+            ),
+            "flow",
+        ),
+        MetricSpec(
+            "operating_income_ttm",
+            ("OperatingIncomeLoss", "ProfitLossFromOperatingActivities"),
+            "flow",
+        ),
         MetricSpec("gross_profit_ttm", ("GrossProfit",), "flow"),
         MetricSpec(
             "operating_cash_flow_ttm",
-            ("NetCashProvidedByUsedInOperatingActivities",),
+            (
+                "NetCashProvidedByUsedInOperatingActivities",
+                "CashFlowsFromUsedInOperatingActivities",  # ifrs-full
+            ),
             "flow",
         ),
         MetricSpec(
             "capex_ttm",
-            ("PaymentsToAcquirePropertyPlantAndEquipment",),
+            (
+                "PaymentsToAcquirePropertyPlantAndEquipment",
+                "PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities",  # ifrs-full
+            ),
             "flow",
         ),
         MetricSpec("assets", ("Assets",), "instant"),
@@ -90,12 +115,19 @@ METRICS: dict[str, MetricSpec] = {
             (
                 "StockholdersEquity",
                 "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+                # ifrs-full：归母优先、总量兜底
+                "EquityAttributableToOwnersOfParent",
+                "Equity",
             ),
             "instant",
         ),
         MetricSpec(
             "shares_outstanding",
-            ("EntityCommonStockSharesOutstanding", "CommonStockSharesOutstanding"),
+            (
+                "EntityCommonStockSharesOutstanding",
+                "CommonStockSharesOutstanding",
+                "NumberOfSharesOutstanding",  # ifrs-full（dei 封面页缺席时兜底）
+            ),
             "instant",
             unit="shares",
         ),
@@ -149,7 +181,7 @@ def load_fundamental_facts(
     engine: Engine,
     *,
     metrics: tuple[str, ...] = DEFAULT_METRICS,
-    types: tuple[str, ...] = ("CS",),
+    types: tuple[str, ...] = DEFAULT_RESEARCH_TYPES,
     security_ids: list[int] | None = None,
 ) -> pd.DataFrame:
     """拉取所需 concept 的 vintage 序列（长表）。
@@ -458,7 +490,7 @@ def load_fundamental_panel(
     *,
     dates: list[date] | pd.DatetimeIndex,
     metrics: tuple[str, ...] = DEFAULT_METRICS,
-    types: tuple[str, ...] = ("CS",),
+    types: tuple[str, ...] = DEFAULT_RESEARCH_TYPES,
     security_ids: list[int] | None = None,
     max_staleness_days: int = 270,
     visible_delay_days: int = 1,

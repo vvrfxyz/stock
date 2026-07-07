@@ -15,7 +15,9 @@ from scripts.import_corporate_actions_archive import (
     holdback_mismatches,
     load_dividend_rows,
     load_split_rows,
+    parse_adjudicated_allowlist,
     resolve_events,
+    resolve_events_allowlist,
     sift_splits,
     _window_filter,
 )
@@ -456,3 +458,121 @@ class TestQuarantineDetail:
         _window_filter(rows, date(2003, 1, 1), date(2024, 5, 14), stats, "dividend", detail)
         assert [d["reason"] for d in detail] == ["before_min_date"]
         assert stats["dividend_at_or_after_cutoff"] == 1
+
+
+ALLOWLIST_HEADER = "event_id\tsecurity_id\tticker\tex_date\tkind\n"
+
+
+class TestParseAdjudicatedAllowlist:
+    def test_parses_rows(self):
+        lines = [ALLOWLIST_HEADER,
+                 "E1\t10\tREUSE\t2012-01-01\tdividend\n",
+                 "E2\t11\tAGFY\t2024-10-08\tsplit\n"]
+        allowlist = parse_adjudicated_allowlist(lines)
+        assert allowlist["E1"] == {"security_id": 10, "ticker": "REUSE",
+                                   "ex_date": date(2012, 1, 1), "kind": "dividend"}
+        assert allowlist["E2"]["kind"] == "split"
+
+    def test_identical_duplicate_rows_converge(self):
+        lines = [ALLOWLIST_HEADER,
+                 "E1\t10\tREUSE\t2012-01-01\tdividend\n",
+                 "E1\t10\tREUSE\t2012-01-01\tdividend\n"]
+        assert len(parse_adjudicated_allowlist(lines)) == 1
+
+    def test_conflicting_duplicate_event_id_raises(self):
+        # 多归属歧义必须回裁决层解决，导入层绝不猜
+        lines = [ALLOWLIST_HEADER,
+                 "E1\t10\tREUSE\t2012-01-01\tdividend\n",
+                 "E1\t11\tREUSE\t2012-01-01\tdividend\n"]
+        with pytest.raises(ValueError):
+            parse_adjudicated_allowlist(lines)
+
+    def test_bad_header_raises(self):
+        with pytest.raises(ValueError):
+            parse_adjudicated_allowlist(["event_id\tticker\n", "E1\tA\n"])
+
+    def test_bad_kind_raises(self):
+        with pytest.raises(ValueError):
+            parse_adjudicated_allowlist([ALLOWLIST_HEADER, "E1\t10\tA\t2012-01-01\tmerger\n"])
+
+
+class TestResolveEventsAllowlist:
+    ALLOWLIST = {
+        "E1": {"security_id": 10, "ticker": "REUSE", "ex_date": date(2012, 1, 1), "kind": "dividend"},
+        "E5": {"security_id": 20, "ticker": "OLDCO", "ex_date": date(2015, 6, 1), "kind": "split"},
+    }
+
+    def test_bypasses_tenure_and_maps_by_allowlist_security(self):
+        # E1 落在 REUSE 两任之间的空档（resolve_events 会 out_of_tenure），allowlist 直接归属
+        rows = [_div("E1", "REUSE", date(2012, 1, 1), "9.50")]
+        stats = Counter()
+        by_sec = resolve_events_allowlist(rows, self.ALLOWLIST, "dividend", stats)
+        assert [r["id"] for r in by_sec[10]] == ["E1"]
+        assert stats["dividend_mapped"] == 1
+
+    def test_rows_not_in_allowlist_skipped(self):
+        rows = [_div("E9", "AAPL", date(2020, 8, 7), "0.82")]
+        stats = Counter()
+        by_sec = resolve_events_allowlist(rows, self.ALLOWLIST, "dividend", stats)
+        assert not by_sec
+        assert stats["dividend_not_in_allowlist"] == 1
+
+    def test_kind_mismatch_counts_as_not_in_allowlist(self):
+        # E5 是拆股裁决，分红行撞上同 id 不放行
+        rows = [_div("E5", "OLDCO", date(2015, 6, 1), "0.10")]
+        stats = Counter()
+        by_sec = resolve_events_allowlist(rows, self.ALLOWLIST, "dividend", stats)
+        assert not by_sec
+        assert stats["dividend_not_in_allowlist"] == 1
+
+    def test_ticker_mismatch_skipped_with_count(self):
+        rows = [_div("E1", "OTHER", date(2012, 1, 1), "9.50")]
+        stats = Counter()
+        by_sec = resolve_events_allowlist(rows, self.ALLOWLIST, "dividend", stats)
+        assert not by_sec
+        assert stats["dividend_allowlist_mismatch"] == 1
+
+    def test_ticker_match_is_case_insensitive(self):
+        allowlist = {"E1": {"security_id": 10, "ticker": "REUSE",
+                            "ex_date": date(2012, 1, 1), "kind": "dividend"}}
+        rows = [_div("E1", "reuse", date(2012, 1, 1), "9.50")]
+        by_sec = resolve_events_allowlist(rows, allowlist, "dividend", Counter())
+        assert len(by_sec[10]) == 1
+
+    def test_ex_date_mismatch_skipped_with_count(self):
+        rows = [_div("E1", "REUSE", date(2012, 1, 2), "9.50")]
+        stats = Counter()
+        by_sec = resolve_events_allowlist(rows, self.ALLOWLIST, "dividend", stats)
+        assert not by_sec
+        assert stats["dividend_allowlist_mismatch"] == 1
+
+    def test_cutoff_still_enforced(self):
+        # 裁决通过也不侵入 live 窗口：逐证券精确上界与 resolve_events 同口径
+        allowlist = {"E1": {"security_id": 10, "ticker": "REUSE",
+                            "ex_date": date(2024, 6, 3), "kind": "dividend"}}
+        rows = [_div("E1", "REUSE", date(2024, 6, 3), "0.10")]
+        stats = Counter()
+        by_sec = resolve_events_allowlist(rows, allowlist, "dividend", stats,
+                                          cutoff=date(2024, 5, 14), security_cutoffs={})
+        assert not by_sec
+        assert stats["dividend_at_or_after_cutoff"] == 1
+
+    def test_per_security_extended_cutoff_applies(self):
+        allowlist = {"E1": {"security_id": 10, "ticker": "DEAD",
+                            "ex_date": date(2024, 6, 3), "kind": "dividend"}}
+        rows = [_div("E1", "DEAD", date(2024, 6, 3), "0.10")]
+        by_sec = resolve_events_allowlist(rows, allowlist, "dividend", Counter(),
+                                          cutoff=date(2024, 5, 14),
+                                          security_cutoffs={10: date(2025, 3, 11)})
+        assert len(by_sec[10]) == 1
+
+    def test_accounting_keys_partition_input(self):
+        # R19：allowlist 模式下 mapped + not_in_allowlist + allowlist_mismatch = 输入行数
+        rows = [_div("E1", "REUSE", date(2012, 1, 1), "9.50"),
+                _div("E1", "OTHER", date(2012, 1, 1), "9.50"),
+                _div("E9", "AAPL", date(2020, 8, 7), "0.82")]
+        stats = Counter()
+        resolve_events_allowlist(rows, self.ALLOWLIST, "dividend", stats)
+        total = (stats["dividend_mapped"] + stats["dividend_not_in_allowlist"]
+                 + stats["dividend_allowlist_mismatch"])
+        assert total == len(rows)

@@ -19,12 +19,16 @@ from sqlalchemy.engine import Engine
 
 from research.backtest import eligibility_mask, hold_between_rebalances, run_backtest
 from research.data import (
+    ADR_TYPES,
+    DEFAULT_RESEARCH_TYPES,
     FACTOR_TRUST_FLOOR,
+    RESEARCH_TYPES_WITH_ADR,
     load_adjusted_panel,
     load_delisting_returns,
     research_engine,
     resolve_terminal_returns,
     securities_with_uncovered_events,
+    uncovered_gate_version,
 )
 from research.factors.builtins import bar_geometry as _bar_geometry  # noqa: F401
 from research.factors.builtins import classic_pillars as _classic_pillars  # noqa: F401
@@ -729,6 +733,17 @@ def _buffered_end(end: date, max_horizon: int, market: str = "US") -> date:
         return end + timedelta(days=math.ceil(max_horizon * 7 / 5) + 5)
 
 
+def _load_type_ids(engine: Engine, types: tuple[str, ...]) -> set[int]:
+    """指定 type 集合的全部 security_id（adr_unsafe 门用，一次评估最多查一遍）。"""
+    from sqlalchemy import text as _text
+    with engine.connect() as conn:
+        rows = conn.execute(
+            _text("select id from securities where upper(type) = any(:types)"),
+            {"types": [t.upper() for t in types]},
+        )
+        return {int(r[0]) for r in rows}
+
+
 def _factor_version(factor: Factor, git_sha: str | None) -> str:
     source = inspect.getsourcefile(factor.__class__) or inspect.getsourcefile(factor)
     if source is None:
@@ -780,7 +795,7 @@ def run_evaluation(
     horizons: tuple[int, ...] = DEFAULT_HORIZONS,
     n_quantiles: int = 5,
     cost_bps: float = 10.0,
-    types: tuple[str, ...] = ("CS",),
+    types: tuple[str, ...] = DEFAULT_RESEARCH_TYPES,
     min_price: float = 3.0,
     min_median_dollar_volume: float = 2_000_000.0,
     eligibility_window: int = 63,
@@ -802,7 +817,15 @@ def run_evaluation(
     buffered_end = _buffered_end(end, max(horizons))
     panel = load_adjusted_panel(engine, start=start, end=buffered_end, types=types, as_of=effective_as_of)
     # 剔除窗口与缓冲面板一致：前向收益会用到 end 之后 max(horizons) 个交易日的价格。
-    bad = set(securities_with_uncovered_events(engine, start=start, end=buffered_end)) | set(extra_drop_ids or [])
+    # gate 口径单一事实源：行为（require_straddle 实参）与 params_hash 标签（uncovered_gate）
+    # 都从这一个变量派生——将来加 legacy 对照旗标只改这里，不会出现"跑 legacy 宇宙、
+    # 记 straddle_v2 标签"的错桶。
+    uncovered_require_straddle = True
+    bad = set(
+        securities_with_uncovered_events(
+            engine, start=start, end=buffered_end, require_straddle=uncovered_require_straddle
+        )
+    ) | set(extra_drop_ids or [])
     if bad:
         for key in panel:
             panel[key] = panel[key].drop(columns=[c for c in panel[key].columns if int(c) in bad], errors="ignore")
@@ -838,6 +861,20 @@ def run_evaluation(
     factor_params = _factor_params_snapshot(factor_obj)
     ctx = FactorContext(engine=engine, dates=ctx_dates, security_universe=universe, as_of=pd.Timestamp(effective_as_of))
     factor_values = factor_obj.compute(ctx).reindex(index=ctx_dates, columns=universe).astype("float64")
+    # §E.3 股本口径门：ADR 的 ADS/公司股本混杂，声明 adr_unsafe 的因子
+    # （size/earnings_yield/short_interest_ratio）在 ADR opt-in 宇宙里对
+    # ADR 列置 NaN——其余证券照常评估，禁入直至 ADS 比率归一化。
+    adr_gated_count = 0
+    if getattr(factor_obj, "adr_unsafe", False) and any(t in ADR_TYPES for t in types):
+        adr_ids = _load_type_ids(engine, ADR_TYPES)
+        gated_cols = [c for c in factor_values.columns if int(c) in adr_ids]
+        if gated_cols:
+            factor_values.loc[:, gated_cols] = np.nan
+            adr_gated_count = len(gated_cols)
+            logger.warning(
+                "factor={} 声明 adr_unsafe：{} 只 ADR 列已置 NaN（股本口径未归一化，§E.3）",
+                factor_obj.name, adr_gated_count,
+            )
     if factor_values.dropna(how="all", axis=0).empty:
         raise FactorEvaluationError(f"factor {factor_obj.name!r} is empty or all NaN")
     default_eval_start = ctx_dates[252].date() if eval_start is None and len(ctx_dates) > 252 else None
@@ -869,6 +906,10 @@ def run_evaluation(
         "min_median_dollar_volume": min_median_dollar_volume,
         "eligibility_window": eligibility_window,
         "extra_drop_ids": sorted(int(x) for x in (extra_drop_ids or [])),
+        # 未覆盖事件 gate 口径进 params_hash：straddle_v2（只剔跨立事件，2310->794）与
+        # legacy_v1（任何未覆盖事件都剔）的 trial 必须可区分，先例同退市终局口径。
+        # 标签与上方 gate 调用同源（uncovered_require_straddle），不得各写默认值。
+        "uncovered_gate": uncovered_gate_version(uncovered_require_straddle),
         "factor_name": factor_obj.name,
         "factor_params": factor_params,
         "universe_hash": u_hash,
@@ -915,6 +956,7 @@ def run_evaluation(
     diagnostics = dict(result.diagnostics)
     diagnostics["pit_regression_max_abs_diff"] = pit_diff
     diagnostics["pit_presence_violations"] = pit_presence
+    diagnostics["adr_gated_columns"] = adr_gated_count
     diagnostics["lookahead_suspect"] = bool(
         diagnostics.get("lookahead_suspect", False)
         or (pd.notna(pit_diff) and pit_diff > 1e-6)
@@ -1091,6 +1133,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--horizons", type=_parse_csv_ints, default=DEFAULT_HORIZONS)
     parser.add_argument("--n-quantiles", type=int, default=5)
     parser.add_argument("--cost-bps", type=float, default=10.0)
+    parser.add_argument("--include-adr", action="store_true",
+                        help="宇宙并入 ADR 家族（ADRC/ADRP/ADRR）。默认 CS-only 零污染；"
+                             "adr_unsafe 因子（size/earnings_yield/short_interest_ratio）"
+                             "的 ADR 列自动置 NaN（股本口径未归一化，§E.3）。")
     parser.add_argument("--risk-free-series", default=DEFAULT_RISK_FREE_SERIES, help="risk_free_rates series_id；默认 DTB3。")
     parser.add_argument("--no-risk-free", action="store_true", help="复现旧口径：Sharpe/IR 不扣 risk-free。")
     parser.add_argument("--terminal-return", default=None,
@@ -1135,6 +1181,7 @@ def main(argv: list[str] | None = None) -> int:
         horizons=args.horizons,
         n_quantiles=args.n_quantiles,
         cost_bps=args.cost_bps,
+        types=RESEARCH_TYPES_WITH_ADR if args.include_adr else DEFAULT_RESEARCH_TYPES,
         risk_free_series=None if args.no_risk_free else args.risk_free_series,
         terminal_return=args.terminal_return,
         use_delisting_returns=not args.no_delisting_returns,

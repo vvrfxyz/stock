@@ -88,7 +88,7 @@ def test_apply_adjustment_event_on_bar_date_uses_next_event():
 
 @pytest.mark.integration
 def test_uncovered_events_matches_at_event_level(pg_db):
-    from data_models.models import ComputedAdjustmentFactor, CorporateAction, Security
+    from data_models.models import ComputedAdjustmentFactor, CorporateAction, DailyPrice, Security
 
     day = date(2024, 6, 3)
     mv = "raw_actions_v1"
@@ -106,6 +106,11 @@ def test_uncovered_events_matches_at_event_level(pg_db):
                 )
             )
         session.flush()
+        # 所有证券给一对跨立事件日的价格行（min < ex_date <= max），
+        # 使事件级匹配语义在默认 straddle 口径下原样可测。
+        for sid in (1, 2, 3, 4, 5):
+            session.add(DailyPrice(security_id=sid, date=date(2024, 5, 31), close=Decimal("10")))
+            session.add(DailyPrice(security_id=sid, date=date(2024, 6, 4), close=Decimal("11")))
         # 证券 1：同日拆股已建因子 + 外币分红缺 FX 被跳过（无因子行）。
         # 旧的"同证券同日期存在任意因子行"匹配会被拆股因子行掩盖而漏报。
         session.add(
@@ -193,3 +198,83 @@ def test_uncovered_events_matches_at_event_level(pg_db):
         pg_db.engine, start=date(2024, 6, 1), end=date(2024, 6, 30)
     )
     assert sorted(got) == [1, 3, 4]
+
+    # 全部事件都跨立时，legacy 口径与 straddle 口径一致
+    legacy = securities_with_uncovered_events(
+        pg_db.engine, start=date(2024, 6, 1), end=date(2024, 6, 30), require_straddle=False
+    )
+    assert sorted(legacy) == [1, 3, 4]
+
+
+@pytest.mark.integration
+def test_uncovered_events_straddle_gate(pg_db):
+    """跨立精化：只有跨立价格序列（min_date < ex_date <= max_date）的未覆盖事件计为洞。
+
+    原理：因子只作用 ex_date 之前的价格行——事件前无价格则无可调整行，事件后无价格
+    则全序列同乘常数、收益率不变；两种形态都放行。生产实测 2310 -> 794。
+    """
+    from data_models.models import CorporateAction, DailyPrice, Security
+
+    with pg_db.get_session() as session:
+        for sid in (11, 12, 13, 14, 15, 16, 17):
+            session.add(
+                Security(
+                    id=sid,
+                    symbol=f"s{sid}",
+                    current_symbol=f"s{sid}",
+                    market="US",
+                    type="CS",
+                    is_active=True,
+                    full_refresh_interval=30,
+                )
+            )
+        session.flush()
+
+        def _split(sid: int, ex: date, eid: str, source: str = "MASSIVE") -> None:
+            session.add(
+                CorporateAction(
+                    security_id=sid, action_type="SPLIT", ex_date=ex,
+                    source=source, source_event_id=eid,
+                    split_from=Decimal("1"), split_to=Decimal("2"),
+                )
+            )
+
+        def _price(sid: int, d: date) -> None:
+            session.add(DailyPrice(security_id=sid, date=d, close=Decimal("10")))
+
+        # 11：MASSIVE 缺因子事件不晚于首根价格（ex_date == min_date，无 ex 前行）-> 放行
+        _split(11, date(2024, 6, 3), "ev-11")
+        _price(11, date(2024, 6, 3))
+        _price(11, date(2024, 6, 10))
+        # 12：MASSIVE 缺因子事件跨立 -> 剔除
+        _split(12, date(2024, 6, 3), "ev-12")
+        _price(12, date(2024, 5, 30))
+        _price(12, date(2024, 6, 5))
+        # 13：POLYGON 孤行全部在价格覆盖之前开始（价格都在 ex 之后）-> 放行
+        _split(13, date(2024, 6, 3), "ev-13", source="POLYGON")
+        _price(13, date(2024, 6, 4))
+        _price(13, date(2024, 6, 5))
+        # 14：MASSIVE 缺因子事件晚于最后一根价格（max_date < ex_date）-> 放行
+        _split(14, date(2024, 6, 3), "ev-14")
+        _price(14, date(2024, 5, 1))
+        _price(14, date(2024, 5, 15))
+        # 15：POLYGON 跨立孤行 -> 剔除
+        _split(15, date(2024, 6, 3), "ev-15", source="POLYGON")
+        _price(15, date(2024, 5, 30))
+        _price(15, date(2024, 6, 3))  # max_date == ex_date 也算跨立（ex 前后都有行）
+        # 16：混合——一条跨立 + 一条不跨立（晚于最后价格）-> 剔除
+        _split(16, date(2024, 6, 5), "ev-16a")
+        _split(16, date(2024, 6, 20), "ev-16b")
+        _price(16, date(2024, 6, 1))
+        _price(16, date(2024, 6, 10))
+        # 17：有未覆盖事件但完全无价格行 -> 放行
+        _split(17, date(2024, 6, 3), "ev-17")
+        session.commit()
+
+    window = dict(start=date(2024, 6, 1), end=date(2024, 6, 30))
+    got = securities_with_uncovered_events(pg_db.engine, **window)
+    assert sorted(got) == [12, 15, 16]
+
+    # require_straddle=False 完全复现旧口径：任何未覆盖事件都剔除
+    legacy = securities_with_uncovered_events(pg_db.engine, require_straddle=False, **window)
+    assert sorted(legacy) == [11, 12, 13, 14, 15, 16, 17]

@@ -361,8 +361,9 @@ def test_uncovered_events_window_covers_forward_return_buffer(monkeypatch):
     }
     seen = {}
 
-    def fake_uncovered(engine, *, start, end):
+    def fake_uncovered(engine, *, start, end, require_straddle=True):
         seen["end"] = end
+        seen["require_straddle"] = require_straddle
         return []
 
     monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
@@ -385,6 +386,8 @@ def test_uncovered_events_window_covers_forward_return_buffer(monkeypatch):
     # 剔除窗口须覆盖前向收益实际用到的缓冲日期，而非止步于 end
     assert seen["end"] == ev._buffered_end(end, 5)
     assert seen["end"] > end
+    # gate 行为与 params_hash 标签同源：run_evaluation 显式传 require_straddle（straddle_v2）
+    assert seen["require_straddle"] is True
 
 
 def test_run_evaluation_requires_eval_start_for_short_default_warmup(monkeypatch):
@@ -461,6 +464,19 @@ def test_params_hash_excludes_note():
     other = config | {"note": "b"}
 
     assert _params_hash(config) == _params_hash(other)
+
+
+def test_params_hash_distinguishes_uncovered_gate_versions():
+    # gate 口径（straddle_v2 / legacy_v1）进 params_hash：新旧口径 trial 不互相顶替
+    from research.data import uncovered_gate_version
+
+    base = {"factor_name": "x", "cost_bps": 10.0}
+    new = base | {"uncovered_gate": uncovered_gate_version()}
+    legacy = base | {"uncovered_gate": uncovered_gate_version(require_straddle=False)}
+
+    assert new["uncovered_gate"] == "straddle_v2"
+    assert legacy["uncovered_gate"] == "legacy_v1"
+    assert len({_params_hash(base), _params_hash(new), _params_hash(legacy)}) == 3
 
 
 def test_parse_args_rejects_start_before_trust_floor():
