@@ -307,15 +307,31 @@ class TestUsdPeggedCurrencies:
 
 
 class TestFredIlsSeries:
-    def test_dexisus_maps_to_usd_base_ils_quote(self):
-        # DEXISUS 口径：1 USD = rate ILS；写入原样存，读取取倒数（同 DEXTAUS 方向锁定）
+    def test_ccusma_ils_maps_to_usd_base_ils_quote(self):
+        # CCUSMA02ILM618N 口径：1 USD = rate ILS（月频月均值）；写入原样存，读取取倒数
         observations = parse_fred_observations(
-            {"observations": [{"date": "2026-06-11", "value": "3.65"}]}, series_id="DEXISUS",
+            {"observations": [{"date": "2026-06-01", "value": "3.65"}]},
+            series_id="CCUSMA02ILM618N",
         )
-        rows = build_fred_fx_rows("DEXISUS", observations)
+        rows = build_fred_fx_rows("CCUSMA02ILM618N", observations)
         assert rows[0]["base_currency"] == "USD" and rows[0]["quote_currency"] == "ILS"
         fx = UsdFxConverter(_FxDbManager(rows))
         # 0.86 ILS（ITRN 2007 分红量级）应折 ~0.2356 USD，而不是 3.14 USD
         usd = Decimal("0.86") * fx.rate_to_usd("ILS", D)
         assert abs(usd - Decimal("0.86") / Decimal("3.65")) < Decimal("1e-15")
         assert usd < Decimal("0.3")
+
+    def test_ils_monthly_staleness_override_covers_month_interior(self):
+        # 月频行 rate_date 在月首；月末日期距月首 ~30 天，超默认 7 天阈值但在 35 天覆盖内
+        rows = [_fx(date(2007, 3, 1), "USD", "ILS", "4.20", "FRED")]
+        fx = UsdFxConverter(_FxDbManager(rows))
+        assert fx.rate_to_usd("ILS", date(2007, 3, 19)) == Decimal("1") / Decimal("4.20")
+        assert fx.rate_to_usd("ILS", date(2007, 3, 31)) == Decimal("1") / Decimal("4.20")
+        # 超过 35 天（真正断供）仍拒绝
+        assert fx.rate_to_usd("ILS", date(2007, 5, 15)) is None
+
+    def test_staleness_override_scoped_to_fallback_only(self):
+        # 覆盖只影响 fallback 路径；其它币种（TWD 日频）仍是 7 天阈值
+        rows = [_fx(date(2026, 6, 1), "USD", "TWD", "32.5", "FRED")]
+        fx = UsdFxConverter(_FxDbManager(rows))
+        assert fx.rate_to_usd("TWD", date(2026, 6, 9)) is None

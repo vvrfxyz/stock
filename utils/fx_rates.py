@@ -25,6 +25,15 @@ USD_PEGGED_CURRENCIES: dict[str, Decimal] = {
     "BMD": Decimal("1"),
 }
 
+# fallback（USD 基直连）路径的按币种 staleness 覆盖天数。
+# ILS 走 OECD 月频序列（CCUSMA02ILM618N，rate_date 为月首的当月日均值）：
+# 月内任意日期距月首最多 30 天，35 天上限刚好容纳月频且不放纵真正的断供。
+# 仅作用于 fallback 路径；ECB 日频交叉路径的 7 天阈值不受影响（ECB 有 ILS 的
+# 2011+ 段仍走日频率）。
+FALLBACK_STALENESS_OVERRIDES: dict[str, int] = {
+    "ILS": 35,
+}
+
 
 class UsdFxConverter:
     """按需加载单序列并缓存；线程不安全，单脚本进程内使用。"""
@@ -71,20 +80,25 @@ class UsdFxConverter:
 
     def _direct_usd_base_rate(self, currency: str, on_date: date) -> Decimal | None:
         # USD 基直连行口径：1 USD = rate CCY（如 FRED DEXTAUS），折 USD 取倒数。
-        rate = self._rate_asof(self._fallback_source, "USD", currency, on_date)
+        # 月频序列币种（如 ILS 的 OECD 月均值）按 FALLBACK_STALENESS_OVERRIDES 放宽。
+        staleness = FALLBACK_STALENESS_OVERRIDES.get(currency, self._max_staleness_days)
+        rate = self._rate_asof(self._fallback_source, "USD", currency, on_date,
+                               max_staleness_days=staleness)
         if rate is None or rate == 0:
             return None
         with localcontext() as ctx:
             ctx.prec = 28
             return Decimal("1") / rate
 
-    def _rate_asof(self, source: str, base: str, quote: str, on_date: date) -> Decimal | None:
+    def _rate_asof(self, source: str, base: str, quote: str, on_date: date,
+                   max_staleness_days: int | None = None) -> Decimal | None:
         dates, by_date = self._load(source, base, quote)
         index = bisect_right(dates, on_date) - 1
         if index < 0:
             return None
         rate_date = dates[index]
-        if (on_date - rate_date).days > self._max_staleness_days:
+        threshold = max_staleness_days if max_staleness_days is not None else self._max_staleness_days
+        if (on_date - rate_date).days > threshold:
             return None
         return by_date[rate_date]
 
