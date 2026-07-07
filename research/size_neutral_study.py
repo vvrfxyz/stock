@@ -28,6 +28,8 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
+from dotenv import load_dotenv
+
 from research.backtest import TRADING_DAYS, eligibility_mask, run_backtest
 from research._trials_store import append_study
 from research.company_market_cap import is_common_equity
@@ -77,6 +79,7 @@ def _bucket_labels(mcap_row: np.ndarray, valid: np.ndarray, n_buckets: int) -> n
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv()  # systemd-run 洗净环境（run_research.sh 发射）下 .env 是唯一的连库配置来源
     args = parse_args(argv)
     engine = research_engine()
     with engine.connect() as conn:

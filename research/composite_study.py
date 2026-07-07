@@ -38,6 +38,8 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
+from dotenv import load_dotenv
+
 from research.backtest import eligibility_mask
 from research._trials_store import append_study
 from research.data import (
@@ -73,6 +75,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv()  # systemd-run 洗净环境（run_research.sh 发射）下 .env 是唯一的连库配置来源
     args = parse_args(argv)
     engine = research_engine()
     with engine.connect() as conn:

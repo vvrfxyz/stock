@@ -28,6 +28,8 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
+from dotenv import load_dotenv
+
 from research.backtest import eligibility_mask
 from research.data import load_delisting_returns, research_engine, resolve_terminal_returns
 from research.evaluate import (
@@ -69,6 +71,7 @@ def _pairwise_daily_rank_corr(ranks: dict[str, np.ndarray], valids: dict[str, np
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv()  # systemd-run 洗净环境（run_research.sh 发射）下 .env 是唯一的连库配置来源
     args = parse_args(argv)
     names = [x.strip() for x in args.factors.split(",") if x.strip()]
     engine = research_engine()
