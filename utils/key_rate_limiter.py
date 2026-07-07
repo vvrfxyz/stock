@@ -18,6 +18,26 @@ class _RateLimiterState:
 _GLOBAL_STATE_LOCK = threading.Lock()
 _GLOBAL_STATES: Dict[Tuple[str, int, int], _RateLimiterState] = {}
 
+# 进程内累计限速等待秒数（跨线程求和，只增不减）。
+# 消费方：massive_task.run_concurrently 的非 TTY 进度行用它算 rate-wait 占比，
+# 一眼区分"配额慢"（该加 key/缩范围）与"IO 慢"（该查网络/vendor）。
+# 语义诚实标注：限速器状态是 per-key 进程共享的，此计数只覆盖【本进程】
+# 线程的等待，是全局配额压力的下界，不是全局值。
+_WAITED_LOCK = threading.Lock()
+_WAITED_SECONDS = 0.0
+
+
+def waited_seconds() -> float:
+    """本进程迄今在限速等待上花掉的累计秒数（全部线程求和）。"""
+    with _WAITED_LOCK:
+        return _WAITED_SECONDS
+
+
+def _record_wait(seconds: float) -> None:
+    global _WAITED_SECONDS
+    with _WAITED_LOCK:
+        _WAITED_SECONDS += seconds
+
 
 class KeyRateLimiter:
     """
@@ -159,3 +179,4 @@ class KeyRateLimiter:
                 wait_duration,
             )
             time.sleep(wait_duration)
+            _record_wait(wait_duration)

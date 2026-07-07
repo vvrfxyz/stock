@@ -9,8 +9,9 @@
 各脚本只保留差异部分：自有参数、选择过滤条件、process_* 业务逻辑与统计输出。
 """
 import argparse
+import sys
 import time
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Sequence
@@ -23,6 +24,7 @@ from data_models.models import Security
 from data_sources.massive_source import MassiveSource
 from db_manager import DatabaseManager
 from utils.key_rate_limiter import KeyRateLimiter
+from utils.key_rate_limiter import waited_seconds as key_rate_limiter_waited_seconds
 from utils.massive_config import (
     ALLOWED_US_SECURITY_TYPES,
     MASSIVE_RATE_LIMIT,
@@ -128,6 +130,87 @@ def _fatal_cost(item) -> int:
     return len(item) if isinstance(item, (list, tuple)) else 1
 
 
+def _rss_line() -> str:
+    """当前 RSS（Linux /proc VmRSS；macOS 无 /proc 退化为 ru_maxrss 峰值）。
+
+    刻意内联而非 import research.progress：utils 层不依赖 research 层。
+    """
+    import resource
+    import sys as _sys
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return f"rss {int(line.split()[1]) / 1024 ** 2:.1f}G"
+    except OSError:
+        pass
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    gb = peak / 1024 ** 2 if _sys.platform.startswith("linux") else peak / 1024 ** 3
+    return f"rss {gb:.1f}G peak"
+
+
+class _LineProgress:
+    """非 TTY（systemd/nohup/管道）下替代 tqdm 的节流进度行。
+
+    tqdm 在 journald 下退化成 \\r 残迹或静默——daily run 的 cron 日志全中招。
+    每 ≥interval 秒打一行（同时规避 journald burst rate-limit）：
+        [desc 0:12:34] 1234/5656 ok, 3 failed | 8.2 item/s | ETA ~09:41 | rss 2.1G | rate-wait 38%
+    速率用最近 5 分钟滑窗（长尾证券全量回填会拖歪全程均值）；ETA 带 ~ 明示粗估；
+    rate-wait = 本进程限速累计等待 / (墙钟 × 线程数)，是配额压力下界。
+    """
+
+    WINDOW_SECONDS = 300.0
+
+    def __init__(self, desc: str, total: int, *, workers: int, interval: float = 30.0, out=None):
+        self.desc = desc
+        self.total = total
+        self.workers = max(1, workers)
+        self.interval = interval
+        self._out = out if out is not None else sys.stderr
+        self._t0 = time.monotonic()
+        self._last_emit = self._t0
+        self._done = 0
+        self._failed = 0
+        self._window: deque[float] = deque()  # 最近完成时刻
+        self._wait0 = key_rate_limiter_waited_seconds()
+
+    def update(self, *, failed: bool = False) -> None:
+        now = time.monotonic()
+        self._done += 1
+        if failed:
+            self._failed += 1
+        self._window.append(now)
+        while self._window and now - self._window[0] > self.WINDOW_SECONDS:
+            self._window.popleft()
+        if now - self._last_emit >= self.interval or self._done == self.total:
+            self._emit(now)
+            self._last_emit = now
+
+    def _emit(self, now: float) -> None:
+        elapsed = now - self._t0
+        span = min(elapsed, self.WINDOW_SECONDS)
+        rate = len(self._window) / span if span > 0 else 0.0
+        eta = ""
+        if rate > 0 and self._done < self.total:
+            r = round((self.total - self._done) / rate)
+            eta_txt = f"{r // 3600}:{r % 3600 // 60:02d}:{r % 60:02d}" if r >= 3600 else f"{r // 60:02d}:{r % 60:02d}"
+            eta = f" | ETA ~{eta_txt}"
+        rate_wait = ""
+        waited = key_rate_limiter_waited_seconds() - self._wait0
+        if elapsed > 0 and waited > 0:
+            pct = min(1.0, waited / (elapsed * self.workers))
+            rate_wait = f" | rate-wait {pct:.0%}"
+        h, rem = divmod(int(elapsed), 3600)
+        failed_part = f", {self._failed} failed" if self._failed else ""
+        ok = self._done - self._failed
+        print(
+            f"[{self.desc} {h}:{rem // 60:02d}:{rem % 60:02d}] "
+            f"{ok}/{self.total} ok{failed_part} | {rate:.1f} item/s{eta}"
+            f" | {_rss_line()}{rate_wait}",
+            file=self._out, flush=True,
+        )
+
+
 def run_concurrently(
     items: Sequence,
     worker: Callable,
@@ -139,18 +222,30 @@ def run_concurrently(
 
     item 可以是单个 Security 或一批 Security；worker 抛出的未捕获异常
     按 item 内证券数量计入 FATAL_ERROR，不中断其余任务。
+
+    进度反馈按输出端分叉：stderr 是 TTY 时保留 tqdm（交互体验不变）；
+    非 TTY（systemd/nohup/管道）切换为 _LineProgress 的 30s 节流逐行输出。
     """
     counter = Counter()
     outputs = []
+    interactive = sys.stderr.isatty()
+    line_prog = None if interactive else _LineProgress(desc, len(items), workers=max_workers)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_item = {executor.submit(worker, item): item for item in items}
-        for future in tqdm(as_completed(future_to_item), total=len(future_to_item), desc=desc):
+        completed = as_completed(future_to_item)
+        if interactive:
+            completed = tqdm(completed, total=len(future_to_item), desc=desc)
+        for future in completed:
             item = future_to_item[future]
+            failed = False
             try:
                 outputs.append(future.result())
             except Exception as exc:
+                failed = True
                 logger.opt(exception=exc).error("任务 {} 发生未捕获异常: {}", _item_label(item), exc)
                 counter["FATAL_ERROR"] += _fatal_cost(item)
+            if line_prog is not None:
+                line_prog.update(failed=failed)
     return outputs, counter
 
 
