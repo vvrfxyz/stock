@@ -47,6 +47,7 @@ from research.factors.builtins import residual_vol as _residual_vol  # noqa: F40
 from research.factors.builtins import short_interest as _short_interest  # noqa: F401
 from research.factors.builtins import short_volume as _short_volume  # noqa: F401
 from research.factors.builtins import size as _size  # noqa: F401
+from research.factors.builtins import ta_combo as _ta_combo  # noqa: F401
 from research.factors.builtins import ta_zoo as _ta_zoo  # noqa: F401
 from research.factors.protocol import Factor, FactorContext, get, list_factors
 from research.progress import Progress
