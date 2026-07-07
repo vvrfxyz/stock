@@ -42,10 +42,14 @@ class ReversalEnsembleFactor:
         ]
         ranks = [m.rank(axis=1, pct=True) for m in members]
         stacked = np.stack([r.to_numpy() for r in ranks])
-        out = pd.DataFrame(np.nanmean(stacked, axis=0), index=ctx.dates,
-                           columns=ctx.security_universe)
-        all_valid = ~np.isnan(stacked)
-        return out.where(pd.DataFrame(all_valid.all(axis=0), index=ctx.dates,
+        # 显式掩码代替 np.nanmean：全 NaN 切片先判空再算，避免"Mean of empty
+        # slice" RuntimeWarning（不吞 warning 军规）；NaN 结果语义不变。
+        valid = ~np.isnan(stacked)
+        cnt = valid.sum(axis=0)
+        with np.errstate(invalid="ignore"):
+            mean = np.where(valid, stacked, 0.0).sum(axis=0) / np.where(cnt == 0, np.nan, cnt)
+        out = pd.DataFrame(mean, index=ctx.dates, columns=ctx.security_universe)
+        return out.where(pd.DataFrame(valid.all(axis=0), index=ctx.dates,
                                       columns=ctx.security_universe))
 
 
