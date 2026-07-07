@@ -37,6 +37,33 @@ def test_overview_counts_trials_and_params():
     assert out.loc["size", "params"] == 2
     assert out.loc["low_vol", "trials"] == 1
     assert list(out.index) == ["size", "low_vol"]  # 按 trial 数降序
+    # bonf_z 随分母动态：m=1 -> 1.96，m=2 -> 2.24
+    assert out.loc["low_vol", "bonf_z"] == pytest.approx(1.96)
+    assert out.loc["size", "bonf_z"] == pytest.approx(2.24)
+
+
+def test_bonferroni_z_dynamic_threshold():
+    # 双侧：m=1 就是普通 1.96；分母越大阈值越高
+    assert trials_cli.bonferroni_z(1) == pytest.approx(1.959964, abs=1e-5)
+    assert trials_cli.bonferroni_z(2) == pytest.approx(2.241403, abs=1e-5)
+    assert trials_cli.bonferroni_z(20) > trials_cli.bonferroni_z(2)
+    with pytest.raises(ValueError):
+        trials_cli.bonferroni_z(0)
+
+
+def test_unreachable_git_shas_real_repo():
+    import subprocess
+
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=trials_cli.DEFAULT_TRIALS_PATH.parents[2],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    df = pd.DataFrame({"code_git_sha": [head, "f" * 40, None]})
+    missing = trials_cli.unreachable_git_shas(df)
+    assert head not in missing          # 本机可达的 sha 不报
+    assert "f" * 40 in missing          # 伪 sha 报为不可达
+    # 无 code_git_sha 列（如老账/合成数据）静默返回空
+    assert trials_cli.unreachable_git_shas(pd.DataFrame({"x": [1]})) == []
 
 
 def test_factor_report_best_t_and_denominator():
@@ -63,7 +90,17 @@ def test_main_report_factor(monkeypatch, capsys):
     assert trials_cli.main(["report", "--factor", "size"]) == 0
     out = capsys.readouterr().out
     assert "Bonferroni 分母）: 2" in out
+    assert "双侧 Bonferroni z 阈值（alpha=0.05, m=2）: 2.24" in out
     assert "逐 horizon 最佳" in out
+
+
+def test_main_warns_on_unreachable_shas(monkeypatch, capsys):
+    monkeypatch.setattr(trials_cli, "load_trials", lambda path: _synthetic_trials())
+    monkeypatch.setattr(trials_cli, "unreachable_git_shas", lambda trials: ["e" * 40])
+    assert trials_cli.main(["report"]) == 0
+    out = capsys.readouterr().out
+    assert "可能存在异地台账" in out
+    assert "e" * 12 in out
 
 
 def test_main_unknown_factor_lists_known(monkeypatch, capsys):

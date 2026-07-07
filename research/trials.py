@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 from pathlib import Path
 
 import pandas as pd
@@ -21,6 +22,62 @@ from research._trials_store import load_trials
 # 与 evaluate.py 的写侧同锚（__file__ 绝对路径）：cwd 相对路径会在错目录下
 # 把有账报成"无 trial 记录"——假空账比报错更危险（审查确认，2026-07-07）。
 DEFAULT_TRIALS_PATH = Path(__file__).resolve().parent / "output" / "trials.parquet"
+
+
+def bonferroni_z(m: int, alpha: float = 0.05) -> float:
+    """双侧 Bonferroni z 阈值：m 个 trial 分摊 alpha 后的单尾分位。
+
+    以前"除以分母再看 2.9"是钉在人脑里的经验数；这里改成由当前分母动态
+    推导——z = Phi^{-1}(1 - alpha/2/m)。scipy 缺席时退回标准库 NormalDist
+    （同一分布，无精度损失）。
+    """
+    if m < 1:
+        raise ValueError(f"Bonferroni 分母必须 >= 1，得到 {m}")
+    p = 1 - alpha / 2 / m
+    try:
+        from scipy.stats import norm
+
+        return float(norm.ppf(p))
+    except ImportError:
+        from statistics import NormalDist
+
+        return float(NormalDist().inv_cdf(p))
+
+
+def unreachable_git_shas(trials: pd.DataFrame) -> list[str]:
+    """台账里本机 git 不可达的 code_git_sha（异地台账线索）。
+
+    trials.parquet 可能在多台机器（本地 Mac / 253）各自积账；如果某 trial 的
+    code_git_sha 在当前仓库 `git cat-file -e` 查不到，多半是别处跑的评估——
+    Bonferroni 分母可能被低估。git 本身不可用/不在仓库时静默返回空（不阻塞、
+    不误报——此时"查不到"不构成异地证据）。
+    """
+    if "code_git_sha" not in trials.columns:
+        return []
+    shas = sorted({s for s in trials["code_git_sha"].dropna().astype(str) if s})
+    if not shas:
+        return []
+    root = Path(__file__).resolve().parents[1]
+    try:
+        probe = subprocess.run(
+            ["git", "rev-parse", "--git-dir"], cwd=root, timeout=2, check=False, capture_output=True
+        )
+        if probe.returncode != 0:
+            return []
+        missing = []
+        for sha in shas:
+            check = subprocess.run(
+                ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+                cwd=root,
+                timeout=2,
+                check=False,
+                capture_output=True,
+            )
+            if check.returncode != 0:
+                missing.append(sha)
+        return missing
+    except Exception:
+        return []
 
 
 def overview(trials: pd.DataFrame) -> pd.DataFrame:
@@ -37,6 +94,7 @@ def overview(trials: pd.DataFrame) -> pd.DataFrame:
             "last_run": grouped["_created"].max().dt.date,
         }
     )
+    out["bonf_z"] = out["trials"].map(lambda m: round(bonferroni_z(int(m)), 2))
     return out.sort_values("trials", ascending=False)
 
 
@@ -101,16 +159,26 @@ def main(argv: list[str] | None = None) -> int:
             print(f"因子 {args.factor!r} 无 trial；已有: {known}")
             return 1
         n_trials, n_params = len(per_trial), per_trial["params_hash"].nunique()
+        z_thresh = bonferroni_z(n_trials)
         print(f"== {args.factor} 查账 ==")
-        print(f"trial 数（多重检验/Bonferroni 分母）: {n_trials}；参数口径 {n_params} 种\n")
+        print(f"trial 数（多重检验/Bonferroni 分母）: {n_trials}；参数口径 {n_params} 种")
+        print(f"双侧 Bonferroni z 阈值（alpha=0.05, m={n_trials}）: {z_thresh:.2f}\n")
         print("-- 逐 trial（时间序）--")
         print(per_trial.to_string())
         if not by_horizon.empty:
-            print("\n-- 逐 horizon 最佳 |ic_nw_t|（* 记得除以上面的分母再看显著性）--")
+            print(f"\n-- 逐 horizon 最佳 |ic_nw_t|（* |t| 须过上面的阈值 {z_thresh:.2f} 才算显著）--")
             print(by_horizon.to_string())
     else:
         print(f"== trials 概览（{args.trials_path}）==")
         print(overview(trials).to_string())
+        print("\n* bonf_z = 该因子分母下的双侧 Bonferroni z 阈值（alpha=0.05）")
+    missing_shas = unreachable_git_shas(trials)
+    if missing_shas:
+        preview = ", ".join(s[:12] for s in missing_shas[:5])
+        print(
+            f"\n⚠ 可能存在异地台账：{len(missing_shas)} 个 code_git_sha 在本机 git 不可达"
+            f"（{preview}{'…' if len(missing_shas) > 5 else ''}）——Bonferroni 分母可能被低估"
+        )
     return 0
 
 
