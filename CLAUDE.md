@@ -185,6 +185,7 @@ python -m pytest tests/ -q -m "not integration"  # 仅纯单元测试
 - **数据安全**：research/ 只读，绝不回写事实表；PIT 边界（filing_date/lag_days）先于
   一切优化；预注册判据写死在脚本 docstring 再跑数（改动留痕），试验全部进 trials.parquet。
 - 慢作业先 profile 定位（`/usr/bin/sample <pid>`）再改，禁止盲目重跑。
+- **研究/评估作业一律在 253 上跑**（owner 指令 2026-07-07）：跨网冷拉 GB 级面板在 I/O 争抢下 10-15 分钟，本地 socket 几十秒。Mac 只写码/提交，跑数走 `ssh home-debian`（253 的 `.env` DATABASE_URL 即本地库）。
 
 ## Sub-repo / Explore / Team safety rule
 
