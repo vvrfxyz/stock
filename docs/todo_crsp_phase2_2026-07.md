@@ -383,3 +383,33 @@ trials.parquet 台账同步。h=21 汇总（Rank IC / Newey-West t / 多空净 S
 - 短窗口三个 short 因子按数据下限跑 2024-05-14 起（对照一期裁决，全维持）。
 - 性能（perf 改造后实测）：9 因子战役全程约 2 小时 15 分（32GB Mac，面板缓存
   命中后单因子边际 ~15-20 分钟）；长表 COPY 只拉 close/volume 两列。
+
+### 杂项裁决订正：short_interest 缝合切换挂起（2026-07-07 上午）
+
+杂项条目"`research/short_interest.py` 切换到缝合股本流（short_interest_ratio
+历史随之延长到 2009+）"的前提**不成立**：`short_interests` 分子数据本身
+2024-05-15 起（FINRA 接入时点，生产实测 min(settlement_date)），分母股本缝到
+2009 也没有分子可除。切换只影响现有 2024-05+ 窗口内少数缺 vendor 股本的证券，
+而实现须完整移植 stale_after/split 前滚语义（fundamentals 调研报告 §7 的风险
+警告）——收益/风险比不成立，**挂起**；若未来回填 FINRA 历史空头数据再启。
+
+### 任务 D 收尾 + B3 落地（2026-07-07 上午）
+
+- **cik_ambiguous 475 → 462**（commit 40d756f，已 --apply 于 253）：companies 就位后
+  同族收窄双硬条件（链尾唯一持有者 + 全链 live history 佐证）裁决 30 组，
+  +74 RENAME 事件（36 HIGH + 38 MEDIUM）+205 tenure，覆盖 68.1%→**72.1%**。
+  残组诚实分解：421 single_ticker（优先股票据噪声，正确拒绝）+ 8 tail_not_unique
+  + 33 chain_uncorroborated——**此清单就此收案**，剩余是设计内不可裁。
+- **tail_mismatch 200→207**：全量清单已由新 --dump-buckets 旗标导出
+  （/tmp/tail_mismatch_symbols.txt，已复制到 253:/tmp）；等每日调度让开后
+  `update_massive_events $(cat /tmp/tail_mismatch_symbols.txt) --force` 刷新
+  live 再重考据（见执行日志）。
+- **B3 company_events**（commit e03b54f，migration b3c4d5e6f7a8 已 upgrade 于 253）：
+  世系边表 + 播种脚本。dry-run 计划：Alphabet 2015 CIK_CHANGE 1 边（老 Google
+  CIK 补建 companies 行）+ 并购边 29 条（r4 表的 acquirer_security token 解析，
+  33 候选中 2 无 successor company、2 重复去重）。r5 重建完成后 --apply。
+- **OHLC 探针**（commit aeafe0a）：全史七类不变量 ratchet 探针进 check_data_integrity，
+  基线 0（repair_ohlc_violations 与 NVDA 脏 high 均已被 c08f968 窗口订正，
+  生产实测零违规——杂项条目'706 行'系订正前旧数，就此收案）。
+- **short_interest 缝合切换**：裁决为挂起（分子 FINRA 数据 2024-05 起，缝分母
+  无意义），见上节订正。
