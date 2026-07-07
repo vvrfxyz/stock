@@ -77,6 +77,30 @@ ssh home-debian "tail -50 /home/wenruifeng/projects/stock/logs/cron_daily_run.lo
 `scheduled_update` 现在会隔离单步失败、继续后续步骤，并在有失败时以非 0 退出——
 `journalctl` 里 service 失败即代表当天至少一步出错，去 `logs/` 下对应脚本日志定位。
 
+## 研究长任务标准发射器（run_research.sh，2026-07-07）
+
+研究/回填长任务不再裸 `nohup`，一律走 `scripts/run_research.sh`：
+
+```bash
+# 253 上，wenruifeng 身份
+scripts/run_research.sh ta-zoo -- .venv/bin/python -m research.evaluate --factors size --start 2016-01-04
+journalctl --user -u research-ta-zoo -f          # 跟进度（Progress 行全在这）
+systemctl --user show research-ta-zoo -p Result  # 死因：oom-kill / exit-code / signal
+```
+
+要点：固定 unit 名（日志不再靠 `ls -t logs/` 猜）、`MemoryHigh=5G`/`MemoryMax=7G`
+护住 11G 机器（可用 `RESEARCH_MEMORY_HIGH/MAX` 环境变量覆盖）、失败经
+`stock-research-notify@` 走既有 `notify_failure.sh`（logs/failures.log + 可选 webhook）。
+
+一次性准备（每台机器一次）：
+
+```bash
+sudo loginctl enable-linger wenruifeng    # user manager 不随 ssh 会话退出，OnFailure 才发得出
+mkdir -p ~/.config/systemd/user
+cp deploy/systemd/user/stock-research-notify@.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+```
+
 ## 已知环境差异
 
 - 远端 venv 没有 pytest；测试只在本地跑（600+ 用例，2026-07 时点 634 个）。

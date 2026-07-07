@@ -189,7 +189,7 @@ python -m pytest tests/ -q -m "not integration"  # 仅纯单元测试
   一切优化；预注册判据写死在脚本 docstring 再跑数（改动留痕），试验全部进 trials.parquet。
 - 慢作业先 profile 定位（`/usr/bin/sample <pid>`）再改，禁止盲目重跑。
 - **研究/评估作业一律在 253 上跑**（owner 指令 2026-07-07）：跨网冷拉 GB 级面板在 I/O 争抢下 10-15 分钟，本地 socket 几十秒。Mac 只写码/提交，跑数走 `ssh home-debian`（253 的 `.env` DATABASE_URL 即本地库）。
-- **评测/研究脚本必须带进度**（owner 指令 2026-07-07）：统一走 `research/progress.Progress`（逐步耗时 + RSS 内存，stderr 逐行 flush，tail -f 可读）——evaluate 主循环已内置，新脚本照抄；OOM 风险要在日志里看得见（253 峰值 6G 即危险区，长任务用 `systemd-run --uid=wenruifeng -p MemoryMax=7G` 拉起，nohup/setsid 会被会话清理击杀）。
+- **评测/研究脚本必须带进度**（owner 指令 2026-07-07）：统一走 `research/progress.Progress`（逐步耗时 + RSS 双读数 now/peak + ⚠MEM 水位 + FAILED 带异常 + done() top3 耗时，stderr 逐行 flush，tail -f 可读）——evaluate/price_cache/load_adjusted_panel/run_baselines/retail_reality 已内置，新脚本抄 progress.py 顶部模板；扩展前先读 docstring 的"非目标"清单。OOM 风险要在日志里看得见（253 峰值 6G 即危险区）；研究长任务一律 `scripts/run_research.sh <tag> -- <cmd>` 拉起（systemd-run 固定 unit 名 + MemoryMax=7G + OnFailure 通知，见 docs/deployment.md；nohup/setsid 会被会话清理击杀）。evaluate 断点续跑：`--skip-existing`（trial 全指纹命中即跳过 compute）。开研前查账：`python -m research.trials report --factor <name>`（Bonferroni 分母机器化）。批处理侧：`run_concurrently` 非 TTY 下自带 30s 节流进度行（吞吐/ETA/rss/rate-wait 配额占比）。
 
 ## Sub-repo / Explore / Team safety rule
 

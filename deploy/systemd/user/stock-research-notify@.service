@@ -1,0 +1,7 @@
+[Unit]
+Description=Notify failure of research job %i (user manager)
+
+[Service]
+Type=oneshot
+Environment=STOCK_REPO_DIR=/home/wenruifeng/projects/stock
+ExecStart=/home/wenruifeng/projects/stock/scripts/notify_failure.sh %i --user
