@@ -26,8 +26,11 @@ from utils.script_logging import setup_logging as configure_script_logging
 
 # FRED H.10 汇率系列注册表：series_id -> (base_currency, quote_currency)。
 # DEXTAUS 口径为 1 USD = rate TWD；行按 vendor 口径原样存，绝不在写入侧取倒数。
+# DEXISUS：1 USD = rate ILS，1970 年代起——ECB 的 EUR->ILS 序列 2011-01-03 才开始，
+# 2007-2009 的以色列跨上市分红（ITRN/CEL）靠此序列折算。
 FRED_FX_SERIES: dict[str, tuple[str, str]] = {
     "DEXTAUS": ("USD", "TWD"),
+    "DEXISUS": ("USD", "ILS"),
 }
 
 

@@ -17,6 +17,14 @@ from data_models.models import FxRate
 DEFAULT_MAX_STALENESS_DAYS = 7
 DEFAULT_FALLBACK_SOURCE = "FRED"
 
+# 硬锚定币种白名单：对 USD 长期 1:1 锚定、且 ECB/FRED 均无序列的货币。
+# BMD（百慕大元）自 1972 年起 1:1 锚定 USD；库内自证：NTB 分红 2019-08 前标 BMD、
+# 2019-11 起标 USD，换标前后金额同为 0.44（vendor 只改标签、从未换算）。
+# 只放"绝无浮动"的硬锚定；软钉住（如 HKD 区间盯住）不进此表。
+USD_PEGGED_CURRENCIES: dict[str, Decimal] = {
+    "BMD": Decimal("1"),
+}
+
 
 class UsdFxConverter:
     """按需加载单序列并缓存；线程不安全，单脚本进程内使用。"""
@@ -40,6 +48,9 @@ class UsdFxConverter:
         currency = (currency or "").upper()
         if currency == "USD":
             return Decimal("1")
+        pegged = USD_PEGGED_CURRENCIES.get(currency)
+        if pegged is not None:
+            return pegged
         rate = self._ecb_cross_rate(currency, on_date)
         if rate is not None:
             return rate

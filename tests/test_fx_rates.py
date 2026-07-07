@@ -290,3 +290,32 @@ class TestUsdFxConverterDirectUsdFallback:
         )
         fx = UsdFxConverter(_FxDbManager(build_fred_fx_rows("DEXTAUS", observations)))
         assert abs(Decimal("1000") * fx.rate_to_usd("TWD", D) - Decimal("30.7692307692")) < Decimal("1e-6")
+
+
+class TestUsdPeggedCurrencies:
+    def test_bmd_pegged_one_to_one_without_any_rate_rows(self):
+        # BMD 硬锚定 1:1：无任何 fx_rates 行也返回 1（NTB 百慕大分红场景）
+        fx = UsdFxConverter(_FxDbManager([]))
+        assert fx.rate_to_usd("BMD", D) == Decimal("1")
+        assert fx.rate_to_usd("bmd", date(2016, 11, 1)) == Decimal("1")  # 大小写/任意历史日期
+
+    def test_peg_does_not_shadow_floating_currencies(self):
+        # 白名单只含硬锚定；浮动币种仍走 ECB/FRED 路径
+        fx = UsdFxConverter(_FxDbManager(ECB_ROWS))
+        assert fx.rate_to_usd("CAD", D) == Decimal("1.10") / Decimal("1.60")
+        assert fx.rate_to_usd("ILS", D) is None  # 无 ILS 行时不假装有率
+
+
+class TestFredIlsSeries:
+    def test_dexisus_maps_to_usd_base_ils_quote(self):
+        # DEXISUS 口径：1 USD = rate ILS；写入原样存，读取取倒数（同 DEXTAUS 方向锁定）
+        observations = parse_fred_observations(
+            {"observations": [{"date": "2026-06-11", "value": "3.65"}]}, series_id="DEXISUS",
+        )
+        rows = build_fred_fx_rows("DEXISUS", observations)
+        assert rows[0]["base_currency"] == "USD" and rows[0]["quote_currency"] == "ILS"
+        fx = UsdFxConverter(_FxDbManager(rows))
+        # 0.86 ILS（ITRN 2007 分红量级）应折 ~0.2356 USD，而不是 3.14 USD
+        usd = Decimal("0.86") * fx.rate_to_usd("ILS", D)
+        assert abs(usd - Decimal("0.86") / Decimal("3.65")) < Decimal("1e-15")
+        assert usd < Decimal("0.3")
