@@ -167,6 +167,25 @@ python -m pytest tests/ -q -m "not integration"  # 仅纯单元测试
 - `update_massive_*` scripts build on `utils/massive_task.py` (`run_massive_task` + `select_us_securities` + `run_concurrently`); keep per-script code to parser extras, selection filters, and `process_*` logic.
 - Multi-row `pg_insert().values()` requires homogeneous dict keys; group heterogeneous rows with `_group_rows_by_key_set` (see `upsert_securities_by_symbol`).
 
+### 研究/回测代码：只写高性能、安全的算法（owner 指令，2026-07-07）
+
+- **禁止逐日/逐证券 Python 循环做面板计算**。横截面统计用向量化矩阵运算（rolling/
+  一次 rank + numpy 视图/掩码代数），复用现成机器：`evaluate._masked_rowwise_corr`、
+  `_quantile_weight_matrices`、`backtest._derived_from_prices`。逐行循环只允许出现在
+  稀疏事件（如 insider 事件条）或 ~百量级再平衡行上。
+- **面板装载只走 COPY + 进程内共享缓存**，绝不重复拉同一面板：因子层用
+  `research/factors/price_cache.py`（v2：长表一次 COPY、逐列一次 pivot、buffer 量化
+  {200,420} 档跨因子共享——v1 曾因缓存键含精确起始日被 8 因子各拉 8 遍，引以为戒）；
+  评估层用 `data.load_adjusted_panel`（容量 2 记忆化）。read_sql 在 30M 行量级慢 5-10 倍，禁用。
+- **性能改动必须带等价性金测试**（新旧实现在含 NaN/并列/停牌/退市尾巴的合成面板上
+  1e-12 一致，参照 `tests/test_evaluate_fast_equivalence.py`），速度绝不以数字漂移换。
+- **数值安全**：病理值置 NaN 剔除排名，绝不 clip 成极值信号（residual_vol 曾把负残差
+  方差 clip(0) 排进最强分位——教训）；零方差/零量/零区间一律 NaN；除法全部走
+  `np.errstate` + 显式掩码，不吞 warning。
+- **数据安全**：research/ 只读，绝不回写事实表；PIT 边界（filing_date/lag_days）先于
+  一切优化；预注册判据写死在脚本 docstring 再跑数（改动留痕），试验全部进 trials.parquet。
+- 慢作业先 profile 定位（`/usr/bin/sample <pid>`）再改，禁止盲目重跑。
+
 ## Sub-repo / Explore / Team safety rule
 
 当当前 cwd 不在 git 仓库内，或准备使用 Explore、Agent、team /task 工作流时，必须先校验运行前提，禁止在已知前提不满足时重复重试。
