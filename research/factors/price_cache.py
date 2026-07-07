@@ -1,12 +1,19 @@
-"""因子层共享价格面板缓存 + COPY 高速装载。
+"""因子层共享价格面板缓存（COPY 高速装载 + 进程内记忆化）。
 
-解决两个性能问题（2026-07-06 wave-1 评估实测痛点）：
-1. 多个日线因子各自 compute() 里独立拉同一份价格面板——进程内按
-   (url, start, end, universe 指纹) 记忆化，一次装载全族复用；
-2. pd.read_sql 逐行物化慢——走 PostgreSQL COPY csv 通道直接喂 pandas C 解析器，
-   31M 行量级实测 5-10 倍于 read_sql。
+2026-07-07 性能重写（v2）：v1 的缓存键含精确起始日，而各因子 buffer_days
+不同（70/90/.../400），8 个 TA 因子各自脱靶——同一份 30M 行 OHLCV 拉了 8 遍、
+每遍再 pivot_table 5 列（groupby 聚合是 30M 行量级的纯开销）。v2 三刀：
 
-只读缓存，进程结束即失；evaluate 单进程单窗口的使用模式下内存占用 = 一份面板。
+1. **长表只装一次**：全列（o/h/l/c/v/vwap）一次 COPY，键=量化后窗口+宇宙指纹。
+2. **宽表按列缓存**：每列只 pivot 一次（走 PK 无重复的快速 `pivot`，重复键才
+   回退 pivot_table，同 data.to_wide 语义），后续调用零成本返回同一 DataFrame
+   对象——消费方约定只读（reindex/where 都产生新对象，天然安全）。
+3. **buffer 量化**：buffer_days 上取整到 {200, 420} 档，不同因子共享缓存条目。
+   多出的历史对固定窗滚动值无影响（窗口只看最近 w 个观测）；对 ewm（macd）
+   仅改善序列头部的初始化偏差，方向更正确，文档化接受。
+
+内存账：长表 ~30M 行 × 8 列 ≈ 1.9GB + 宽表 ~255MB/列，20 年窗口全列驻留
+约 4GB——单评估进程可承受；超限先 clear_cache()。
 """
 from __future__ import annotations
 
@@ -16,13 +23,24 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-from research.data import apply_adjustment, load_factor_events, to_wide
+from research.data import apply_adjustment, load_factor_events
 
 _PANEL_CACHE: dict[tuple, pd.DataFrame] = {}
 
+BAR_COLUMNS = ("open", "high", "low", "close", "volume", "vwap")
+_BUFFER_TIERS = (200, 420)
+
 
 def _universe_fingerprint(ids: list[int]) -> str:
-    return hashlib.md5(",".join(map(str, sorted(ids))).encode()).hexdigest()[:16]
+    joined = ",".join(str(int(x)) for x in sorted(ids))
+    return hashlib.md5(joined.encode()).hexdigest()
+
+
+def _quantize_buffer(buffer_days: int) -> int:
+    for tier in _BUFFER_TIERS:
+        if buffer_days <= tier:
+            return tier
+    return buffer_days  # 超出档位按原值（罕见调用自担脱靶）
 
 
 def load_price_long_fast(
@@ -62,26 +80,31 @@ def load_price_long_fast(
     return frame
 
 
-def adjusted_close_panel(
-    engine,
-    *,
-    dates: pd.DatetimeIndex,
-    security_ids: list[int],
-    buffer_days: int = 45,
-) -> pd.DataFrame:
-    """复权收盘宽表（含 lookback 预热段），进程内记忆化。"""
-    start = (dates[0] - timedelta(days=buffer_days)).date()
-    end = dates[-1].date()
-    key = ("adj_close", str(engine.url), start, end, _universe_fingerprint(security_ids))
-    if key in _PANEL_CACHE:
-        return _PANEL_CACHE[key]
-    prices = load_price_long_fast(
-        engine, start=start, end=end, columns="close", security_ids=security_ids)
-    events = load_factor_events(engine, as_of=end)
-    prices = apply_adjustment(prices, events, as_of=end)
-    panel = to_wide(prices, "adj_close")
-    _PANEL_CACHE[key] = panel
-    return panel
+def _long_bars(engine, *, start: date, end: date, security_ids: list[int]) -> pd.DataFrame:
+    key = ("long_bars", str(engine.url), start, end, _universe_fingerprint(security_ids))
+    if key not in _PANEL_CACHE:
+        _PANEL_CACHE[key] = load_price_long_fast(
+            engine, start=start, end=end,
+            columns=", ".join(BAR_COLUMNS), security_ids=security_ids)
+    return _PANEL_CACHE[key]
+
+
+def _wide_bar(engine, *, start: date, end: date, security_ids: list[int], column: str) -> pd.DataFrame:
+    key = ("wide", str(engine.url), start, end, _universe_fingerprint(security_ids), column)
+    if key not in _PANEL_CACHE:
+        frame = _long_bars(engine, start=start, end=end, security_ids=security_ids)
+        try:
+            wide = frame.pivot(index="date", columns="security_id", values=column)
+        except ValueError:  # 重复键理论上不发生（PK），保底旧语义
+            wide = frame.pivot_table(index="date", columns="security_id",
+                                     values=column, aggfunc="last")
+        _PANEL_CACHE[key] = wide
+    return _PANEL_CACHE[key]
+
+
+def _window(dates: pd.DatetimeIndex, buffer_days: int) -> tuple[date, date]:
+    quantized = _quantize_buffer(buffer_days)
+    return (dates[0] - timedelta(days=quantized)).date(), dates[-1].date()
 
 
 def raw_bar_panels(
@@ -92,20 +115,35 @@ def raw_bar_panels(
     columns: tuple[str, ...],
     buffer_days: int = 45,
 ) -> dict[str, pd.DataFrame]:
-    """原始日线多列宽表（open/high/low/close/vwap/...），一次装载多列复用，记忆化。"""
-    start = (dates[0] - timedelta(days=buffer_days)).date()
-    end = dates[-1].date()
-    key = ("raw_bars", str(engine.url), start, end, _universe_fingerprint(security_ids))
-    if key not in _PANEL_CACHE:
-        frame = load_price_long_fast(
-            engine, start=start, end=end,
-            columns="open, high, low, close, volume, vwap",
-            security_ids=security_ids)
-        _PANEL_CACHE[key] = frame
-    frame = _PANEL_CACHE[key]
-    return {col: frame.pivot_table(index="date", columns="security_id",
-                                   values=col, aggfunc="last")
+    """原始日线多列宽表；长表单次装载 + 逐列单次 pivot，跨因子全命中。"""
+    start, end = _window(dates, buffer_days)
+    return {col: _wide_bar(engine, start=start, end=end,
+                           security_ids=security_ids, column=col)
             for col in columns}
+
+
+def adjusted_close_panel(
+    engine,
+    *,
+    dates: pd.DatetimeIndex,
+    security_ids: list[int],
+    buffer_days: int = 45,
+) -> pd.DataFrame:
+    """复权收盘宽表（含 lookback 预热段），从共享长表派生，进程内记忆化。"""
+    start, end = _window(dates, buffer_days)
+    key = ("adj_close", str(engine.url), start, end, _universe_fingerprint(security_ids))
+    if key not in _PANEL_CACHE:
+        frame = _long_bars(engine, start=start, end=end, security_ids=security_ids)
+        prices = frame[["security_id", "date", "close"]].copy()
+        events = load_factor_events(engine, as_of=end)
+        prices = apply_adjustment(prices, events, as_of=end)
+        try:
+            wide = prices.pivot(index="date", columns="security_id", values="adj_close")
+        except ValueError:
+            wide = prices.pivot_table(index="date", columns="security_id",
+                                      values="adj_close", aggfunc="last")
+        _PANEL_CACHE[key] = wide
+    return _PANEL_CACHE[key]
 
 
 def clear_cache() -> None:
