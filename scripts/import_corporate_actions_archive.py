@@ -69,6 +69,10 @@ E-id 行（分红金额+币种精确相等；拆股 to/from 比例 rtol 1e-6）�
 故绕过任期归属与这两类隔离；导入前仍校验归档行 ticker（大小写不敏感）与 ex_date
 和 allowlist 一致，不一致跳过并计数（allowlist_mismatch）。其余防线全部保留：
 R7/R9/R10 重复检测、窗口/cutoff 上界、R13 值冲突挂起、结构性只插入。
+round-2 扩展（2026-07-08）：allowlist 显式点名的 event_id 还可穿越两类隔离——
+R3 spinoff 伪拆股（非 E 前缀，落库强制 adjustment_type='spinoff_pseudo_split'，
+价格因子链消费分拆因子、research/market_cap 股本前滚按标记同日抑制）与 R10 冲突组
+（只放行点名成员，其余照旧隔离；同组点名矛盾比例直接报错）。未点名的行行为不变。
 allowlist 模式绝不组合 --retire-synthetic（直接拒绝），也绝不触碰 allowlist 之外的行。
 三份报告（隔离汇总/隔离明细/值冲突）改道写 `*_allowlist.tsv`——allowlist 模式绕过
 resolve_events，报告只含残缺子集，绝不可覆盖全量导入产出的裁决输入工件。
@@ -211,8 +215,14 @@ def load_dividend_rows(path: Path, stats: Counter) -> list[dict]:
     return rows
 
 
-def load_split_rows(path: Path, stats: Counter, quarantine: Counter, detail: list[dict]) -> list[dict]:
-    """parquet -> 规范化拆股行。R3：非 E 前缀 id 是 spinoff 伪拆分，整体隔离。"""
+def load_split_rows(path: Path, stats: Counter, quarantine: Counter, detail: list[dict],
+                    allowlist_ids: set[str] | None = None) -> list[dict]:
+    """parquet -> 规范化拆股行。R3：非 E 前缀 id 是 spinoff 伪拆分，整体隔离。
+
+    allowlist 模式例外（2026-07 round-2 裁决）：allowlist 显式点名的非 E 行放行，
+    落库强制打 adjustment_type='spinoff_pseudo_split' 标记——价格因子链正确消费
+    分拆因子，research/market_cap.load_split_events 按该标记做股本前滚同日抑制
+    （伪拆股不是股份数变动）。未点名的非 E 行照旧整体隔离。"""
     import pandas as pd
 
     frame = pd.read_parquet(path, columns=[
@@ -230,6 +240,17 @@ def load_split_rows(path: Path, stats: Counter, quarantine: Counter, detail: lis
             continue
         ticker = _to_str(rec.ticker) or ""
         if not event_id.startswith("E"):
+            if allowlist_ids is not None and event_id in allowlist_ids:
+                stats["split_spinoff_recovered_by_allowlist"] += 1
+                rows.append({
+                    "id": event_id,
+                    "ticker": ticker,
+                    "ex_date": ex_date,
+                    "split_from": split_from,
+                    "split_to": split_to,
+                    "adjustment_type": "spinoff_pseudo_split",
+                })
+                continue
             row = {"id": event_id, "ticker": ticker or "?", "ex_date": ex_date,
                    "split_from": split_from, "split_to": split_to}
             quarantine[(row["ticker"], "spinoff_pseudo_split")] += 1
@@ -269,15 +290,34 @@ def dedupe_dividends(rows: list[dict], existing_ids: set[str], stats: Counter) -
 
 
 def sift_splits(rows: list[dict], existing_ids: set[str], stats: Counter,
-                quarantine: Counter, detail: list[dict]) -> list[dict]:
-    """R9 精确重复保留一行；R10 同 (ticker, 日) 比例矛盾全组隔离；R11 极端比例只示警。"""
+                quarantine: Counter, detail: list[dict],
+                allowlist_ids: set[str] | None = None) -> list[dict]:
+    """R9 精确重复保留一行；R10 同 (ticker, 日) 比例矛盾全组隔离；R11 极端比例只示警。
+
+    allowlist 模式例外（2026-07 round-2 裁决）：冲突组内被 allowlist 显式点名的成员
+    放行（裁决已用价格证据定出哪个比例为真），组内其余成员照旧隔离；同组点名了两个
+    矛盾比例直接报错——多归属歧义必须回裁决层解决，绝不在导入层猜。"""
     groups: dict[tuple, list[dict]] = defaultdict(list)
     for row in rows:
         groups[(row["ticker"], row["ex_date"])].append(row)
     kept = []
-    for (ticker, _), group in groups.items():
+    for (ticker, ex_date), group in groups.items():
         ratios = {(_fmt(r["split_from"]), _fmt(r["split_to"])) for r in group}
         if len(ratios) > 1:
+            chosen = [r for r in group if allowlist_ids is not None and r["id"] in allowlist_ids]
+            chosen_ratios = {(_fmt(r["split_from"]), _fmt(r["split_to"])) for r in chosen}
+            if len(chosen_ratios) > 1:
+                raise ValueError(
+                    f"allowlist 在冲突组 ({ticker}, {ex_date}) 点名了矛盾比例，回裁决层解决。")
+            if chosen:
+                row = _keep_rule(chosen, existing_ids)
+                others = [r for r in group if r["id"] != row["id"]]
+                quarantine[(ticker, "conflicting_split")] += len(others)
+                detail.extend(_detail_record(r, "split", "conflicting_split") for r in others)
+                stats["split_conflicting_quarantined"] += len(others)
+                stats["split_conflicting_recovered_by_allowlist"] += 1
+                kept.append(row)
+                continue
             quarantine[(ticker, "conflicting_split")] += len(group)
             detail.extend(_detail_record(r, "split", "conflicting_split") for r in group)
             stats["split_conflicting_quarantined"] += len(group)
@@ -739,7 +779,9 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("prod 既有 vendor 事件：{} 个 (security, id) 对。", len(existing_pairs))
 
         dividends_raw = load_dividend_rows(dividends_path, stats)
-        splits_raw = load_split_rows(splits_path, stats, quarantine, detail)
+        allowlist_ids = set(allowlist) if allowlist is not None else None
+        splits_raw = load_split_rows(splits_path, stats, quarantine, detail,
+                                     allowlist_ids=allowlist_ids)
         input_counts = {"dividend": len(dividends_raw), "split": len(splits_raw)}
 
         tenures = load_tenures(db_manager)
@@ -753,7 +795,8 @@ def main(argv: list[str] | None = None) -> int:
             dedupe_dividends(dividends_raw, existing_ids, stats),
             min_date, cutoff, stats, "dividend", detail, ticker_cutoffs)
         splits = _window_filter(
-            sift_splits(splits_raw, existing_ids, stats, quarantine, detail),
+            sift_splits(splits_raw, existing_ids, stats, quarantine, detail,
+                        allowlist_ids=allowlist_ids),
             min_date, cutoff, stats, "split", detail, ticker_cutoffs)
         logger.info("窗口 [{}, {}) 内待归属：分红 {} 条、拆股 {} 条。",
                     min_date, cutoff or "∞", len(dividends), len(splits))

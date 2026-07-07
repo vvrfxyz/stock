@@ -104,18 +104,31 @@ def load_split_events(
     """加载 corporate_actions 的 SPLIT 事件（ex_date 提前公告，作 PIT 可见日安全）。
 
     distinct 按经济键去重：同一拆股的合成/vendor 双 ID 替身只保留一行。
+
+    spinoff 伪拆股（adjustment_type='spinoff_pseudo_split'，2026-07 allowlist 恢复导入的
+    归档 P 前缀行）是分拆日的价格调整因子，不是股份数变动——股本前滚绝不消费。
+    按 (security_id, ex_date) 整日抑制：同日的无标记替身（POLYGON legacy 合成行）一并
+    压掉，防止 distinct 去重后标记丢失。代价是"真实拆股与分拆伪因子同日"会被一并抑制
+    （vendor 通常把两者折进一个复合因子，同日双行未见实例；出现时股本靠下一次 XBRL
+    申报自愈）。
     """
     if security_ids is not None and not security_ids:
         return _empty_split_events()
     sql = text(
         """
-        select distinct security_id, ex_date,
-               split_from::float8 as split_from, split_to::float8 as split_to
-        from corporate_actions
-        where action_type = 'SPLIT'
-          and split_from is not null and split_from > 0
-          and split_to is not null and split_to > 0
-          and (:security_ids is null or security_id = any(:security_ids))
+        select distinct ca.security_id, ca.ex_date,
+               ca.split_from::float8 as split_from, ca.split_to::float8 as split_to
+        from corporate_actions ca
+        where ca.action_type = 'SPLIT'
+          and ca.split_from is not null and ca.split_from > 0
+          and ca.split_to is not null and ca.split_to > 0
+          and not exists (
+              select 1 from corporate_actions m
+              where m.security_id = ca.security_id
+                and m.action_type = 'SPLIT'
+                and m.ex_date = ca.ex_date
+                and m.adjustment_type = 'spinoff_pseudo_split')
+          and (:security_ids is null or ca.security_id = any(:security_ids))
         order by security_id, ex_date
         """
     )

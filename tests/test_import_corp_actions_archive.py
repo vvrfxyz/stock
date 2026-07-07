@@ -97,6 +97,40 @@ class TestLoadRows:
         assert stats["split_spinoff_quarantined"] == 1
         assert quarantine[("IBM", "spinoff_pseudo_split")] == 1
 
+    def test_split_loader_recovers_allowlisted_pseudo_split(self, tmp_path):
+        # round-2：allowlist 点名的 P 行放行并强制打伪拆股标记；未点名的照旧隔离
+        frame = pd.DataFrame({
+            "id": ["P1", "P2"],
+            "ticker": ["IBM", "MMM"],
+            "execution_date": ["2021-11-04", "2024-04-01"],
+            "adjustment_type": ["spinoff", None],
+            "split_from": [1000.0, 1000.0],
+            "split_to": [1046.0, 1196.0],
+        })
+        path = tmp_path / "splits.parquet"
+        frame.to_parquet(path)
+        stats, quarantine = Counter(), Counter()
+        detail = []
+        rows = load_split_rows(path, stats, quarantine, detail, allowlist_ids={"P1"})
+        assert [r["id"] for r in rows] == ["P1"]
+        assert rows[0]["adjustment_type"] == "spinoff_pseudo_split"  # vendor 值不透传，强制标记
+        assert stats["split_spinoff_recovered_by_allowlist"] == 1
+        assert stats["split_spinoff_quarantined"] == 1  # P2 未点名照旧隔离
+        assert quarantine[("MMM", "spinoff_pseudo_split")] == 1
+
+    def test_split_loader_without_allowlist_keeps_r3_wholesale(self, tmp_path):
+        # 非 allowlist 模式（allowlist_ids=None）行为位级不变
+        frame = pd.DataFrame({
+            "id": ["P1"], "ticker": ["IBM"], "execution_date": ["2021-11-04"],
+            "adjustment_type": ["spinoff"], "split_from": [1000.0], "split_to": [1046.0],
+        })
+        path = tmp_path / "splits.parquet"
+        frame.to_parquet(path)
+        stats = Counter()
+        rows = load_split_rows(path, stats, Counter(), [], allowlist_ids=None)
+        assert rows == []
+        assert stats["split_spinoff_quarantined"] == 1
+
 
 class TestDedupeDividends:
     def test_exact_duplicates_keep_lex_min_id(self):
@@ -148,6 +182,36 @@ class TestSiftSplits:
         assert kept == []  # R10
         assert stats["split_conflicting_quarantined"] == 2
         assert quarantine[("NYC", "conflicting_split")] == 2
+
+    def test_conflicting_group_allowlisted_member_recovered(self):
+        # round-2：ALEX 2017-11-28 冲突组（1:1.42 纯拆股 vs 1:1.574 含分红复合因子），
+        # 裁决点名 1:1.42——放行点名成员，孪生照旧隔离
+        rows = [_spl("E1", "ALEX", date(2017, 11, 28), "1", "1.42"),
+                _spl("E2", "ALEX", date(2017, 11, 28), "1", "1.5741279154")]
+        stats, quarantine = Counter(), Counter()
+        detail = []
+        kept = sift_splits(rows, set(), stats, quarantine, detail, allowlist_ids={"E1"})
+        assert [r["id"] for r in kept] == ["E1"]
+        assert stats["split_conflicting_recovered_by_allowlist"] == 1
+        assert stats["split_conflicting_quarantined"] == 1  # 只有孪生 E2 被隔离
+        assert quarantine[("ALEX", "conflicting_split")] == 1
+        assert [d["event_id"] for d in detail] == ["E2"]  # 明细只含被隔离的孪生
+
+    def test_conflicting_group_two_allowlisted_ratios_raise(self):
+        # 同组点名两个矛盾比例=裁决层 bug，导入层绝不猜
+        rows = [_spl("E1", "NYC", date(2020, 8, 18), "10", "1"),
+                _spl("E2", "NYC", date(2020, 8, 18), "1", "10")]
+        with pytest.raises(ValueError):
+            sift_splits(rows, set(), Counter(), Counter(), [], allowlist_ids={"E1", "E2"})
+
+    def test_conflicting_group_no_allowlist_unchanged(self):
+        # allowlist 模式下未点名的冲突组行为不变（全组隔离）
+        rows = [_spl("E1", "NYC", date(2020, 8, 18), "10", "1"),
+                _spl("E2", "NYC", date(2020, 8, 18), "1", "10")]
+        stats = Counter()
+        kept = sift_splits(rows, set(), stats, Counter(), [], allowlist_ids={"E9"})
+        assert kept == []
+        assert stats["split_conflicting_quarantined"] == 2
 
     def test_extreme_ratio_flagged_not_dropped(self):
         # R11：真实 OTC 100:1 反向拆分必须保留

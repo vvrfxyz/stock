@@ -85,15 +85,18 @@ def _insert_price(pg_db, security_id, date, close):
         conn.commit()
 
 
-def _insert_split(pg_db, security_id, ex_date, split_from, split_to, source="MASSIVE", source_event_id=None):
+def _insert_split(pg_db, security_id, ex_date, split_from, split_to, source="MASSIVE",
+                  source_event_id=None, adjustment_type=None):
     with pg_db.engine.connect() as conn:
         conn.execute(
             text(
                 """
                 insert into corporate_actions
-                    (security_id, action_type, ex_date, split_from, split_to, source, source_event_id)
+                    (security_id, action_type, ex_date, split_from, split_to, source,
+                     source_event_id, adjustment_type)
                 values
-                    (:security_id, 'SPLIT', :ex_date, :split_from, :split_to, :source, :source_event_id)
+                    (:security_id, 'SPLIT', :ex_date, :split_from, :split_to, :source,
+                     :source_event_id, :adjustment_type)
                 """
             ),
             {
@@ -103,6 +106,7 @@ def _insert_split(pg_db, security_id, ex_date, split_from, split_to, source="MAS
                 "split_to": split_to,
                 "source": source,
                 "source_event_id": source_event_id or f"split:{security_id}:{ex_date}:{source}",
+                "adjustment_type": adjustment_type,
             },
         )
         conn.commit()
@@ -367,6 +371,25 @@ def test_load_split_events_against_real_schema(pg_db):
     assert splits["ex_date"].tolist() == [pd.Timestamp("2025-06-10"), pd.Timestamp("2025-08-01")]
     assert splits["split_from"].tolist() == [1.0, 50.0]
     assert splits["split_to"].tolist() == [10.0, 1.0]
+
+
+@pytest.mark.integration
+def test_load_split_events_suppresses_spinoff_pseudo_splits(pg_db):
+    """spinoff 伪拆股不是股份数变动：股本前滚必须整日抑制（含同日无标记的 POLYGON 孪生）。"""
+    _insert_security(pg_db, 1, "dell")
+    # 归档导入的伪拆股（带标记）+ 同日 POLYGON legacy 合成孪生（无标记）
+    _insert_split(pg_db, 1, "2021-11-02", 1000, 1973,
+                  adjustment_type="spinoff_pseudo_split", source_event_id="P-vmware")
+    _insert_split(pg_db, 1, "2021-11-02", 1000, 1973,
+                  source="POLYGON", source_event_id="massive-split:legacy")
+    # 真实拆股不受影响
+    _insert_split(pg_db, 1, "2024-05-01", 1, 2, adjustment_type="forward_split")
+
+    splits = load_split_events(pg_db.engine)
+
+    assert len(splits) == 1
+    assert splits["ex_date"].tolist() == [pd.Timestamp("2024-05-01")]
+    assert splits["split_to"].tolist() == [2.0]
 
 
 @pytest.mark.integration
