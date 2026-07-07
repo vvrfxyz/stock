@@ -213,3 +213,67 @@ manual_residual 812。执行记录：
   （bucket 列过滤 MANUAL）；裁决落库后 gate 读取时自动放行，无需改代码。
 - arkd/mchb/pacw 三只身份手术（谱系剥离/污染价格行隔离），与 tail_mismatch 207 队列同流程。
 - 新防线提案未立项：单证券内部价格量级跳变探针（mchb 型污染 check_data_integrity 盲区）。
+
+## round-2：911 行人工队列并行裁决（2026-07-08 落地）
+
+第一轮留下的 911 行 MANUAL 孤行（565 dividend_price_inconclusive / 221
+archive_split_price_unconfirmed / 99 split_price_corroborated / 26
+split_price_inconclusive，286 只证券），以 Workflow 并行裁决（73 agent：49 批调查员
++ 双视角怀疑者对抗验证，DELETE/PROMOTE 候选须 2/2 一致 uphold，low 置信自动降级，
+归档 event_id 多归属冲突全体降级）。
+
+**证据升级**（第一轮机器没有的三类）：ex 日 ±14 天价格/成交量上下文、±5 天邻近事件
+（差一天位移重复探测）、松弛口径归档重匹配（ticker 归一化 / 日期 ±3 天 / 金额 2%
+容差——273 行找到候选，第一轮严格口径全部漏掉）。证据包由 `/tmp/adjq/build_packs.py`
+（一次性 LATERAL/VALUES 批量 SQL）预打包，agent 不撞库。
+
+**主会话终审改判**（agent 结论不可全信的三处实证）：
+- **yfinance 遗留段是混合复权体制**：金样本 MSFT 2003-02-18 拆股在遗留段有原始跳变，
+  EBAY 2003-08-29 拆股却无跳变（存储价 27.7 = 名义价 110 的 1/4，已复权）。结论：
+  遗留段"无跳变"不能证明事件为假；但删孤行判据的本质是"存储序列无断点 ⇒ 不该有
+  因子"，与序列是原始还是已复权无关，DELETE 仍然安全。**反方向致命**：给已平滑的
+  序列 PROMOTE 因子会凭空造假跳变——artna 2003-07-01（agent 判 PROMOTE）据此降回 KEEP。
+- **cpf 238313**（workflow 掉行，本会话手工复核）：2003 遗留段收盘 519-554 = 名义价
+  约 26 x20——被 Yahoo 按 2011 年 20:1 缩股回溯上调后又叠了一层，与 2011-02 后原始价
+  同单位。PROMOTE 会造 400 倍假悬崖，DELETE 证据不足（7.5 年缺口无法测跳变），KEEP。
+- **expe 2011-12-21 缩股 DELETE 维持**：事件历史上真实（1:2 缩股 + TripAdvisor 分拆
+  同日对冲），但存储原始价无断点，任何因子都会破坏收益连续性；分拆价值损益不入价格
+  因子是全库一致口径。
+
+**P 前缀语义修正**（本轮最大工程发现）：R3 "非 E 前缀 = spinoff 伪拆分"是抽样启发式，
+55 条 allowlist 里 36 条 P 行实际混有 18 条真实拆股（ANDE 3-for-2、iShares 2005 系列
+1:2、CATY/OTEX/MIDD、UCAR/SLE/FRMM/HUT 反向拆股）——vendor 的 adjustment_type 也无法
+区分（GE/GEV 分拆与 IWM 真拆股都标 forward_split）。语义由裁决层逐事件定：
+- allowlist 新增可选第 6 列 `adjustment_type_override`（只允许 spinoff_pseudo_split，
+  白名单校验）；18 条真分拆价值因子（A/Keysight、AA/Arconic、ASH/Valvoline、DELL/
+  VMware、DHR/Fortive、EBAY/PayPal、EQT/Equitrans、GE x2、HSIC/Covetrus、IBM/Kyndryl、
+  LEN 跨类 B 股、MDU/KnifeRiver、MMM/Solventum、SLM/Navient、SNX/Concentrix、XPO x2）
+  打标，其余 18 条透传 vendor 值。
+- `research/market_cap.load_split_events` 按标记做 (security_id, ex_date) **整日抑制**：
+  伪拆股是价格调整因子不是股份数变动，股本前滚绝不消费；同日抑制连带压掉无标记的
+  POLYGON 孪生行。真实拆股照常前滚（否则反向拆股后市值错 20-100 倍直到下次 XBRL）。
+- 价格因子链照常消费伪拆股 MASSIVE 行——分拆日价格连续性正是它的用途（GE 2024-04-02
+  GEV 分拆日：原始 -22% 悬崖，复权后 -2.5%，实测通过）。
+- import 侧 allowlist 通道可穿越 R3 与 R10 冲突组隔离（只放行点名成员；同组点名矛盾
+  比例直接报错）；ALEX/LADR 两条冲突组选择均为"剔除同日独立分红后的纯拆股因子"
+  （另一孪生是含分红复合因子，导入会双重计息）。
+
+**终局**（911 行）：DELETE 21（全部 split_price_refuted，整行备份
+`logs/manual_backfill/round2_delete_backup_20260707_163154.tsv`）、PROMOTE 55
+（36 R3 恢复 + 2 冲突组恢复 + 17 常规任期恢复；`--cutoff none` 放行 CERO 2025 事件，
+结构性只插入护栏不变；零 R13 挂起，47 只证券 55 行全部落库，18 行带伪拆股标记）、
+KEEP 835（宁缺毋滥）。裁决全量明细
+`logs/manual_backfill/round2_verdicts_full.tsv`。全量因子重建 8m50s，
+check_data_integrity 通过。
+
+**gate 终态**：straddle_v2 剔除 **325 -> 267**（活跃 CS 226 / 活跃 ETF 34 / 退市 7；
+legacy_v1 口径 1,926 -> 1,879）。GE/IBM/DELL/MMM/EXPE/XPO/IWM 等大票全部释放；
+ebay（2003 遗留段复权拆股，加因子即双重复权）、eqt（2005 无价格上下文）、aeg
+（8 条对抗验证否决）等留在残余队列，理由逐行在 verdicts TSV。
+
+**新增系统性挂账**（本轮法证副产品，未立项）：
+- yfinance 遗留段混合复权体制：2003-01-01（FACTOR_TRUST_FLOOR）~2003-09（flat files
+  起点）的面板切片 + OTC 填缝段，部分序列是 Yahoo 拆股复权价。影响：该切片上的
+  factor 应用可能双重复权（ebay 类）；需要指纹感知的序列级审计才能定量。
+- cpf 型"遗留段预缩放"（2003 段 = 名义价 x400）：mchb 家族的新亚种，单证券价格量级
+  跳变探针提案（第一轮已挂账）同样覆盖。
