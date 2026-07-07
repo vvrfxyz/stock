@@ -85,6 +85,15 @@
    评估与三关对照——技术族已挖完，价值/质量族是没动过的矿。
 4. insider_cluster 事件研究口径（CAR）；eod 隔夜腿精修——均低优先级。
 
+## 工程债（研究基建）
+
+- **研究脚本一律在 253 本机跑（owner 指令，2026-07-07）**：跨网冷拉 GB 级面板
+  在 I/O 争抢下可达 10-15 分钟，本地 socket 几十秒。Mac 只做编码/提交，
+  评估/研究一律 SSH 到 253 执行（`.env` 的 DATABASE_URL 即本地库，evaluate 的
+  load_dotenv 自动生效）。parquet 磁盘快照缓存作为后备优化保留在册。
+- ta_zoo 教训固化：新因子模块的 buffer_days 走 price_cache 量化档（{200,420}），
+  不要自定义中间值。
+
 ## 登记流程（每轮研究收尾必做）
 
 1. evaluate 自动写 trials.parquet（勿手工编辑）。
