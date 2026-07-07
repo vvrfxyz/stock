@@ -94,6 +94,15 @@ METRICS: dict[str, MetricSpec] = {
         ),
         MetricSpec("gross_profit_ttm", ("GrossProfit",), "flow"),
         MetricSpec(
+            "cost_of_revenue_ttm",
+            (
+                "CostOfRevenue",
+                "CostOfGoodsAndServicesSold",
+                "CostOfSales",  # ifrs-full（排尾，us-gaap 公司不报此名，coalesce 无碰撞）
+            ),
+            "flow",
+        ),
+        MetricSpec(
             "operating_cash_flow_ttm",
             (
                 "NetCashProvidedByUsedInOperatingActivities",
@@ -148,6 +157,8 @@ _PRIOR_FY_TOLERANCE_DAYS = 7  # YTD 的 period_start - 1 天 与上一财年 per
 _PRIOR_YTD_TOLERANCE_DAYS = 14  # 去年同期 YTD 的 period_end 与 (period_end - 365) 的容差
 
 _EVENT_COLUMNS = ["security_id", "concept", "period_end", "visible_date", "value"]
+
+_NS_PER_DAY = 86_400_000_000_000  # period_end -> 自纪元天数（float 精确，用于跨 metric 对齐）
 
 _EMPTY_EVENTS = pd.DataFrame(
     {
@@ -462,12 +473,18 @@ def asof_panel(
     dates: pd.DatetimeIndex,
     max_staleness_days: int = 270,
     visible_delay_days: int = 1,
+    include_period_end: bool = False,
 ) -> dict[str, pd.DataFrame]:
     """事件表 -> {metric: 宽表 (index=dates, columns=security_id)} 的 as-of 取数。
 
     每个 (date, security) 取 visible_date + visible_delay_days <= date 的最近事件（重述事件自然
     覆盖旧值）；默认后移一天，避免 filed_date 当日盘后 EDGAR 申报被 t 日收盘建仓提前看到。
     period_end 落后 date 超过 max_staleness_days 的值视为停止披露，置 NaN。
+
+    include_period_end=True（只读扩展，默认关，不改既有行为）时对每个 metric 额外产出一张
+    键为 f"{metric}__period_end" 的面板：所选 as-of 事件的 period_end（自纪元天数 float，
+    NaN 处与值面板逐格一致——同事件、同排序、同新鲜度门槛）。用于跨 metric 的 period_end
+    对齐门槛（gross_profitability 兜底减法只在两腿同 period_end 时启用）。
     """
     dates = pd.DatetimeIndex(pd.to_datetime(dates)).astype("datetime64[ns]")
     panels: dict[str, pd.DataFrame] = {}
@@ -482,6 +499,22 @@ def asof_panel(
             visible_delay_days=visible_delay_days,
             max_staleness_days=max_staleness_days,
         )
+        if include_period_end:
+            pe = ev.copy()
+            # period_end 作 value：同 visible/staleness 参数 -> merge_asof 选中同一事件行，
+            # 读出其 period_end；staleness 亦按 period_end 锚一致置 NaN。
+            pe["_period_end_days"] = (
+                pe["period_end"].astype("int64") // _NS_PER_DAY
+            ).astype("float64")
+            panels[f"{metric}__period_end"] = event_table_to_asof_panel(
+                pe,
+                dates=dates,
+                value_column="_period_end_days",
+                visible_date_column="visible_date",
+                staleness_anchor_column="period_end",
+                visible_delay_days=visible_delay_days,
+                max_staleness_days=max_staleness_days,
+            )
     return panels
 
 
@@ -494,11 +527,15 @@ def load_fundamental_panel(
     security_ids: list[int] | None = None,
     max_staleness_days: int = 270,
     visible_delay_days: int = 1,
+    include_period_end: bool = False,
 ) -> dict[str, pd.DataFrame]:
     """一站式：拉事实 -> 构造事件 -> as-of 面板。
 
     dates 通常传调仓日序列；返回 {metric: 宽表}，与
     research.data.load_adjusted_panel 的返回形态一致，可直接对齐相乘。
+
+    include_period_end=True 时额外返回 f"{metric}__period_end" 面板（只读扩展，
+    默认关；见 asof_panel）。
     """
     facts = load_fundamental_facts(
         engine, metrics=metrics, types=types, security_ids=security_ids
@@ -509,4 +546,5 @@ def load_fundamental_panel(
         dates=pd.DatetimeIndex(pd.to_datetime(list(dates))),
         max_staleness_days=max_staleness_days,
         visible_delay_days=visible_delay_days,
+        include_period_end=include_period_end,
     )

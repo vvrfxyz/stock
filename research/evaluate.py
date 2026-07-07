@@ -30,6 +30,7 @@ from research.data import (
     securities_with_uncovered_events,
     uncovered_gate_version,
 )
+from research.factors.builtins import accruals as _accruals  # noqa: F401
 from research.factors.builtins import bar_geometry as _bar_geometry  # noqa: F401
 from research.factors.builtins import classic_pillars as _classic_pillars  # noqa: F401
 from research.factors.builtins import classic_price as _classic_price  # noqa: F401
@@ -38,12 +39,14 @@ from research.factors.builtins import days_to_cover as _days_to_cover  # noqa: F
 from research.factors.builtins import delta_institutional_ownership as _delta_inst_own  # noqa: F401
 from research.factors.builtins import earnings_yield as _earnings_yield  # noqa: F401
 from research.factors.builtins import eod_pressure as _eod_pressure  # noqa: F401
+from research.factors.builtins import gross_profitability as _gross_profitability  # noqa: F401
 from research.factors.builtins import insider_cluster as _insider_cluster  # noqa: F401
 from research.factors.builtins import insider_net_buy as _insider_net_buy  # noqa: F401
 from research.factors.builtins import institutional_breadth as _institutional_breadth  # noqa: F401
 from research.factors.builtins import intraday_flow as _intraday_flow  # noqa: F401
 from research.factors.builtins import intraday_moments as _intraday_moments  # noqa: F401
 from research.factors.builtins import ownership_concentration as _ownership_concentration  # noqa: F401
+from research.factors.builtins import operating_profitability as _operating_profitability  # noqa: F401
 from research.factors.builtins import residual_vol as _residual_vol  # noqa: F401
 from research.factors.builtins import short_interest as _short_interest  # noqa: F401
 from research.factors.builtins import short_volume as _short_volume  # noqa: F401
