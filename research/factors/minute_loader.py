@@ -16,7 +16,8 @@ import pandas as pd
 from research.minute_bars import query_df
 
 FEATURE_COLUMNS = ("ret_first30", "ret_last30", "rv", "rv_up", "rv_down",
-                   "rskew", "bipower", "ext_volume_share", "n_bars")
+                   "rskew", "bipower", "ext_volume_share", "cs_spread", "roll_spread",
+                   "n_bars")
 
 
 def load_minute_feature_panel(
