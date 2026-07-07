@@ -132,9 +132,11 @@ class SecurityInfo:
     symbol: str | None            # lower
     current_symbol: str | None    # lower
     cik: str | None               # 去前导零
-    figi: str | None              # upper
+    figi: str | None              # upper（composite_figi）
     is_active: bool
     delist_date: date | None
+    company_id: int | None = None       # companies.id（PERMCO 等价物），cik 消歧用
+    share_class_figi: str | None = None  # upper；归档侧恒空，仅审计留痕
 
 
 @dataclass
@@ -224,6 +226,7 @@ class GroupResolution:
     anchors: frozenset = frozenset()
     bucket: str | None = None
     note: str = ""
+    narrowed_by: str = ""     # 非空表示经 cik 同族收窄命中（审计留痕）
 
 
 def resolve_group(
@@ -267,6 +270,86 @@ def resolve_group(
     return GroupResolution(group, bucket="unresolved", note="figi/cik 均无唯一库内命中")
 
 
+CIK_NARROW_ANCHOR = frozenset({"cik_cohort"})
+CIK_NARROW_METHOD = "cik_cohort_tail_corroborated"
+
+
+def _known_symbols(sec: SecurityInfo, live_history: dict[int, dict[str, set]]) -> set:
+    """一只证券的全部已知代码：live symbol history（非归档）+ symbol + current_symbol。"""
+    syms = set(live_history.get(sec.id, {}))
+    if sec.symbol:
+        syms.add(sec.symbol)
+    if sec.current_symbol:
+        syms.add(sec.current_symbol)
+    return syms
+
+
+def _narrow_cohort(
+    group: ArchiveGroup,
+    cohort: list[SecurityInfo],
+    live_history: dict[int, dict[str, set]],
+) -> tuple[SecurityInfo | None, str]:
+    """CIK 同族内把候选收窄到唯一证券（纯函数）。返回 (证券|None, 原因码)。
+
+    多 share class 共享 CIK 时 CIK 锚失效；此处用两道硬条件锁定：
+      1. 事件链尾 ticker 恰好命中同族里【唯一】一只证券的 symbol/current_symbol
+         （= 当前持有 new 代码的那只，通常是普通股本身）；
+      2. 链内全部 distinct ticker 都能被这只证券【自己的】 live symbol history 佐证——
+         防止把优先股/权证的老代码（如 agcg->agnc 里的 agcg、zb->zion 里的 zb）
+         错配成普通股改名。任一条件不满足即留桶。
+    """
+    chain = [ticker for _, ticker in group.events]
+    distinct = set(chain)
+    if len(distinct) < 2:
+        return None, "single_ticker"          # 无 old->new 可裁（优先股票据噪声）
+    tail = chain[-1]
+    bearers = [
+        sec for sec in cohort
+        if tail == sec.symbol or tail == sec.current_symbol
+    ]
+    if len(bearers) != 1:
+        return None, "tail_not_unique"        # 链尾无法唯一定位持有者
+    sec = bearers[0]
+    if not distinct <= _known_symbols(sec, live_history):
+        return None, "chain_uncorroborated"   # 链内有 ticker 不属于该证券自己的历史
+    return sec, "ok"
+
+
+def narrow_cik_ambiguous(
+    resolutions: list[GroupResolution],
+    by_cik: dict[str, list[SecurityInfo]],
+    live_history: dict[int, dict[str, set]],
+) -> Counter:
+    """companies 就位后对 cik_ambiguous 残组做公司感知收窄（就地改写 resolutions）。
+
+    命中者转为已解析 GroupResolution（security 置位、anchors={'cik_cohort'} —— 独立于
+    干净 figi/cik 锚的启发式锚，永不满足 {figi,cik} 的 HIGH 判据故下游恒 MEDIUM，
+    即便与另一组的 figi 锚合并也不镀金；narrowed_by 标记审计），residual 保持
+    cik_ambiguous 桶（宁缺毋滥）。
+    注：归档 ticker_events 对这些组 composite_figi 恒为 NULL，share_class_figi 无归档侧
+    可匹配键，故 FIGI 不参与判据；决定性信号是「CIK 同族 + 链尾身份 + 全链 live 佐证」。
+    """
+    counts: Counter = Counter()
+    for res in resolutions:
+        if res.bucket != "cik_ambiguous":
+            continue
+        cohort = by_cik.get(res.group.cik, [])
+        sec, reason = _narrow_cohort(res.group, cohort, live_history)
+        if sec is None:
+            counts[f"residual_{reason}"] += 1
+            continue
+        res.security = sec
+        res.anchors = CIK_NARROW_ANCHOR
+        res.bucket = None
+        res.narrowed_by = CIK_NARROW_METHOD
+        res.note = (
+            f"cik 同族收窄: 链尾 {res.group.events[-1][1]} 唯一锁定 security {sec.id}"
+            f"（company_id={sec.company_id}），全链被 live history 佐证"
+        )
+        counts["narrowed"] += 1
+    return counts
+
+
 @dataclass
 class EntityEvidence:
     """多个 queried_ticker 组可解析到同一 security，此处按 security 合并证据。"""
@@ -277,6 +360,7 @@ class EntityEvidence:
     archive_ciks: set = field(default_factory=set)
     events: list = field(default_factory=list)
     same_date_conflict: bool = False
+    narrowed_by: set = field(default_factory=set)
 
 
 def merge_by_security(resolutions: list[GroupResolution]) -> dict[int, EntityEvidence]:
@@ -291,6 +375,8 @@ def merge_by_security(resolutions: list[GroupResolution]) -> dict[int, EntityEvi
             ent = EntityEvidence(security=res.security)
             entities[sid] = ent
         ent.anchors |= set(res.anchors)
+        if res.narrowed_by:
+            ent.narrowed_by.add(res.narrowed_by)
         if res.group.queried_ticker:
             ent.queried_tickers.append(res.group.queried_ticker)
         if res.group.figi:
@@ -406,6 +492,19 @@ def plan_renames(
             corroborated = old in known_symbols or new in known_symbols
             confidence = "HIGH" if ent.anchors == set(BOTH_ANCHORS) and corroborated else "MEDIUM"
             plan.counts[f"events_planned_{confidence.lower()}"] += 1
+            details = {
+                "script": "backfill_rename_events",
+                "source": ARCHIVE_SOURCE,
+                "archive_file": "ticker_events.parquet",
+                "event_date": tdate.isoformat(),
+                "anchors": sorted(ent.anchors),
+                "archive_figis": sorted(ent.archive_figis),
+                "archive_ciks": sorted(ent.archive_ciks),
+                "queried_tickers": sorted(set(ent.queried_tickers)),
+                "corroborated": corroborated,
+            }
+            if ent.narrowed_by:
+                details["disambiguation"] = sorted(ent.narrowed_by)
             plan.events.append({
                 "security_id": sid,
                 "event_type": "RENAME",
@@ -413,17 +512,7 @@ def plan_renames(
                 "new_symbol": new,
                 "resolution_source": "AUDIT",
                 "confidence": confidence,
-                "details": json.dumps({
-                    "script": "backfill_rename_events",
-                    "source": ARCHIVE_SOURCE,
-                    "archive_file": "ticker_events.parquet",
-                    "event_date": tdate.isoformat(),
-                    "anchors": sorted(ent.anchors),
-                    "archive_figis": sorted(ent.archive_figis),
-                    "archive_ciks": sorted(ent.archive_ciks),
-                    "queried_tickers": sorted(set(ent.queried_tickers)),
-                    "corroborated": corroborated,
-                }, ensure_ascii=False),
+                "details": json.dumps(details, ensure_ascii=False),
             })
 
         # 退市证券补任期行（active 证券的 live 管道自会维护自己的 history）
@@ -562,7 +651,8 @@ def plan_identifier_rows(
 # --------------------------------------------------------------------------- #
 def load_securities(engine) -> list[SecurityInfo]:
     sql = text(
-        "SELECT id, symbol, current_symbol, cik, composite_figi, is_active, delist_date "
+        "SELECT id, symbol, current_symbol, cik, composite_figi, is_active, delist_date, "
+        "company_id, share_class_figi "
         "FROM securities"
     )
     with engine.connect() as conn:
@@ -575,6 +665,8 @@ def load_securities(engine) -> list[SecurityInfo]:
                 figi=_norm_figi(row.composite_figi),
                 is_active=bool(row.is_active),
                 delist_date=row.delist_date,
+                company_id=row.company_id,
+                share_class_figi=_norm_figi(row.share_class_figi),
             )
             for row in conn.execute(sql)
         ]
@@ -709,6 +801,37 @@ def _capped_buckets(buckets: dict) -> dict:
     }
 
 
+def dump_full_buckets(raw_buckets_by_stage: dict, dump_dir: str) -> dict:
+    """把各阶段报告桶的【完整未截断】明细落盘（调试/人工再裁决用；绕开 BUCKET_DETAIL_CAP）。
+
+    产出（dump_dir 下）：
+      - buckets_full.json：{stage: {bucket: [entries...]}} 全量明细；
+      - tail_mismatch_symbols.txt：renames.tail_mismatch 每实体一行 current_symbol
+        （runbook：这些是快照期改名、live 尾不符的实体，需 update_massive_events 刷新后再裁决）。
+    返回落盘计数摘要。
+    """
+    os.makedirs(dump_dir, exist_ok=True)
+    full_path = os.path.join(dump_dir, "buckets_full.json")
+    with open(full_path, "w", encoding="utf-8") as handle:
+        json.dump(raw_buckets_by_stage, handle, ensure_ascii=False, indent=2, default=str)
+
+    tail_items = raw_buckets_by_stage.get("renames", {}).get("tail_mismatch", [])
+    tail_path = os.path.join(dump_dir, "tail_mismatch_symbols.txt")
+    lines = [
+        (item.get("db_current_symbol") or item.get("db_symbol") or "")
+        for item in sorted(tail_items, key=lambda it: it.get("security_id") or 0)
+    ]
+    with open(tail_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + ("\n" if lines else ""))
+
+    return {
+        "buckets_full_path": full_path,
+        "tail_mismatch_path": tail_path,
+        "tail_mismatch_entities": len(tail_items),
+        "tail_mismatch_distinct_symbols": len({ln for ln in lines if ln}),
+    }
+
+
 def write_report(report: dict, report_dir: str) -> str:
     os.makedirs(report_dir, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -742,6 +865,9 @@ def create_parser() -> argparse.ArgumentParser:
                         help="执行写入。先跑 dry-run 人工确认报告桶。")
     parser.add_argument("--report-dir", default=os.path.join(project_root, "logs"),
                         help="JSON 明细报告输出目录（默认 logs/）。")
+    parser.add_argument("--dump-buckets", default=None, metavar="DIR",
+                        help="把各阶段报告桶的完整未截断明细落盘到 DIR（绕开 BUCKET_DETAIL_CAP）；"
+                             "另出 tail_mismatch_symbols.txt（每实体一行 current_symbol）。")
     return parser
 
 
@@ -767,6 +893,7 @@ def run(args: argparse.Namespace, db_manager: DatabaseManager) -> tuple[int, dic
         f"================ backfill_rename_events 报告（{mode_label}） ================",
         f"[load] {dict(load_counts)}",
     ]
+    raw_buckets_by_stage: dict = {}   # --dump-buckets 用的未截断桶明细
 
     # ---- 阶段 1：renames ----
     if "renames" in stages:
@@ -775,12 +902,18 @@ def run(args: argparse.Namespace, db_manager: DatabaseManager) -> tuple[int, dic
         by_figi, by_cik = build_security_indexes(securities)
         resolutions = [resolve_group(group, by_figi, by_cik) for group in groups]
 
+        # companies 就位后：对 cik_ambiguous 残组做公司感知收窄（需 live history 佐证）
+        live_history = load_live_history(db_manager.engine)
+        narrow_counts = narrow_cik_ambiguous(resolutions, by_cik, live_history)
+
         resolution_counts: Counter = Counter()
         resolution_buckets: dict = defaultdict(list)
         for res in resolutions:
             if res.security is not None:
                 resolution_counts["groups_resolved"] += 1
                 resolution_counts[f"groups_anchor_{'+'.join(sorted(res.anchors))}"] += 1
+                if res.narrowed_by:
+                    resolution_counts["groups_cik_narrowed"] += 1
             else:
                 resolution_counts[f"groups_{res.bucket}"] += 1
                 resolution_buckets[res.bucket].append({
@@ -792,7 +925,6 @@ def run(args: argparse.Namespace, db_manager: DatabaseManager) -> tuple[int, dic
                 })
 
         entities = merge_by_security(resolutions)
-        live_history = load_live_history(db_manager.engine)
         existing_rename_keys = load_existing_rename_keys(db_manager.engine)
         plan = plan_renames(entities, live_history, existing_rename_keys)
 
@@ -807,6 +939,7 @@ def run(args: argparse.Namespace, db_manager: DatabaseManager) -> tuple[int, dic
             "epoch_dropped": epoch_dropped,
             "groups_total": len(groups),
             **resolution_counts,
+            **{f"cik_narrow_{k}": v for k, v in narrow_counts.items()},
             "entities_resolved": len(entities),
             **plan.counts,
             "events_planned_total": len(plan.events),
@@ -818,11 +951,20 @@ def run(args: argparse.Namespace, db_manager: DatabaseManager) -> tuple[int, dic
             "counts": stage_counts,
             "buckets": _capped_buckets({**resolution_buckets, **plan.buckets}),
         }
+        raw_buckets_by_stage["renames"] = {
+            name: list(items) for name, items in {**resolution_buckets, **plan.buckets}.items()
+        }
         stats.update({f"renames_{k}": v for k, v in stage_counts.items()})
         summary_lines.append(
             f"[renames] epoch_dropped={epoch_dropped} groups={len(groups)} "
             f"resolved={resolution_counts['groups_resolved']} entities={len(entities)} "
             f"gated={plan.counts['entities_gated']}"
+        )
+        summary_lines.append(
+            f"          cik 同族收窄: narrowed={narrow_counts['narrowed']} "
+            f"（残: tail_not_unique={narrow_counts['residual_tail_not_unique']} "
+            f"chain_uncorroborated={narrow_counts['residual_chain_uncorroborated']} "
+            f"single_ticker={narrow_counts['residual_single_ticker']}）"
         )
         summary_lines.append(
             f"          事件: planned HIGH={plan.counts['events_planned_high']} "
@@ -865,6 +1007,9 @@ def run(args: argparse.Namespace, db_manager: DatabaseManager) -> tuple[int, dic
             "counts": stage_counts,
             "buckets": _capped_buckets(figi_plan.buckets),
             "fills_planned": figi_plan.fills[:BUCKET_DETAIL_CAP],
+        }
+        raw_buckets_by_stage["figi"] = {
+            name: list(items) for name, items in figi_plan.buckets.items()
         }
         stats.update({f"figi_{k}": v for k, v in stage_counts.items()})
         summary_lines.append(
@@ -955,6 +1100,15 @@ def run(args: argparse.Namespace, db_manager: DatabaseManager) -> tuple[int, dic
 
     report_path = write_report(report, args.report_dir)
     summary_lines.append(f"明细报告: {report_path}")
+    if args.dump_buckets:
+        dump_info = dump_full_buckets(raw_buckets_by_stage, args.dump_buckets)
+        stats.update({f"dump_{k}": v for k, v in dump_info.items()})
+        summary_lines.append(
+            f"桶全量落盘: {dump_info['buckets_full_path']}；"
+            f"tail_mismatch {dump_info['tail_mismatch_entities']} 实体"
+            f"（{dump_info['tail_mismatch_distinct_symbols']} 个不同 symbol）-> "
+            f"{dump_info['tail_mismatch_path']}"
+        )
     if not apply_mode:
         summary_lines.append("dry-run 模式未写库；确认报告桶后加 --apply 执行。")
     summary = "\n".join(summary_lines)

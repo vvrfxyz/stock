@@ -17,17 +17,22 @@ from data_models.models import Security
 import scripts.backfill_rename_events as bre
 from scripts.backfill_rename_events import (
     ARCHIVE_SOURCE,
+    CIK_NARROW_ANCHOR,
+    CIK_NARROW_METHOD,
     EPOCH_SENTINEL,
     ArchiveGroup,
     EntityEvidence,
+    GroupResolution,
     SecurityInfo,
     build_cik_figi_map,
     build_groups,
     build_security_indexes,
     create_parser,
     drop_epoch_rows,
+    dump_full_buckets,
     load_archive_rows,
     merge_by_security,
+    narrow_cik_ambiguous,
     plan_figi_fills,
     plan_identifier_rows,
     plan_renames,
@@ -37,7 +42,7 @@ from scripts.backfill_rename_events import (
 
 
 def _sec(security_id, symbol, *, active=True, cik=None, figi=None,
-         current=None, delist=None) -> SecurityInfo:
+         current=None, delist=None, company_id=None, share_class_figi=None) -> SecurityInfo:
     return SecurityInfo(
         id=security_id,
         symbol=symbol,
@@ -46,6 +51,8 @@ def _sec(security_id, symbol, *, active=True, cik=None, figi=None,
         figi=figi,
         is_active=active,
         delist_date=delist,
+        company_id=company_id,
+        share_class_figi=share_class_figi,
     )
 
 
@@ -219,6 +226,116 @@ class TestResolveGroup:
         res = resolve_group(self._group(cik="999", figi="BBG000UNKNOWN"), by_figi, by_cik)
         assert res.security is None
         assert res.bucket == "unresolved"
+
+
+# --------------------------------------------------------------------------- #
+# cik 同族收窄（companies 消歧）
+# --------------------------------------------------------------------------- #
+
+class TestNarrowCikAmbiguous:
+    """cik_ambiguous 残组的公司感知收窄：链尾唯一定位 + 全链 live 佐证。"""
+
+    # 同一 CIK/company 下：普通股（当前 agnc）与优先股（当前 agncl）
+    COMMON = _sec(7777, "agnc", cik="555", current="agnc", company_id=42)
+    PREF = _sec(6187, "agncl", cik="555", current="agncl", company_id=42)
+
+    def _ambiguous(self, chain, *, cik="555", figi=None) -> GroupResolution:
+        events = [(date(2010 + i, 1, 4), ticker) for i, ticker in enumerate(chain)]
+        group = ArchiveGroup("q", cik, figi, events)
+        # resolve_group 对同 cik 多命中会给 cik_ambiguous
+        by_figi, by_cik = build_security_indexes([self.COMMON, self.PREF])
+        return resolve_group(group, by_figi, by_cik)
+
+    def _by_cik(self):
+        return {"555": [self.COMMON, self.PREF]}
+
+    def test_unique_tail_bearer_full_chain_narrows(self):
+        # 链 oldc -> agnc：链尾 agnc 唯一命中普通股，且 oldc 在其 live history -> 收窄
+        res = self._ambiguous(["oldc", "agnc"])
+        assert res.bucket == "cik_ambiguous"
+        counts = narrow_cik_ambiguous(
+            [res], self._by_cik(), live_history={7777: {"oldc": {date(2010, 1, 4)}}})
+        assert counts["narrowed"] == 1
+        assert res.security.id == 7777
+        assert res.bucket is None
+        assert res.anchors == CIK_NARROW_ANCHOR
+        assert res.narrowed_by == CIK_NARROW_METHOD
+
+    def test_tail_matches_multiple_stays_ambiguous(self):
+        # 两只都以 tail 为 current/symbol -> 链尾不唯一 -> 留桶
+        twin_a = _sec(1, "dup", cik="555", current="dup", company_id=42)
+        twin_b = _sec(2, "old2", cik="555", current="dup", company_id=42)
+        group = ArchiveGroup("q", "555", None,
+                             [(date(2010, 1, 4), "old0"), (date(2020, 1, 4), "dup")])
+        res = GroupResolution(group, bucket="cik_ambiguous", note="cik 命中多只")
+        counts = narrow_cik_ambiguous(
+            [res], {"555": [twin_a, twin_b]},
+            live_history={1: {"old0": {None}}, 2: {"old0": {None}}})
+        assert counts["residual_tail_not_unique"] == 1
+        assert res.security is None
+        assert res.bucket == "cik_ambiguous"
+
+    def test_chain_uncorroborated_stays_ambiguous(self):
+        # agcg -> agnc：链尾 agnc 唯一命中普通股，但 agcg 不在普通股 live history
+        # （agcg 属于优先股票据噪声）-> 留桶（宁缺毋滥）
+        res = self._ambiguous(["agcg", "agnc"])
+        counts = narrow_cik_ambiguous(
+            [res], self._by_cik(), live_history={7777: {"agnc": {None}}})
+        assert counts["residual_chain_uncorroborated"] == 1
+        assert res.security is None
+        assert res.bucket == "cik_ambiguous"
+
+    def test_single_ticker_group_skipped(self):
+        # 单 ticker（无 old->new）-> 无改名可裁，留桶
+        res = self._ambiguous(["agnc"])
+        counts = narrow_cik_ambiguous(
+            [res], self._by_cik(), live_history={7777: {"agnc": {None}}})
+        assert counts["residual_single_ticker"] == 1
+        assert res.security is None
+        assert res.bucket == "cik_ambiguous"
+
+    def test_narrowed_flows_to_medium_event_with_audit(self):
+        # 端到端：收窄命中 -> merge -> plan_renames 产 MEDIUM 事件 + details 带消歧留痕
+        res = self._ambiguous(["oldc", "agnc"])
+        live_history = {7777: {"oldc": {date(2010, 1, 4)}, "agnc": {None}}}
+        narrow_cik_ambiguous([res], self._by_cik(), live_history)
+        entities = merge_by_security([res])
+        assert entities[7777].narrowed_by == {CIK_NARROW_METHOD}
+        plan = plan_renames(entities, live_history, existing_rename_keys={})
+        assert len(plan.events) == 1
+        event = plan.events[0]
+        assert (event["old_symbol"], event["new_symbol"]) == ("oldc", "agnc")
+        assert event["confidence"] == "MEDIUM"   # 单锚（cik），恒不 HIGH
+        details = json.loads(event["details"])
+        assert details["disambiguation"] == [CIK_NARROW_METHOD]
+        assert details["anchors"] == ["cik_cohort"]   # 启发式锚，恒不参与 HIGH 判据
+
+    def test_non_ambiguous_resolution_untouched(self):
+        # 非 cik_ambiguous 的 resolution 不被收窄触碰
+        res = GroupResolution(ArchiveGroup("q", "555", None, []),
+                              security=self.COMMON, anchors=frozenset({"figi", "cik"}))
+        counts = narrow_cik_ambiguous([res], self._by_cik(), live_history={})
+        assert counts == {}  # 空 Counter
+        assert res.anchors == frozenset({"figi", "cik"})
+        assert res.narrowed_by == ""
+
+    def test_narrowed_plus_figi_stays_medium_not_high(self):
+        # 启发式 cik_cohort 锚 + 另一组的独立 figi 锚合并后【不得】升 HIGH（防启发式镀金）
+        sec = _sec(9, "new", cik="555", figi="BBG000000009", current="new")
+        g_figi = ArchiveGroup("newq", None, "BBG000000009",
+                              [(date(2010, 1, 4), "old"), (date(2024, 5, 1), "new")])
+        g_narrow = ArchiveGroup("prefq", "555", None,
+                                [(date(2010, 1, 4), "old"), (date(2024, 5, 1), "new")])
+        res = [
+            GroupResolution(g_figi, security=sec, anchors=frozenset({"figi"})),
+            GroupResolution(g_narrow, security=sec, anchors=CIK_NARROW_ANCHOR,
+                            narrowed_by=CIK_NARROW_METHOD),
+        ]
+        entities = merge_by_security(res)
+        plan = plan_renames(entities, live_history={9: {"old": {None}}}, existing_rename_keys={})
+        assert len(plan.events) == 1
+        assert plan.events[0]["confidence"] == "MEDIUM"
+        assert sorted(json.loads(plan.events[0]["details"])["anchors"]) == ["cik_cohort", "figi"]
 
 
 # --------------------------------------------------------------------------- #
@@ -415,6 +532,39 @@ class TestPlanIdentifierRows:
         assert row["start_date"] is None
 
 
+class TestDumpFullBuckets:
+    def test_writes_full_json_and_tail_mismatch_symbols(self, tmp_path):
+        raw = {
+            "renames": {
+                "tail_mismatch": [
+                    {"security_id": 3, "db_symbol": "c", "db_current_symbol": "cc", "archive_tail": "cx"},
+                    {"security_id": 1, "db_symbol": "a", "db_current_symbol": "aa", "archive_tail": "ax"},
+                    {"security_id": 2, "db_symbol": "b", "db_current_symbol": None, "archive_tail": "bx"},
+                ],
+                "unresolved": [{"queried_ticker": "z"}] * 3000,   # 绕开 2000 截断
+            },
+        }
+        info = dump_full_buckets(raw, str(tmp_path / "dump"))
+        assert info["tail_mismatch_entities"] == 3
+        assert info["tail_mismatch_distinct_symbols"] == 3   # cc/aa/b
+        # tail_mismatch_symbols.txt：按 security_id 升序、current 优先、null 回退 symbol
+        lines = (tmp_path / "dump" / "tail_mismatch_symbols.txt").read_text().splitlines()
+        assert lines == ["aa", "b", "cc"]
+        # buckets_full.json：unresolved 未截断（3000 条全在）
+        full = json.loads((tmp_path / "dump" / "buckets_full.json").read_text())
+        assert len(full["renames"]["unresolved"]) == 3000
+
+    def test_empty_tail_mismatch_writes_empty_file(self, tmp_path):
+        info = dump_full_buckets({"renames": {}}, str(tmp_path / "dump"))
+        assert info["tail_mismatch_entities"] == 0
+        assert (tmp_path / "dump" / "tail_mismatch_symbols.txt").read_text() == ""
+
+    def test_parser_accepts_dump_buckets(self):
+        args = create_parser().parse_args(["--dump-buckets", "/tmp/out"])
+        assert args.dump_buckets == "/tmp/out"
+        assert create_parser().parse_args([]).dump_buckets is None
+
+
 # --------------------------------------------------------------------------- #
 # 集成：--apply 幂等 / dry-run 零写入 / live 胜护栏
 # --------------------------------------------------------------------------- #
@@ -581,3 +731,36 @@ class TestBackfillRenameEventsIntegration:
                               "WHERE id_type='FIGI' AND security_id=2") == 1
         assert _scalar(pg_db, "SELECT count(*) FROM security_identifiers "
                               "WHERE id_type='FIGI'") == 3
+
+    def test_cik_cohort_narrowing_adjudicates_common_rename(self, pg_db, tmp_path):
+        # CIK 同族：普通股(agnc)+优先股(agncl) 共享 cik、composite_figi 皆空 -> cik_ambiguous。
+        # companies 消歧：链尾唯一定位 + 全链 live 佐证 -> 只裁定被佐证的普通股改名。
+        _insert_security(pg_db, 20, "agnc", cik="0000000900")
+        _insert_security(pg_db, 21, "agncl", cik="0000000900")
+        pg_db.upsert_symbol_history([{   # 普通股的 live 老代码，供全链佐证
+            "security_id": 20, "symbol": "oldc", "source": "MASSIVE",
+            "source_event_id": "20:oldc:2010-01-04", "event_type": "ticker_change",
+            "start_date": date(2010, 1, 4),
+        }])
+        parquet = _write_parquet(tmp_path / "events.parquet", [
+            # 普通股改名 oldc->agnc：oldc 在库内历史 -> 收窄裁定 MEDIUM
+            _parquet_record("AGNC", "OLDC", date(2010, 1, 4), cik="0000000900"),
+            _parquet_record("AGNC", "AGNC", date(2020, 1, 4), cik="0000000900"),
+            # 优先股票据噪声 agcg->agnc：agcg 不在普通股历史 -> 留桶不写（宁缺毋滥）
+            _parquet_record("AGNCL", "AGCG", date(2011, 1, 4), cik="0000000900"),
+            _parquet_record("AGNCL", "AGNC", date(2019, 1, 4), cik="0000000900"),
+        ])
+        exit_code, stats = _run_script(pg_db, tmp_path, parquet, "--stage", "renames", "--apply")
+        assert exit_code == 0
+        assert stats["renames_cik_narrow_narrowed"] == 1
+        assert stats["renames_cik_narrow_residual_chain_uncorroborated"] == 1
+        with pg_db.engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT security_id, old_symbol, new_symbol, confidence, details "
+                "FROM security_identity_events WHERE event_type='RENAME'")).all()
+        assert len(rows) == 1                 # 只裁普通股改名，危险组留桶
+        ev = rows[0]
+        assert ev.security_id == 20
+        assert (ev.old_symbol, ev.new_symbol) == ("oldc", "agnc")
+        assert ev.confidence == "MEDIUM"      # cik 单锚，恒不 HIGH
+        assert json.loads(ev.details)["disambiguation"] == [CIK_NARROW_METHOD]
