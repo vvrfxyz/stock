@@ -576,3 +576,25 @@ class TestResolveEventsAllowlist:
         total = (stats["dividend_mapped"] + stats["dividend_not_in_allowlist"]
                  + stats["dividend_allowlist_mismatch"])
         assert total == len(rows)
+
+
+class TestAllowlistReportRedirect:
+    """allowlist 模式的报告改道：绝不覆盖全量导入产出的裁决输入工件。"""
+
+    def test_redirect_appends_allowlist_suffix(self):
+        from pathlib import Path
+        from scripts.import_corporate_actions_archive import _allowlist_report_path
+
+        p = Path("logs/manual_backfill/corp_actions_archive_quarantine_detail.tsv")
+        assert _allowlist_report_path(p) == Path(
+            "logs/manual_backfill/corp_actions_archive_quarantine_detail_allowlist.tsv")
+
+    def test_redirect_preserves_parent_and_suffix(self):
+        from pathlib import Path
+        from scripts.import_corporate_actions_archive import _allowlist_report_path
+
+        p = Path("/abs/dir/report.tsv")
+        out = _allowlist_report_path(p)
+        assert out.parent == p.parent
+        assert out.suffix == ".tsv"
+        assert out != p
