@@ -161,3 +161,55 @@ rtol 1e-6），落实 CLAUDE.md"真 vendor id 出现时清理合成 id"规则；
 - 快照无 per-row 可见性时间戳：as-of 2024 前的复权查询内嵌 2026 年知识
   （对因子水平可接受，严格 PIT 回测须知晓）。
 - pre-2003 仍是硬地板，yfinance 时代更早价格保持未复权。
+
+## POLYGON 孤行裁决 + gate 跨立精化（2026-07-07 落地）
+
+上节"POLYGON 孤行回收"项当日整体收官。两条腿：
+
+**读取层 gate 跨立精化**（`securities_with_uncovered_events`，research/data.py）：
+复权因子只作用于 ex_date 之前的价格行——事件前无价格则无可调整行、事件后无价格则
+全序列同乘常数（收益率不变），两类洞均无害。gate 改为只把"跨立事件"
+（min(price_date) < ex_date 且 max(price_date) >= ex_date）计为洞；
+`require_straddle=False` 完全复现旧口径，evaluate 的 params_hash 带
+`uncovered_gate` key（straddle_v2/legacy_v1，新旧 trial 不互相顶替）。
+bounds 用逐证券 LATERAL min/max 端点探针（IN+GROUP BY 聚合会诱使规划器全表
+Seq Scan daily_prices：23s vs 3.4s，结果位级相同）。
+单此一步剔除数 2,310 -> 794（释放 1,516 只，零正确性代价）。
+
+**跨立孤行证据分桶裁决**（`scripts/adjudicate_polygon_orphans.py`）：
+对 9,906 跨立孤行 / 790 只证券按顺序分桶——
+tenure_violation 316 行（回收污染，DELETE）；archive_match_promote 8,597 行
+（归档隔离区 out_of_tenure/ambiguous 能按 ticker+ex_date+值对上：分红需在任期窗口内、
+拆股需价格跳变佐证）；split_refuted 29 + dividend_refuted 53（价格正面反证，DELETE）；
+manual_real_no_vendor_id 99（价格佐证的真实拆股但无 vendor id，不凭空造 MASSIVE 行）；
+manual_residual 812。执行记录：
+
+- DELETE 398 行（整行备份 `logs/manual_backfill/adjudicate_polygon_orphans_delete_backup_20260707_090122.tsv`；
+  表级快照 `/home/wenruifeng/backups/corporate_actions_pre_adjudicate_20260707.dump`）。
+- PROMOTE 经 `import_corporate_actions_archive --adjudicated-allowlist`（新旗标：只导
+  allowlist 内 event_id、归属用 allowlist 的 security_id、其余防线全保留、报告改道
+  `*_allowlist.tsv` 绝不覆盖全量 run 工件）落库 8,440 行（8,032 分红 + 408 拆股），
+  零 R13 值冲突挂起。
+- 全量因子重建 8m50s：computed_adjustment_factors 覆盖至 11,392 只证券。
+
+**小尾巴修复**（详见当日调查 /tmp/tails_report.md 结论，已固化到本节）：
+- BMD（百慕大元）1:1 硬锚定进 `utils/fx_rates.USD_PEGGED_CURRENCIES`（NTB 12 事件解锁；
+  库内自证：vendor 2019 年 BMD->USD 换标前后金额同为 0.44）。
+- ILS 2011 年前无 ECB 序列，接 FRED/OECD 月频 `CCUSMA02ILM618N`（FRED 无日频 ILS；
+  fallback staleness 按币种放宽 35 天容纳月频），ITRN/CEL 2007-2009 共 6 事件解锁。
+- SCCO 2013-02-11 分红 currency PEN->USD 人工订正（vendor 原始 payload 确认就是 PEN 误标：
+  12 笔序列唯一非 USD、金额 0.24 与相邻 USD 笔同量级；vendor 侧无法修复，库内订正留 updated_at 痕迹）。
+- cash_ge_close 8 事件调查结论：零个单位错误、零个方法论天花板，全部是身份污染
+  （arkd 回收票融合、mchb 单证券内部混入老 OTC 实体 24 行 2 万+价格行、pacw 前任仙股段+价格断层），
+  转入身份手术队列。
+
+**终态**：gate 剔除 2,310 -> **325 只**（活跃 CS 267 / 活跃 ETF 47 / 退市 11）。
+剩余构成：POLYGON 孤行残余 322 只（manual_residual 812 行 + manual_real_no_vendor_id 99 行
++ archive 拆股价格未证实 221 行的证券），MASSIVE 缺因子残余 5 只（arkd/mchb/pacw 身份污染
++ 少量 cash>=close 清盘事件）。check_data_integrity 通过。
+
+**残余队列**（不阻塞，人工裁决节奏）：
+- manual 队列 911 行明细在 `logs/manual_backfill/adjudicate_polygon_orphans_detail.tsv`
+  （bucket 列过滤 MANUAL）；裁决落库后 gate 读取时自动放行，无需改代码。
+- arkd/mchb/pacw 三只身份手术（谱系剥离/污染价格行隔离），与 tail_mismatch 207 队列同流程。
+- 新防线提案未立项：单证券内部价格量级跳变探针（mchb 型污染 check_data_integrity 盲区）。
