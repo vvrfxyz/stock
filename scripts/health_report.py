@@ -363,6 +363,27 @@ def report_staleness(session) -> int:
     return p2
 
 
+def summarize(p0_total: int, p1_total: int, p2_total: int) -> int:
+    """汇总分层计数并给出退出码。
+
+    只有 P0（阻塞性问题）才以非零退出让 daily run 变红；P1 是 advisory 告警，
+    在汇总区显著输出但退出 0——否则 pipeline_task_runs 天天记 FAILED、
+    systemd OnFailure 假告警，告警疲劳会淹没真 P0（2026-07-07 调整）。
+    """
+    _section("汇总（按严重度分层）")
+    logger.info("  P0 BLOCKING : {} 项", p0_total)
+    logger.info("  P1 WARNING  : {} 项", p1_total)
+    logger.info("  P2 ADVISORY : {} 项", p2_total)
+    if p0_total > 0:
+        logger.error("  存在 P0 阻塞性问题，需要立即处理。")
+        return 1
+    if p1_total > 0:
+        logger.warning("  ⚠️ P1 告警汇总: {} 项待关注（advisory 不阻塞调度，exit 0；明细见上方各 section）。", p1_total)
+        return 0
+    logger.success("  所有检查通过。")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     start_time = time.monotonic()
     setup_logging()
@@ -405,18 +426,7 @@ def main(argv: list[str] | None = None) -> int:
                     session.rollback()
                     logger.opt(exception=exc).warning("报告 section {} 执行失败，跳过: {}", name, exc)
 
-        _section("汇总（按严重度分层）")
-        logger.info("  P0 BLOCKING : {} 项", p0_total)
-        logger.info("  P1 WARNING  : {} 项", p1_total)
-        logger.info("  P2 ADVISORY : {} 项", p2_total)
-        if p0_total > 0:
-            logger.error("  存在 P0 阻塞性问题，需要立即处理。")
-            return 2
-        if p1_total > 0:
-            logger.warning("  存在 P1 告警，建议关注。")
-            return 1
-        logger.success("  所有检查通过。")
-        return 0
+        return summarize(p0_total, p1_total, p2_total)
     except Exception as exc:
         logger.opt(exception=exc).critical("health_report 执行失败: {}", exc)
         return 1
