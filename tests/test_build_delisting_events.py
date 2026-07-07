@@ -2627,3 +2627,50 @@ class TestCashReturnSanityGate:
         assert self._row("15.00", "10.00")["delisting_return"] == Decimal("0.50000000")
         assert self._row("5.99", "10.00")["delisting_return"] is None
         assert self._row("15.01", "10.00")["delisting_return"] is None
+
+
+class TestMergerProxyFamilyWidening:
+    """并购委托书族扩圈：DEF 14A/SC 14D9 等入池、族内按特异性排序、
+    年会 DEF 14A 的 election 样板句免疫。"""
+
+    def test_proxy_rank_orders_defm14a_before_generic_def14a(self):
+        evidence = Evidence(defm14a=[
+            _filing(accession="0001-24-000001", form="DEF 14A",
+                    filed=date(2024, 5, 27), doc_url="u1"),   # 更近但泛用
+            _filing(accession="0001-24-000002", form="DEFM14A",
+                    filed=date(2024, 4, 2), doc_url="u2"),    # 更远但专用
+        ])
+        picked = pick_merger_doc_candidates(evidence, date(2024, 6, 1))
+        assert [f.form_type for f in picked[:2]] == ["DEFM14A", "DEF 14A"]
+
+    def test_sc14d9_ranks_between_defm14a_and_def14a(self):
+        evidence = Evidence(defm14a=[
+            _filing(accession="0001-24-000003", form="DEF 14A",
+                    filed=date(2024, 5, 29), doc_url="u1"),
+            _filing(accession="0001-24-000004", form="SC 14D9",
+                    filed=date(2024, 5, 2), doc_url="u2"),
+        ])
+        picked = pick_merger_doc_candidates(evidence, date(2024, 6, 1))
+        assert picked[0].form_type == "SC 14D9"
+
+    def test_annual_proxy_edelivery_boilerplate_never_sets_election(self):
+        # 年会 DEF 14A：无对价章节、无对价候选，只有电子送达样板句——
+        # 绝不允许它抑制其他文档抽出的股票腿
+        annual = ("Stockholders may elect to receive future proxy materials "
+                  "electronically by email. The annual meeting will be held in June.")
+        deal_8k = ("Each share was converted into 0.5000 shares of Acquirer Inc. "
+                   "common stock for each share of the Company.")
+        result = extract_consideration(
+            [(_filing(form="DEF 14A"), annual), (_filing(form="8-K"), deal_8k)],
+            final_price=Decimal("10.00"),
+        )
+        assert result.stock_ratio == Decimal("0.5000")
+        assert result.election is False
+
+    def test_deal_doc_election_with_candidates_still_detected(self):
+        deal = ("each holder may elect to receive either $10.00 per share in cash "
+                "or 0.5000 shares of Acquirer Inc. common stock for each share")
+        result = extract_consideration(
+            [(_filing(form="8-K"), deal)], final_price=Decimal("10.00"),
+        )
+        assert result.election is True

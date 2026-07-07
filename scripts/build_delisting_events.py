@@ -141,6 +141,12 @@ EIGHTK_103_WINDOW_BEFORE_DAYS = 400
 # 数月，窗口前沿放宽到 365 天，后沿至 delist_date（days_after=0）
 EIGHTK_101_WINDOW_BEFORE_DAYS = 365
 DEFM14A_WINDOW_BEFORE_DAYS = 120
+# 并购委托书族（load_defm14a_filings / 文档优先级共用；序即优先级——并购专用
+# 表格在前，普通 DEF 14A 最后）：598 只无文档并购族解剖显示只有 4 个 CIK 有
+# DEFM14A，但 116 只窗口内有普通 DEF 14A（特别股东会并购委托书常不用 M 表格），
+# SC 14D9（要约收购目标方声明）是现金要约的对价一手来源。
+MERGER_PROXY_FORM_TYPES = ("DEFM14A", "SC 14D9", "PREM14A", "DEFM14C", "DEF 14A")
+_PROXY_FORM_RANK = {form: rank for rank, form in enumerate(MERGER_PROXY_FORM_TYPES)}
 
 # Form 25 的 12d2-2 规则段 → reason。子款：(a)(1) 全类赎回 / (a)(2) 到期退休
 # → LIQUIDATION（CS 类多为 SPAC 赎回清算）；(a)(3)/(a)(4) 全类换成另一证券 →
@@ -964,16 +970,28 @@ def pick_merger_doc_candidates(evidence: Evidence, delist_date: date) -> list[Fi
             key=lambda f: (abs((f.filing_date - delist_date).days), f.accession_number),
         )
 
+    def proxies_by_rank(filings: list[Filing]) -> list[Filing]:
+        # 委托书族内先按 form 特异性（DEFM14A > SC 14D9 > ... > DEF 14A），
+        # 同 form 再按贴近度——普通 DEF 14A 可能是年会件，永远排在专用表格之后
+        return sorted(
+            (f for f in filings if f.primary_document_url),
+            key=lambda f: (
+                _PROXY_FORM_RANK.get((f.form_type or "").upper(), len(_PROXY_FORM_RANK)),
+                abs((f.filing_date - delist_date).days),
+                f.accession_number,
+            ),
+        )
+
     if evidence.eightk_201:
         ordered = (
             by_proximity(evidence.eightk_201)
-            + by_proximity(evidence.defm14a)
+            + proxies_by_rank(evidence.defm14a)
             + by_proximity(evidence.eightk_101)
             + by_proximity(evidence.eightk_301)
         )
     else:
         ordered = (
-            by_proximity(evidence.defm14a)
+            proxies_by_rank(evidence.defm14a)
             + by_proximity(evidence.eightk_101)
             + by_proximity(evidence.eightk_301)
         )
@@ -1020,20 +1038,28 @@ def extract_consideration(
     for filing, doc_text in fetched_docs:
         accessions.append(filing.accession_number)
         extraction_text = doc_text
-        if (filing.form_type or "").upper() == "DEFM14A":
+        section_found = False
+        if (filing.form_type or "").upper() in _PROXY_FORM_RANK:
             section = slice_defm14a_consideration_section(doc_text)
             if section is not None:
                 extraction_text = section
-        amounts.extend(extract_cash_amounts(extraction_text))
+                section_found = True
+        doc_amounts = extract_cash_amounts(extraction_text)
+        amounts.extend(doc_amounts)
+        doc_had_candidates = bool(doc_amounts)
         for ratio_value, ratio_acquirer in extract_stock_ratios(extraction_text):
             ratios.append(ratio_value)
+            doc_had_candidates = True
             if ratio_acquirer:
                 stock_acquirers.setdefault(ratio_acquirer.lower().rstrip("."), ratio_acquirer)
         for name in extract_acquirer_names(doc_text):
             acquirers.setdefault(name.lower().rstrip("."), name)
-        # election 检测与现金/换股比同域（切片当存在，否则全文）——避开委托书里
-        # 与对价无关的电子送达样板句
-        if _ELECTION_RE.search(extraction_text):
+        # election 检测与现金/换股比同域（切片当存在，否则全文），且只认
+        # "确属交易文档" 的文本——切到对价章节、或该文本抽出过对价候选。
+        # 普通 DEF 14A 年会件全文回退时携带的电子送达样板句
+        # （"elect to receive future proxy materials electronically"）
+        # 抽不出任何对价候选，绝不允许它抑制真实的股票/混合腿。
+        if (section_found or doc_had_candidates) and _ELECTION_RE.search(extraction_text):
             election = True
 
     notes: list[str] = []
@@ -1509,7 +1535,12 @@ def _load_eightk_item_filings(session, security_ids: list[int], item: str,
 
 
 def load_defm14a_filings(session, security_ids: list[int]) -> dict[int, list[Filing]]:
-    """并购委托书 DEFM14A（delist 前 120 天窗口），对价抽取的兜底文档来源。"""
+    """并购委托书族（delist 前 120 天窗口），对价抽取的兜底文档来源。
+
+    form 族见 MERGER_PROXY_FORM_TYPES：DEFM14A 之外，普通 DEF 14A（特别股东会
+    并购委托书的常见载体）、PREM14A/DEFM14C、SC 14D9（要约收购）都收。普通
+    DEF 14A 可能是年会委托书（噪声）——排序权重放最后，extract_consideration
+    的章节切片 + 并购专用正则天然免疫年会文本。"""
     if not security_ids:
         return {}
     rows = session.execute(text("""
@@ -1518,10 +1549,11 @@ def load_defm14a_filings(session, security_ids: list[int]) -> dict[int, list[Fil
         JOIN sec_filings f ON ltrim(f.cik, '0') = ltrim(s.cik, '0')
         WHERE s.id = ANY(:ids)
           AND s.cik IS NOT NULL AND s.cik <> ''
-          AND f.form_type = 'DEFM14A'
+          AND f.form_type = ANY(:forms)
           AND f.filing_date BETWEEN s.delist_date - :before AND s.delist_date
         ORDER BY s.id, f.filing_date, f.accession_number
-    """), {"ids": security_ids, "before": DEFM14A_WINDOW_BEFORE_DAYS}).all()
+    """), {"ids": security_ids, "forms": list(MERGER_PROXY_FORM_TYPES),
+           "before": DEFM14A_WINDOW_BEFORE_DAYS}).all()
     filings: dict[int, list[Filing]] = {}
     for security_id, accession, form_type, filing_date, doc_url in rows:
         filings.setdefault(security_id, []).append(
