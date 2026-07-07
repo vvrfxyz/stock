@@ -347,8 +347,11 @@ def securities_with_uncovered_events(
     事件前无任何价格行则无可调整行、不产生假跳空；事件后无任何价格行则缺失因子
     均匀作用于全序列（同乘一个常数），收益率不变。跨立性只依赖每证券 daily_prices
     的 min(date)/max(date)（exists(date<ex) <=> min<ex；exists(date>=ex) <=> max>=ex，
-    内部缺口不影响存在性），故对洞证券集合做一次 join 聚合即可，不必逐行 EXISTS
-    扫 3,100 万行价格表。无任何价格行的证券同样放行（面板里本就没有它的列）。
+    内部缺口不影响存在性），故对洞证券集合逐证券做 LATERAL min/max 端点探针即可
+    （PK (security_id, date) 两端各一次 index-only 探测），不必逐行 EXISTS 扫
+    3,100 万行价格表——`IN + GROUP BY` 聚合写法会诱使规划器全表 Seq Scan
+    daily_prices（生产实测 23s vs LATERAL 3.4s，结果位级相同）。无任何价格行的
+    证券同样放行（面板里本就没有它的列）。
     实测（生产库，窗口 2003-01-01..2026-07-07）：剔除数 2,310 -> 794。
 
     跨立按证券**全历史**价格边界判定，不按 start/end 裁剪价格行——有意的保守选择：
@@ -388,10 +391,13 @@ def securities_with_uncovered_events(
             f"""
             with uncovered as ({uncovered_sql}),
             bounds as (
-                select p.security_id, min(p.date) as min_date, max(p.date) as max_date
-                from daily_prices p
-                where p.security_id in (select distinct security_id from uncovered)
-                group by p.security_id
+                select s.security_id, b.min_date, b.max_date
+                from (select distinct security_id from uncovered) s
+                cross join lateral (
+                    select min(p.date) as min_date, max(p.date) as max_date
+                    from daily_prices p
+                    where p.security_id = s.security_id
+                ) b
             )
             select distinct u.security_id
             from uncovered u
