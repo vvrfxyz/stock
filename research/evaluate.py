@@ -45,6 +45,7 @@ from research.factors.builtins import short_volume as _short_volume  # noqa: F40
 from research.factors.builtins import size as _size  # noqa: F401
 from research.factors.builtins import ta_zoo as _ta_zoo  # noqa: F401
 from research.factors.protocol import Factor, FactorContext, get, list_factors
+from research.progress import Progress
 from utils.risk_free_rates import DEFAULT_SERIES_ID as DEFAULT_RISK_FREE_SERIES, load_risk_free_daily_returns
 from utils.trading_calendar import shift_trading_date
 
@@ -946,9 +947,11 @@ def evaluate_all(
     factor_names = names or list_factors()
     results: list[EvaluationResult] = []
     run_id = hashlib.sha1(f"{pd.Timestamp.now(tz='UTC').isoformat()}:{factor_names}".encode()).hexdigest()
-    for name in factor_names:
+    prog = Progress("evaluate", total=len(factor_names))
+    for i, name in enumerate(factor_names, 1):
         try:
-            result = run_evaluation(name, engine=engine, start=start, end=end, run_id=run_id, **kwargs)
+            with prog.stage(f"因子 {name}", item=i):
+                result = run_evaluation(name, engine=engine, start=start, end=end, run_id=run_id, **kwargs)
             results.append(result)
         except Exception as exc:
             if kwargs.get("strict"):
