@@ -265,6 +265,33 @@ class DelistingEvent(Base):
     )
 
 
+class CompanyEvent(Base):
+    """公司世系/并购边表——记录一个公司实体如何演变为另一个（并购、CIK 变更、
+    分拆、改名）。有向边 predecessor_company_id -> successor_company_id，用于
+    跨实体的世系回溯与幸存者偏差修正。由 scripts/build_company_events.py 幂等重建。
+    """
+    __tablename__ = 'company_events'
+    id = Column(BigInteger, primary_key=True)
+    predecessor_company_id = Column(BigInteger, ForeignKey('companies.id'), nullable=False, index=True,
+                                    comment="前身公司实体（companies.id）")
+    successor_company_id = Column(BigInteger, ForeignKey('companies.id'), nullable=False, index=True,
+                                  comment="继承公司实体（companies.id）")
+    event_date = Column(Date, nullable=False, index=True)
+    event_type = Column(String(20), nullable=False, index=True,
+                        comment="MERGER / CIK_CHANGE / SPINOFF / RENAME")
+    evidence = Column(Text, nullable=True, comment="accession number / 令牌 / 推断依据")
+    source = Column(String(30), nullable=True, comment="DELISTING / MANUAL")
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    predecessor = relationship("Company", foreign_keys=[predecessor_company_id])
+    successor = relationship("Company", foreign_keys=[successor_company_id])
+    __table_args__ = (
+        UniqueConstraint('predecessor_company_id', 'successor_company_id', 'event_date', 'event_type',
+                         name='_company_event_edge_uc'),
+    )
+
+
 class VendorAdjustmentFactor(Base):
     __tablename__ = 'vendor_adjustment_factors'
     id = Column(BigInteger, primary_key=True)

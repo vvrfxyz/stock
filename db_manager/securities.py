@@ -7,7 +7,7 @@ from loguru import logger
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from data_models.models import Company, DailyPrice, Security, SecurityIdentityEvent, SecuritySymbolHistory
+from data_models.models import Company, CompanyEvent, DailyPrice, Security, SecurityIdentityEvent, SecuritySymbolHistory
 from utils.massive_config import ALLOWED_US_SECURITY_TYPES
 
 from .helpers import _clean_for_model, _dedupe_rows_by_key, _group_rows_by_key_set
@@ -63,6 +63,37 @@ class SecuritiesMixin:
                 Company,
                 group,
                 ['cik'],
+                update_on_conflict=True,
+            )
+        return written
+
+    def upsert_company_events(self, rows_data: list[dict]) -> int:
+        """写公司世系/并购边。冲突键
+        (predecessor_company_id, successor_company_id, event_date, event_type)。
+
+        幂等全量重建语义：冲突时以本批为准原位覆盖 evidence/source（重跑用最新
+        证据刷新），id/created_at 受保护。缺任一必填字段（两端 company_id/日期/
+        类型）的行直接跳过——NOT NULL 约束不该靠数据库报错兜底。"""
+        rows = [_clean_for_model(CompanyEvent, row) for row in rows_data]
+        rows = [
+            row for row in rows
+            if row.get('predecessor_company_id')
+            and row.get('successor_company_id')
+            and row.get('event_date')
+            and row.get('event_type')
+        ]
+        if not rows:
+            return 0
+        index_elements = [
+            'predecessor_company_id', 'successor_company_id', 'event_date', 'event_type',
+        ]
+        written = 0
+        # 按键集分组：冲突时只更新该行明确提供的字段（缺 evidence 不覆盖成 NULL）。
+        for group in _group_rows_by_key_set(rows):
+            written += self._batch_upsert(
+                CompanyEvent,
+                group,
+                index_elements,
                 update_on_conflict=True,
             )
         return written
