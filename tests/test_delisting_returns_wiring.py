@@ -283,3 +283,116 @@ def test_redemption_par_synthesizes_zero_for_spac_redemptions(pg_db):
     assert got.to_dict() == {1: 0.0}
     # 单独关 redemption par：spac 行消失
     assert load_delisting_returns(pg_db.engine, redemption_par=False).empty
+
+
+# ---------------------------------------------------------------------------
+# exchange_drop_fallback：EXCHANGE_DROP 无实测行的读取层经验合成（默认关=旧口径）
+# ---------------------------------------------------------------------------
+
+def _exchange_drop_event(security_id, delist_date, *, delisting_return=None):
+    return _event(
+        security_id, delist_date, delisting_return,
+        reason_code="EXCHANGE_DROP",
+        reason_confidence="MEDIUM",
+        source="TICKER_EVENT",
+    )
+
+
+@pytest.mark.integration
+def test_exchange_drop_fallback_only_hits_null_exchange_drop_rows(pg_db):
+    """fallback 只作用于 EXCHANGE_DROP 且无实测的行：其他 reason_code 的 NULL 行
+    照旧缺席，实测行（含 EXCHANGE_DROP 自己的实测）绝不被合成值覆盖。"""
+    from research.data import load_delisting_returns
+
+    for sid, sym in [(1, "otcx"), (2, "otcm"), (3, "unkn"), (4, "dead")]:
+        _insert_security(pg_db, sid, sym)
+    pg_db.upsert_delisting_events([
+        # EXCHANGE_DROP + 实测 NULL -> 合成 fallback
+        _exchange_drop_event(1, date(2022, 5, 2)),
+        # EXCHANGE_DROP 有实测（含深负实测）-> 实测优先，不被覆盖
+        _exchange_drop_event(2, date(2022, 5, 2), delisting_return=Decimal("-0.85")),
+        # 非 EXCHANGE_DROP 的 NULL 行照旧缺席（不被 fallback 波及）
+        _event(3, date(2022, 5, 2), None),
+        # 普通实测行不受影响
+        _event(4, date(2020, 3, 2), Decimal("-1")),
+    ])
+
+    got = load_delisting_returns(pg_db.engine, exchange_drop_fallback=-0.30)
+    assert got.to_dict() == {1: -0.30, 2: -0.85, 4: -1.0}
+    assert got.dtype == "float64"
+
+
+@pytest.mark.integration
+def test_exchange_drop_default_none_reproduces_old_convention(pg_db):
+    """默认参数（None）逐位复现旧口径：EXCHANGE_DROP 无实测行整体缺席。"""
+    from research.data import load_delisting_returns
+
+    _insert_security(pg_db, 1, "otcx")
+    _insert_security(pg_db, 2, "dead")
+    pg_db.upsert_delisting_events([
+        _exchange_drop_event(1, date(2022, 5, 2)),
+        _event(2, date(2020, 3, 2), Decimal("-1")),
+    ])
+
+    got = load_delisting_returns(pg_db.engine)
+    assert got.to_dict() == {2: -1.0}
+
+
+@pytest.mark.integration
+def test_exchange_drop_measured_zero_not_treated_as_missing(pg_db):
+    """EXCHANGE_DROP 实测恰为 0.0 不得被 fallback 顶掉（coalesce 语义锁定）。"""
+    from research.data import load_delisting_returns
+
+    _insert_security(pg_db, 1, "flat")
+    pg_db.upsert_delisting_events([
+        _exchange_drop_event(1, date(2022, 5, 2), delisting_return=Decimal("0")),
+    ])
+
+    assert load_delisting_returns(pg_db.engine, exchange_drop_fallback=-0.30).to_dict() == {1: 0.0}
+
+
+@pytest.mark.integration
+def test_exchange_drop_fallback_respects_latest_episode_semantics(pg_db):
+    """两次退市：更早一次是 EXCHANGE_DROP、最近一次是有实测的并购——面板终局是
+    最近那次，fallback 不得借用旧周期的合成收益。"""
+    from research.data import load_delisting_returns
+
+    _insert_security(pg_db, 1, "back")
+    pg_db.upsert_delisting_events([
+        _exchange_drop_event(1, date(2015, 1, 5)),
+        _event(1, date(2024, 9, 30), Decimal("0.02")),
+    ])
+
+    got = load_delisting_returns(pg_db.engine, exchange_drop_fallback=-0.30)
+    assert got.to_dict() == {1: 0.02}
+
+
+@pytest.mark.integration
+def test_exchange_drop_fallback_composes_with_par_opt_out(pg_db):
+    """fallback 与 par 合成是独立开关：关掉 par 不影响 EXCHANGE_DROP 合成。"""
+    from research.data import load_delisting_returns
+
+    _insert_security(pg_db, 1, "otcx")
+    _insert_security(pg_db, 2, "detf")
+    pg_db.upsert_delisting_events([
+        _exchange_drop_event(1, date(2022, 5, 2)),
+        _fund_closure_event(2, date(2023, 4, 14), final_price=Decimal("25.10")),
+    ])
+
+    got = load_delisting_returns(
+        pg_db.engine, fund_closure_par=False, redemption_par=False,
+        exchange_drop_fallback=-0.30,
+    )
+    assert got.to_dict() == {1: -0.30}
+
+
+def test_exchange_drop_fallback_refuses_non_finite():
+    """NaN/Inf 是无声的口径事故（params_hash 也拒绝），装载层直接抛。"""
+    import math
+
+    from research.data import load_delisting_returns
+
+    with pytest.raises(ValueError):
+        load_delisting_returns(object(), exchange_drop_fallback=math.nan)
+    with pytest.raises(ValueError):
+        load_delisting_returns(object(), exchange_drop_fallback=math.inf)

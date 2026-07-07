@@ -839,6 +839,7 @@ def run_evaluation(
     terminal_return: float | None = None,
     use_delisting_returns: bool = True,
     fund_closure_par: bool = True,
+    exchange_drop_fallback: float | None = None,
     existing_trial_ids: frozenset[str] | None = None,
 ) -> EvaluationResult:
     from research._trials_store import _git_meta, append_trial
@@ -870,7 +871,8 @@ def run_evaluation(
     # CLI 标量降级为未覆盖证券的 fallback；opt-out / 表空时只用标量（旧口径）。
     realized = (
         load_delisting_returns(engine, fund_closure_par=fund_closure_par,
-                               redemption_par=fund_closure_par)
+                               redemption_par=fund_closure_par,
+                               exchange_drop_fallback=exchange_drop_fallback)
         if use_delisting_returns
         else pd.Series(dtype="float64")
     )
@@ -937,6 +939,10 @@ def run_evaluation(
         "fund_closure_par": fund_closure_par if isinstance(resolved_terminal, pd.Series) else None,
         # redemption_par 与 fund_closure_par 同旗标控制（读取层 par 合成一体开关）
         "redemption_par": fund_closure_par if isinstance(resolved_terminal, pd.Series) else None,
+        # EXCHANGE_DROP 无实测行的读取层经验合成（--exchange-drop-fallback，默认 None=旧口径
+        # 即回测按 0% 处理）。同 fund_closure_par：只在实测口径下起作用，其余口径归一为
+        # None 避免无谓的 hash 分裂；值进 params_hash，新旧口径 trial 不互相顶替。
+        "exchange_drop_fallback": exchange_drop_fallback if isinstance(resolved_terminal, pd.Series) else None,
         "run_id": run_id,
         "note": note,
     }
@@ -1194,7 +1200,8 @@ def _write_markdown_report(result: EvaluationResult, output_dir: Path) -> Path:
         f"- Terminal-return mode: `{terminal_mode}`"
         f" (scalar={result.config.get('terminal_return_scalar')},"
         f" fallback={result.config.get('terminal_return_fallback')},"
-        f" fund_closure_par={result.config.get('fund_closure_par')}).",
+        f" fund_closure_par={result.config.get('fund_closure_par')},"
+        f" exchange_drop_fallback={result.config.get('exchange_drop_fallback')}).",
     ]
     if terminal_mode != "none":
         notes.append(
@@ -1253,6 +1260,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-fund-closure-par", action="store_true",
                         help="关闭读取层 par 合成（ETF 清盘 FUND_CLOSURE 与 SPAC 赎回 LIQUIDATION+"
                              "redemption_provision 的 NULL 实测行合成 0.0），只用纯实测行。")
+    parser.add_argument("--exchange-drop-fallback", type=float, default=None,
+                        help="EXCHANGE_DROP（摘牌转 OTC 等 1,194 只）无实测退市收益行的读取层"
+                             "经验合成值（如 -0.30，CRSP 风格假设）。默认不合成=旧口径，回测按 "
+                             "0%% 处理会虚增小盘 q5；实测值永远优先。值进 params_hash。")
     persist_group = parser.add_mutually_exclusive_group()
     persist_group.add_argument("--trials-path", type=Path, default=None)
     persist_group.add_argument("--no-persist", action="store_true")
@@ -1294,6 +1305,7 @@ def main(argv: list[str] | None = None) -> int:
         terminal_return=args.terminal_return,
         use_delisting_returns=not args.no_delisting_returns,
         fund_closure_par=not args.no_fund_closure_par,
+        exchange_drop_fallback=args.exchange_drop_fallback,
         trials_path=args.trials_path,
         note=args.note,
         strict=args.strict,

@@ -251,6 +251,7 @@ def load_delisting_returns(
     *,
     fund_closure_par: bool = True,
     redemption_par: bool = True,
+    exchange_drop_fallback: float | None = None,
 ) -> pd.Series:
     """逐证券实测退市收益（index=security_id int, values=float）。
 
@@ -273,8 +274,16 @@ def load_delisting_returns(
     且 final_price 在场时同样合成 0.0——机制与 ETF 清盘 par 同构：赎回价 =
     信托账户固定金额，终价已收敛到赎回价，持有人按信托价平价退出。只认
     redemption_provision 证据行（真清算/破产式 LIQUIDATION 不带该标记，不合成）。
+
+    exchange_drop_fallback=None（默认）：EXCHANGE_DROP（摘牌转 OTC 等，1,194 只、
+    平均深负后续收益）无实测 return 的行**不出现**在结果里——回测按 0% 处理，
+    即旧口径，会虚增小盘 q5 组合表现。传非 None（如 -0.30，CRSP 风格经验假设）
+    时对 reason_code='EXCHANGE_DROP' 且 delisting_return 为 NULL 的行在读取时
+    合成该值；实测值（含恰为 0.0 的实测）永远优先，不会被合成值覆盖。经验值
+    只活在读取层，事实表保持 NULL——与 fund_closure_par 同一纪律。
     """
     par_cases: list[str] = []
+    params: dict[str, float] = {}
     if fund_closure_par:
         par_cases.append(
             "when reason_code = 'FUND_CLOSURE' and final_price is not null then 0.0"
@@ -284,6 +293,15 @@ def load_delisting_returns(
             "when reason_code = 'LIQUIDATION' and final_price is not null "
             "and evidence like '%redemption_provision%' then 0.0"
         )
+    if exchange_drop_fallback is not None:
+        if not np.isfinite(exchange_drop_fallback):
+            raise ValueError("exchange_drop_fallback must be a finite float")
+        # 无 final_price 门槛：EXCHANGE_DROP 的经验假设锚的是"摘牌后深负结局"
+        # 本身，不像 par 合成需要终价收敛锚点。coalesce 保证实测值永远优先。
+        par_cases.append(
+            "when reason_code = 'EXCHANGE_DROP' then :exchange_drop_fallback"
+        )
+        params["exchange_drop_fallback"] = float(exchange_drop_fallback)
     if par_cases:
         value_expr = (
             "coalesce(delisting_return, case " + " ".join(par_cases) + " end)"
@@ -302,7 +320,7 @@ def load_delisting_returns(
         where ({value_expr}) is not null
         """
     )
-    df = pd.read_sql_query(sql, engine)
+    df = pd.read_sql_query(sql, engine, params=params or None)
     series = df.set_index("security_id")["delisting_return"].astype("float64")
     series.index = series.index.astype("int64")
     return series

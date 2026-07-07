@@ -107,7 +107,8 @@ def _wire(monkeypatch, *, realized: pd.Series, expect_par_kwarg: list | None = N
         "dollar_volume": pd.DataFrame(10_000_000.0, index=dates, columns=universe),
     }
 
-    def fake_load_delisting(engine, *, fund_closure_par=True, redemption_par=True):
+    def fake_load_delisting(engine, *, fund_closure_par=True, redemption_par=True,
+                            exchange_drop_fallback=None):
         if expect_par_kwarg is not None:
             expect_par_kwarg.append(fund_closure_par)
         return realized
@@ -193,6 +194,48 @@ class TestRunEvaluationWiring:
         other_fallback = _run(dates, terminal_return=-1.0)
         assert other_fallback.params_hash != realized_mode.params_hash
 
+    def test_exchange_drop_fallback_threads_to_loader(self, monkeypatch):
+        """--exchange-drop-fallback 穿透到 load_delisting_returns（合成发生在读取层）。"""
+        seen: list = []
+        dates = _wire(monkeypatch, realized=REALIZED)
+
+        def spy_loader(engine, *, fund_closure_par=True, redemption_par=True,
+                       exchange_drop_fallback=None):
+            seen.append(exchange_drop_fallback)
+            return REALIZED
+
+        monkeypatch.setattr(ev, "load_delisting_returns", spy_loader)
+        _run(dates)
+        _run(dates, exchange_drop_fallback=-0.30)
+        assert seen == [None, -0.30]
+
+    def test_exchange_drop_fallback_enters_params_hash(self, monkeypatch):
+        """CRITICAL：EXCHANGE_DROP 合成口径进 params_hash——默认 None（旧口径）与
+        -0.30 的 trial 必须可区分，不同 fallback 值之间也必须可区分。"""
+        dates = _wire(monkeypatch, realized=REALIZED)
+        default_mode = _run(dates)
+        crsp_mode = _run(dates, exchange_drop_fallback=-0.30)
+        deep_mode = _run(dates, exchange_drop_fallback=-0.55)
+
+        assert default_mode.config["exchange_drop_fallback"] is None
+        assert crsp_mode.config["exchange_drop_fallback"] == -0.30
+        assert len({default_mode.params_hash, crsp_mode.params_hash, deep_mode.params_hash}) == 3
+
+    def test_exchange_drop_fallback_normalized_outside_realized_mode(self, monkeypatch):
+        """opt-out（不读 delisting_events）时 fallback 不起作用：config 归一为 None，
+        避免无谓的 hash 分裂（同 fund_closure_par 先例）。"""
+        dates = _wire(monkeypatch, realized=REALIZED)
+        monkeypatch.setattr(
+            ev, "load_delisting_returns",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("必须不读 delisting_events")))
+
+        with_fallback = _run(dates, terminal_return=-0.3, use_delisting_returns=False,
+                             exchange_drop_fallback=-0.30)
+        without = _run(dates, terminal_return=-0.3, use_delisting_returns=False)
+
+        assert with_fallback.config["exchange_drop_fallback"] is None
+        assert with_fallback.params_hash == without.params_hash
+
 
 # ---------------------------------------------------------------------------
 # CLI parser（evaluate + run_baselines 纯 parser 件）
@@ -204,6 +247,7 @@ class TestEvaluateParseArgs:
         assert args.terminal_return is None
         assert args.no_delisting_returns is False
         assert args.no_fund_closure_par is False
+        assert args.exchange_drop_fallback is None
 
     def test_terminal_return_float_and_none_semantics(self):
         assert ev.parse_args(["--factors", "size", "--terminal-return", "-0.3"]).terminal_return == -0.3
@@ -213,6 +257,10 @@ class TestEvaluateParseArgs:
         args = ev.parse_args(["--factors", "size", "--no-delisting-returns", "--no-fund-closure-par"])
         assert args.no_delisting_returns is True
         assert args.no_fund_closure_par is True
+
+    def test_exchange_drop_fallback_parses_float(self):
+        args = ev.parse_args(["--factors", "size", "--exchange-drop-fallback", "-0.30"])
+        assert args.exchange_drop_fallback == -0.30
 
 
 class TestRunBaselinesFallbackFlag:
