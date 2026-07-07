@@ -35,7 +35,7 @@
 | shadow_asymmetry（K 线影线不对称） | 日线 | t=+1.30 @h5 | 死亡 | 短窗 t=2.0 被长窗证伪——短窗显著性教训的标本 | 同上 |
 | smart_money_gap（尾盘-开盘收益差） | 分钟 | t<1 | 死亡 | 无信号 | 同上 |
 | close_vwap_pressure（收盘对 vwap 偏离） | 日线 | t<1（短窗即死） | 死亡 | wave-1 即淘汰，未进长窗 | wave-1 |
-| **composite_v1（3 信号：low_vol + high_52w 逐日残差 + size，0.5 中性填补）** | 日线+PIT 市值 | size 版 IC .0292 t=3.79 @h5；q5 净 Sharpe h21 0.718 | **可用候选（成分 low_vol+high_52w+size，breadth 弃用；2026-07-07 size 关卡重审 PASS）** | wave-6 breadth 版双条件 PASS 后被 wave-8 打回（breadth 是 size 马甲，增量疑似纯 size 暴露）；用 size 直接替换 breadth 同窗口（2016-01-04~2026-07-02）同判据重跑仍双条件 PASS（IC IR 0.1462>0.1412、q5 净 Sharpe 0.718>0.6991，vs low_vol_solo IC .0299/t=3.75）——增量非 breadth 特有，size 直接替换成立，骨架定为 low_vol+high_52w+size。下一步：retail_reality 散户口径复审。4 信号版 FAIL 是符号反转成分的直接实证 | wave-6/8、composite_v1_sizeswap 报告 |
+| **composite_v1（3 信号：low_vol + high_52w 逐日残差 + size，0.5 中性填补）** | 日线+PIT 市值 | size 版 IC .0292 t=3.79 @h5；q5 净 Sharpe h21 0.718；**散户复审（2026-07-08，口径 v2）：40bps alpha t=0.36、IR 全成本档为负、30 只子组合中位 8.65% vs 桶基准 12.63%（−4pp/年）** | **调味料（2026-07-08 降档：排序信息真实、散户不可收割）** | 排序双条件 PASS（wave-8 size 换脚重审维持）后，**retail_reality 散户口径复审双口径 FAIL**（判据 40bps alpha t>=2 且子组合中位超额>0，两半边都不过：alpha t 0.36 远低于 2，中位超额 −4pp）；EXCHANGE_DROP −0.30 敏感性口径数字几乎不动（alpha t 0.362 vs 0.356）——结论对退市口径稳健。注意口径 v2（引擎统一 run_backtest + 退市实测注入）比 wave-10b 旧快循环更严：残差 vol 时代虚增的小盘 q5 收益已挤出。**与 residual_vol/low_vol 同一死法：小盘桶 q5 的抱团肉不够厚，跑不赢桶等权基准**。IC 排序信息保留（复合成分/LS/择时出口未验）；按预注册分叉，主攻权重全转 earnings_yield 与基本面族，**不做参数挽救**。4 信号版 FAIL 是符号反转成分的直接实证 | wave-6/8、composite_v1_sizeswap 报告、retail_reality_composite_v1_*_v2 报告×2、trials study 行×2 |
 | insider_cluster（多内部人非例行集群买入，CMP 例行过滤） | SEC Form 4 | IC 负向弱（t=-0.98~-1.37，全部 noisy） | **死亡（横截面 IC 口径，2026-07-07）** | 侦察队 40-50% 基率落空：条件横截面太薄（~294 只/日）且方向不符；其预警的"事件稀疏杀日频 rank IC"命中。事件研究（CAR）口径未测试——挂低优先级开放问题 | wave-7 |
 | institutional_breadth（13F 持仓机构数） | SEC 13F | IC t=5.82~3.81 全过 Bonferroni，**但对 size 正交化后 partial IC = .0015（归零）** | **死亡（size 马甲，2026-07-07 当夜降档）** | 与 size 秩相关 **0.893**；"全项目最强单因子"称号存活 3 小时即被冗余关卡斩落——13F 机构数 ≈ 盘子大小，其全部 IC 是 2016-2026 大盘制度。变现实测同判（q5 对 spy t=-0.5；ex_q1 +0.76% t=1.4 不显著）。size 反向仍存活（size\|breadth=.0108）→ 吸收方向 size ⊃ breadth | wave-6/8 |
 | **ta_combo 四假设**（wave-11：反转集成 / 放量确认反转 / 锚定门控 / ATR 归一化超级趋势） | 日线量价 | H2 放量确认反转 t=2.88/2.41/2.28/2.18——**全 4 horizon 单调强于裸版**（2.55/2.23/2.04/1.97）但最高 2.88<2.9 不过线；H1 集成 t=2.24 反而低于最好成员；H3 锚定半区差 **精确为零**（t=0.0007）；H4 ATR 趋势 \|t\|<0.6 | **全族死亡/不过线（2026-07-07）** | 预注册四假设三死一悬：量能条件化机制获**第二次独立验证**（继 wave-3 日内版后，日频版全 horizon 单调增强——机制真实，但基础信号太弱托不过 Bonferroni）；"四指标共潜因子"假设证伪（集成加噪不减噪=成员噪声相关）；锚定不调制反转（但半区内分层 IC .0148 t=3.3-3.9 双双高于全截面——分层去噪的事后观察，未预注册不入账）；超级趋势/ATR 族整族结案。**日频反转在本市场的天花板 ≈ t2.9，怎么修饰都差一口气；量能条件化机制的家在日内** | wave-11、docs/wave11_hypotheses.md |
@@ -80,19 +80,19 @@
 ## 开放问题（下一轮候选，按预期肉厚排序）
 
 技术/价格族研究弧（wave 1-9）已完整结案：排序信息真实（小盘特质波动）、
-所有变现出口逐一验毕关闭。下一轮应换族：
+所有变现出口逐一验毕关闭。~~composite_v1 散户口径复审~~（2026-07-08 双口径 FAIL 结案，
+见裁决表——价格族"排序真实、散户不可收割"的结论至此覆盖单因子与复合两种形态）。
+下一轮应换族：
 
-1. **composite_v1 散户口径复审（可用候选的收尾关）**：骨架已定（low_vol+high_52w+size，
-   size 关卡重审 PASS 2026-07-07），进生产前按 `research/retail_reality_study.py` 模板
-   过 $20k/20-40 只/40bps 现实档——wave-10b 教训在前，IC/Sharpe 达标不等于散户可收割。
-2. **liquidity_lambda（基建型）**：分钟级 Kyle-λ + 暂态方差占比。
-   wave-9 把"小盘真实成本"变成了所有后续研究的卡脖子参数——即使因子死，
-   逐股冲击成本面也直接替换 10-25bps 拍脑袋档，让"真实但不可收割"的判定可量化。
+1. **基本面族长窗攻坚（主攻，roadmap W1-2/W2-4）**：earnings_yield（XBRL 2009+ 已就绪，
+   2011+ 长窗 h1 t=5.31 已实测——探索性 trial 49f0d58b2957，待 P2 新退市口径正式重跑确认）
+   补三关对照 + 栖息地诊断 + 散户复审；随后 gross profitability / accruals /
+   operating profitability / asset growth / F-score 子集预注册评估（wave-12）。
+2. **liquidity_lambda（基建型，已改造为价差面进 roadmap W3-5）**：分钟级实测有效价差
+   替换 20/40/80bps 拍脑袋档——"真实但不可收割"判定的成本输入精化。
 3. **peer_lead_lag（侦察队第二候选）**：行业内大→小信息扩散；接收腿=小盘——
    但必须带 wave-9 的栖息地诊断与现实成本档一起设计。
-4. **基本面族长窗攻坚**：earnings_yield（XBRL 2009+ 已就绪）从未做过 2016+ 长窗
-   评估与三关对照——技术族已挖完，价值/质量族是没动过的矿。
-5. insider_cluster 事件研究口径（CAR）；eod 隔夜腿精修——均低优先级。
+4. insider_cluster 事件研究口径（CAR）；eod 隔夜腿精修——均低优先级。
 
 ## 工程债（研究基建）
 
