@@ -99,19 +99,41 @@ def load_price_long_fast(
 
 
 def _materialize(engine, *, start: date, end: date, security_ids: list[int],
-                 columns: tuple[str, ...], with_adjusted: bool) -> None:
-    """急切物化：长表一次装载 -> 需要的宽表逐列 pivot + 复权派生 -> **清退长表**。
+                 columns: tuple[str, ...], with_adjusted: bool) -> tuple[date, date]:
+    """急切物化：长表一次装载 -> 宽表逐列 pivot + 复权派生 -> **清退长表**。
 
-    长表（~1.9G/10 年全宇宙）在宽表齐备后是纯冗余，驻留即 OOM 风险
-    （253 仅 11G 且与 PG/CH 同宿）。物化标记键防止重复装载。
+    窗口覆盖复用（v4，2026-07-07 OOM 二号根因修复）：evaluate 的 PIT 重放会以
+    不同截止日重复请求同一面板——键含精确 end 时每个重放日都触发全量再物化
+    （253 实录：第二窗口物化中 6G 被杀）。现在同 (宇宙, start) 下 end 更晚的
+    缓存直接覆盖服务更早的请求（因子层随后 reindex 到 ctx.dates，多余尾部无害）；
+    需要更晚 end 时**先清退**旧窗口再装载，同套面板永不双份驻留。
+
+    返回实际服务该请求的缓存窗口键 (start, end)。
     """
     fp = _universe_fingerprint(security_ids)
     url = str(engine.url)
-    need = [c for c in columns
-            if ("wide", url, start, end, fp, c) not in _PANEL_CACHE]
+    # 覆盖复用：找同 (fp, start) 且 end 覆盖请求的现存窗口
+    served_end = None
+    for key in _PANEL_CACHE:
+        if key[0] == "wide" and key[1] == url and key[2] == start and key[4] == fp and key[3] >= end:
+            served_end = key[3]
+            break
+    if served_end is not None:
+        have_all = all(("wide", url, start, served_end, fp, c) in _PANEL_CACHE for c in columns)
+        have_adj = not with_adjusted or ("adj_close", url, start, served_end, fp) in _PANEL_CACHE
+        if have_all and have_adj:
+            return start, served_end
+        end = served_end  # 部分命中：在同一窗口上补列，避免开新窗口
+    need = [c for c in columns if ("wide", url, start, end, fp, c) not in _PANEL_CACHE]
     need_adj = with_adjusted and ("adj_close", url, start, end, fp) not in _PANEL_CACHE
     if not need and not need_adj:
-        return
+        return start, end
+    # 物化前清退：同 (fp, start) 的更早窗口条目全部丢弃——先腾内存再装载
+    stale = [k for k in _PANEL_CACHE
+             if k[1] == url and k[2] == start and (k[4] if k[0] == "wide" else k[-1]) == fp
+             and k[3] < end]
+    for k in stale:
+        del _PANEL_CACHE[k]
     prog = Progress(f"panels[{start}~{end}]")
     load_cols = sorted(set(need) | ({"close"} if need_adj else set()))
     with prog.stage(f"COPY 长表 {load_cols}"):
@@ -138,6 +160,7 @@ def _materialize(engine, *, start: date, end: date, security_ids: list[int],
                                          values="adj_close", aggfunc="last")
             _PANEL_CACHE[("adj_close", url, start, end, fp)] = adj
     del frame  # 长表清退：宽表齐备后不留 GB 级冗余
+    return start, end
 
 
 def _window(dates: pd.DatetimeIndex, buffer_days: int) -> tuple[date, date]:
@@ -155,8 +178,8 @@ def raw_bar_panels(
 ) -> dict[str, pd.DataFrame]:
     """原始日线多列宽表；长表单次装载即清退，逐列单次 pivot，跨因子全命中。"""
     start, end = _window(dates, buffer_days)
-    _materialize(engine, start=start, end=end, security_ids=security_ids,
-                 columns=columns, with_adjusted=False)
+    start, end = _materialize(engine, start=start, end=end, security_ids=security_ids,
+                              columns=columns, with_adjusted=False)
     fp = _universe_fingerprint(security_ids)
     return {col: _PANEL_CACHE[("wide", str(engine.url), start, end, fp, col)]
             for col in columns}
@@ -169,10 +192,18 @@ def adjusted_close_panel(
     security_ids: list[int],
     buffer_days: int = 45,
 ) -> pd.DataFrame:
-    """复权收盘宽表（含 lookback 预热段），与原始宽表共享一次装载，进程内记忆化。"""
+    """复权收盘宽表（含 lookback 预热段），与原始宽表共享一次装载，进程内记忆化。
+
+    注意：覆盖复用可能返回 end 更晚的缓存窗口——复权 as_of 随之更晚。因子层
+    全部做后复权**比值/收益**运算（口径对 as_of 平移不变），语义不受影响。
+    诚实代价：evaluate 的 PIT 重放对价格因子将命中同一全窗缓存，重放退化为
+    恒真（对滚动窗因子本就结构性恒真——回看窗看不到未来）；PIT 真防线在
+    13F/股本类因子的 as-of 装载层，那些不走本缓存。此前逐重放日全量重装
+    正是 253 OOM 的二号根因。
+    """
     start, end = _window(dates, buffer_days)
-    _materialize(engine, start=start, end=end, security_ids=security_ids,
-                 columns=(), with_adjusted=True)
+    start, end = _materialize(engine, start=start, end=end, security_ids=security_ids,
+                              columns=(), with_adjusted=True)
     return _PANEL_CACHE[("adj_close", str(engine.url), start, end,
                          _universe_fingerprint(security_ids))]
 
