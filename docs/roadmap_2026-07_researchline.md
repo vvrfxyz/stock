@@ -110,7 +110,12 @@ W5-6 composite_v2 + 30 只月频纸面组合（唯一汇合点）
   与 Plex 共存）；run_research.sh 的 MemoryMax=7G 帽子太高——全局 OOM 先于硬帽触发。
 - 动作：run_research.sh 默认降为 **MemoryHigh=4.5G / MemoryMax=5.5G**；
   PG/CH 容器设内存上限（当前 Memory=0 裸奔）。
-- 本计划所有 253 长窗作业（W1 复审、earnings_yield、基本面族、价差重跑）都在此帽下跑。
+- **默认帽 + 长窗白名单抬帽**（审核 #9 订正，勿照"所有作业同一帽"执行）：07-07 实测
+  长窗 evaluate/retail_reality RSS 5.7-6.4G，5.5G 默认帽下必被帽杀。W1-2 的长窗作业
+  （composite_v1 复审 2016+、earnings_yield 2012+、基本面族 2012+）显式
+  `RESEARCH_MEMORY_HIGH=5.5G RESEARCH_MEMORY_MAX=6.5G` 拉起并**错峰跑**（同一时刻只跑
+  一个长窗作业，且避开每日 10:00 跑批窗口）；短窗/诊断件走默认帽。帽杀
+  （Result=oom-kill）可验尸，发生即抬帽重跑并记录峰值。
 
 ### 排序与工时
 P0/P1/P2/P3/OPS0 相互独立可并行；合计 2-3 天。

@@ -29,8 +29,14 @@ import pandas as pd
 from sqlalchemy import text
 
 from research.backtest import TRADING_DAYS, eligibility_mask, run_backtest
+from research._trials_store import append_study
 from research.company_market_cap import is_common_equity
-from research.data import research_engine, securities_with_uncovered_events
+from research.data import (
+    load_delisting_returns,
+    research_engine,
+    resolve_terminal_returns,
+    securities_with_uncovered_events,
+)
 from research.evaluate import (
     _forward_return,
     _markdown_table,
@@ -146,7 +152,13 @@ def main(argv: list[str] | None = None) -> int:
     main_table = pd.DataFrame(rows).set_index("cost_bps")
 
     # ---- 诊断：桶内日频 rank IC（h=5）
-    fwd = _forward_return(adj_for_bt, 5)
+    # 前向收益退市终局与 evaluate 同口径注入（实测 delisting_return 优先），否则退市证券
+    # 前向收益≈0% 会污染桶内 IC 诊断口径。分位/基准腿的 run_backtest 退市注入不在本关口径
+    # 统一范围内（诊断不进 PASS/FAIL 判据）。
+    realized = load_delisting_returns(engine)
+    resolved_terminal, resolved_fallback = resolve_terminal_returns(realized, None, use_realized=True)
+    fwd = _forward_return(adj_for_bt, 5,
+                          terminal_return=resolved_terminal, terminal_return_fallback=resolved_fallback)
     fwd_np = fwd.rank(axis=1, method="average", na_option="keep").to_numpy()
     daily_buckets = np.zeros_like(sig_np, dtype="int64")
     for i in range(len(dates)):
@@ -181,6 +193,24 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n== 对桶匹配基准 ==\n{main_table.round(4).to_string()}", flush=True)
     print(f"\n== 桶内 IC ==\n{ic_table.round(4).to_string()}", flush=True)
     print(f"\n预注册判据：{'PASS' if verdict else 'FAIL'}\nreport: {out}", flush=True)
+    # 部署判定入机器台账（W0-P3；不入 Bonferroni 分母，见 _trials_store.append_study）
+    append_study(
+        study="size_neutral",
+        factor_name=args.factor,
+        verdict=bool(verdict),
+        criteria="10bps alpha t>=2 & alpha>=1.5%/年 & 25bps alpha>0（桶匹配基准）",
+        params={"n_buckets": args.n_buckets, "n_quantiles": args.n_quantiles,
+                "ic_delisting_caliber": "realized_v1"},
+        eval_start=dates[0].date(),
+        eval_end=dates[-1].date(),
+        report_path=os.path.relpath(out, os.path.dirname(os.path.dirname(__file__))),
+        criterion_values={
+            "alpha_nw_t_10bps": float(main_table.loc[10.0, "alpha_nw_t"]),
+            "alpha_ann_10bps": float(main_table.loc[10.0, "alpha_ann"]),
+            "alpha_ann_25bps": float(main_table.loc[25.0, "alpha_ann"]),
+            "ic_small_bucket_h5": float(ic_table.iloc[0]["ic_mean_h5"]),
+        },
+    )
     return 0
 
 

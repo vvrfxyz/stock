@@ -23,8 +23,13 @@
 #   systemctl --user daemon-reload
 set -euo pipefail
 
-MEMORY_HIGH="${RESEARCH_MEMORY_HIGH:-5G}"
-MEMORY_MAX="${RESEARCH_MEMORY_MAX:-7G}"
+# 默认帽（2026-07-08 W0-OPS0 下调）：07-07 实测 5 次 global OOM 都在 RSS 5.7-6.4G
+# 时发生——11G 主机与 Plex/游戏服共存，MemoryMax=7G 的旧帽等于全局 OOM 先于硬帽
+# 触发（帽形同虚设）。降为 High=4.5G 软限流 / Max=5.5G 硬帽：宁可研究任务被自己的
+# 帽杀（Result=oom-kill 可验尸），不可拖全主机陪葬。特大作业显式抬
+# RESEARCH_MEMORY_* 环境变量并错峰跑。
+MEMORY_HIGH="${RESEARCH_MEMORY_HIGH:-4.5G}"
+MEMORY_MAX="${RESEARCH_MEMORY_MAX:-5.5G}"
 
 usage() {
   echo "用法: $0 <tag> -- <command...>" >&2

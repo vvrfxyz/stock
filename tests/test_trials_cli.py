@@ -89,7 +89,7 @@ def test_main_report_factor(monkeypatch, capsys):
     monkeypatch.setattr(trials_cli, "load_trials", lambda path: _synthetic_trials())
     assert trials_cli.main(["report", "--factor", "size"]) == 0
     out = capsys.readouterr().out
-    assert "Bonferroni 分母）: 2" in out
+    assert "Bonferroni 分母，study 行不计入）: 2" in out
     assert "双侧 Bonferroni z 阈值（alpha=0.05, m=2）: 2.24" in out
     assert "逐 horizon 最佳" in out
 

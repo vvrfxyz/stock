@@ -1,4 +1,13 @@
-"""复合打分原型（wave-6；设计经对抗审计修订，family=composite_v1）。
+"""复合打分实验场（wave-6 起源；设计经对抗审计修订，family=composite_v1）。
+
+【生产口径 vs 本脚本（2026-07-08，路线图 W0-P0）】
+定案骨架 = low_vol + high_52w 残差 + size，已抽为**注册 builtin 因子
+`research/factors/builtins/composite_v1.py`**——那是生产口径（成分写死），
+`evaluate --factors composite_v1` 与 `retail_reality --factor composite_v1` 均消费它。
+定案出处：`docs/research_ledger.md` 因子裁决表 composite_v1 行（2026-07-07 size 关卡
+重审 PASS，594569c）。**本脚本保留为实验场**：可用 --components 试不同成分集、
+--include-eod 做诊断对照；复合构造复用注册因子的共享函数（`residualize_high_52w`/
+`combine_ranks`）以保与生产口径位级一致，默认 COMPONENTS 已订正为定案骨架。
 
 【预注册成功判据——先于任何数字写死】
 主判据（相对主干，不是绝对显著性）：复合分须在同窗/同 universe/同口径下
@@ -9,7 +18,6 @@
 【审计修正落地】
 - eod_reversal_flow 剔出打分集（其总账裁决=执行叠加，不是成分；它是唯一
   日频翻新的成分，会主导复合分的逐日变化——付它的换手、赚不到它的隔夜 alpha）。
-  主口径 = 4 信号：low_vol、high_52w 残差、institutional_breadth、delta_IO。
 - "可得均值"会把缺失变成因子（k=3 名字的复合分方差高 √(5/3)，系统性挤占
   极端分位，而 13F 缺失与小盘/未映射相关）——改用 **0.5 中性填补**：
   composite = (Σ可得秩 + 0.5×缺失数) / k_total，且要求主干 low_vol 必须在场。
@@ -31,13 +39,26 @@ import pandas as pd
 from sqlalchemy import text
 
 from research.backtest import eligibility_mask
-from research.data import research_engine, securities_with_uncovered_events
+from research._trials_store import append_study
+from research.data import (
+    load_delisting_returns,
+    research_engine,
+    resolve_terminal_returns,
+    securities_with_uncovered_events,
+)
 from research.evaluate import _markdown_table, evaluate_factor, _forward_return
+from research.factors.builtins.composite_v1 import (
+    combine_ranks,
+    eligible_component_ranks,
+    residualize_high_52w,
+)
 from research.factors.price_cache import adjusted_close_panel, raw_bar_panels
-from research.factors.protocol import FactorContext, get
+from research.factors.protocol import FactorContext
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
-COMPONENTS = ("low_vol", "high_52w", "institutional_breadth", "delta_institutional_ownership")
+# 定案骨架（2026-07-07 ledger）：low_vol + high_52w 残差 + size。此前默认是含已裁决
+# 死亡的 breadth/delta_IO 的 wave-6 旧 4 信号版——订正为骨架，防实验场误用旧默认。
+COMPONENTS = ("low_vol", "high_52w", "size")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -49,22 +70,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--include-eod", action="store_true",
                         help="诊断口径：把 eod_reversal_flow 加回打分集（5 信号对照）")
     return parser.parse_args(argv)
-
-
-def _rowwise_ols_residual_rank(y_rank: pd.DataFrame, x_rank: pd.DataFrame) -> pd.DataFrame:
-    """逐日横截面 OLS：y = a + b·x + e，残差当日重排回 [0,1]。无前视。"""
-    y, x = y_rank.to_numpy(), x_rank.to_numpy()
-    valid = ~np.isnan(y) & ~np.isnan(x)
-    ym, xm = np.where(valid, y, np.nan), np.where(valid, x, np.nan)
-    n = valid.sum(axis=1).astype("float64")
-    with np.errstate(invalid="ignore", divide="ignore"):
-        mx = np.nansum(xm, axis=1) / n
-        my = np.nansum(ym, axis=1) / n
-        dx, dy = xm - mx[:, None], ym - my[:, None]
-        beta = np.nansum(dx * dy, axis=1) / np.nansum(dx * dx, axis=1)
-        resid = dy - beta[:, None] * dx
-    out = pd.DataFrame(resid, index=y_rank.index, columns=y_rank.columns)
-    return out.rank(axis=1, pct=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -93,33 +98,32 @@ def main(argv: list[str] | None = None) -> int:
     if args.include_eod:
         names.append("eod_reversal_flow")
     assert "low_vol" in names, "主干 low_vol 必须在打分集"
-    ranks: dict[str, pd.DataFrame] = {}
+    # 复合构造复用注册因子 composite_v1 的共享函数——位级一致的单一事实源。
+    ranks = eligible_component_ranks(ctx, eligible, names)
     for name in names:
-        panel = get(name).compute(ctx).where(eligible)
-        ranks[name] = panel.rank(axis=1, pct=True)
         print(f"  {name}: coverage={ranks[name].notna().sum(axis=1).median():.0f}/day", flush=True)
-    if "high_52w" in names:
-        ranks["high_52w"] = _rowwise_ols_residual_rank(ranks["high_52w"], ranks["low_vol"])
+    ranks = residualize_high_52w(ranks, names)
+    composite = combine_ranks(ranks, names)
 
-    stack = np.stack([ranks[n].to_numpy() for n in names])          # (k, T, N)
-    available = ~np.isnan(stack)
-    k_total = float(len(names))
-    composite_vals = (np.nansum(np.where(available, stack, 0.0), axis=0)
-                      + 0.5 * (k_total - available.sum(axis=0))) / k_total
-    composite = pd.DataFrame(composite_vals, index=dates, columns=universe)
-    composite = composite.where(ranks["low_vol"].notna())            # 主干必须在场
+    available = ~np.isnan(np.stack([ranks[n].to_numpy() for n in names]))
     k_dist = pd.Series(available.sum(axis=0)[ranks["low_vol"].notna().to_numpy()]).value_counts(
         normalize=True).sort_index()
     print(f"k 分布（主干在场行）：\n{k_dist.round(3).to_string()}", flush=True)
 
     adj_for_eval = adj_close.loc[dates]
-    forward = {h: _forward_return(adj_for_eval, h) for h in (1, 5, 10, 21)}
+    # 前向收益/分位回测退市终局与 evaluate 同口径（W0 审核发现 #2：本脚本曾是
+    # 第四个未收口的 ffill 消费方，composite_v1 的判据恰在这条路径上算出）。
+    realized = load_delisting_returns(engine)
+    terminal, term_fallback = resolve_terminal_returns(realized, None)
+    forward = {h: _forward_return(adj_for_eval, h, terminal_return=terminal,
+                                  terminal_return_fallback=term_fallback) for h in (1, 5, 10, 21)}
     tag = "composite_v1_5sig" if args.include_eod else "composite_v1"
     results = {}
     for label, factor in (("composite", composite), ("low_vol_solo", ranks["low_vol"])):
         res = evaluate_factor(factor, forward, eligibility=eligible, horizons=(1, 5, 10, 21),
                               adj_close=adj_for_eval, cost_bps=10.0, min_coverage=100,
-                              factor_name=f"{tag}_{label}")
+                              factor_name=f"{tag}_{label}",
+                              terminal_return=terminal, terminal_return_fallback=term_fallback)
         ic = res.ic_table
         q = res.quantile_metrics
         results[label] = {
@@ -144,6 +148,24 @@ def main(argv: list[str] | None = None) -> int:
                  f"预注册判据（IC IR 与 q5 净 Sharpe 双优于 low_vol 单干）："
                  f"{'PASS' if verdict else 'FAIL'}\n")
     print(f"\n预注册判据：{'PASS' if verdict else 'FAIL'}\nreport: {out}", flush=True)
+    # 部署判定入机器台账（W0-P3；不入 Bonferroni 分母，见 _trials_store.append_study）
+    append_study(
+        study="composite_study",
+        factor_name=tag,
+        verdict=bool(verdict),
+        criteria="IC IR(h5) 与 q5 净 Sharpe(h21) 双优于 low_vol 单干",
+        params={"components": list(names), "include_eod": bool(args.include_eod), "cost_bps": 10.0,
+                "ic_delisting_caliber": "realized_v1"},
+        eval_start=dates[0].date(),
+        eval_end=dates[-1].date(),
+        report_path=os.path.relpath(out, os.path.dirname(os.path.dirname(__file__))),
+        criterion_values={
+            "ic_ir_h5_composite": float(table.loc["composite", "ic_ir_h5"]),
+            "ic_ir_h5_low_vol_solo": float(table.loc["low_vol_solo", "ic_ir_h5"]),
+            "q5_net_sharpe_h21_composite": float(table.loc["composite", "q5_net_sharpe_h21"]),
+            "q5_net_sharpe_h21_low_vol_solo": float(table.loc["low_vol_solo", "q5_net_sharpe_h21"]),
+        },
+    )
     return 0
 
 

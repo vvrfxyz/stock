@@ -80,8 +80,27 @@ def unreachable_git_shas(trials: pd.DataFrame) -> list[str]:
         return []
 
 
+def _split_kinds(trials: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(假设检验型 trial, study 行)。历史行 trial_kind 为 NULL，按 'evaluate' 解释。
+
+    分母口径（预注册，roadmap §1 P3）：study 行不计入 Bonferroni 分母——
+    分母只数假设检验型 trial；study 判据用各自预注册阈值。
+    """
+    if "trial_kind" not in trials.columns:
+        return trials, trials.iloc[0:0]
+    # parquet 的 dictionary<string> 读回是 Categorical：老账 NULL 行 + 只追加过
+    # study 行时 categories={'study'}，直接 fillna('evaluate') 会因新类别抛
+    # TypeError（对抗审核实证复现，2026-07-08）。先脱 Categorical 再补默认。
+    kind = trials["trial_kind"].astype(object).fillna("evaluate").astype(str)
+    return trials[kind != "study"], trials[kind == "study"]
+
+
 def overview(trials: pd.DataFrame) -> pd.DataFrame:
-    """全因子概览：每因子一行——trial 数（多重检验分母）、口径/版本数、窗口、最近一次。"""
+    """全因子概览：每因子一行——trial 数（多重检验分母）、口径/版本数、窗口、最近一次。
+
+    只统计假设检验型 trial；study 行（部署判定）另行列示，不进此表分母。
+    """
+    trials, _ = _split_kinds(trials)
     created = pd.to_datetime(trials["created_at"], utc=True, errors="coerce")
     grouped = trials.assign(_created=created).groupby("factor_name")
     out = pd.DataFrame(
@@ -98,12 +117,39 @@ def overview(trials: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values("trials", ascending=False)
 
 
+def study_report(trials: pd.DataFrame, factor: str | None = None) -> pd.DataFrame:
+    """study 行详单（部署判定痕迹）：每 study 一行——结局、判据摘要、口径、窗口。"""
+    _, studies = _split_kinds(trials)
+    if studies.empty:
+        return pd.DataFrame()
+    rows = studies[studies["metric"] == "study_verdict"].copy()
+    if factor:
+        rows = rows[rows["factor_name"] == factor]
+    if rows.empty:
+        return pd.DataFrame()
+    rows["_created"] = pd.to_datetime(rows["created_at"], utc=True, errors="coerce")
+    out = pd.DataFrame(
+        {
+            "created": rows["_created"].dt.date,
+            "study": rows["factor_version"],
+            "factor": rows["factor_name"],
+            "verdict": rows["value"].map({1.0: "PASS", 0.0: "FAIL"}),
+            "eval_start": rows["eval_start"],
+            "eval_end": rows["eval_end"],
+            "params_hash": rows["params_hash"].astype(str).str[:12],
+            "criteria": rows["note"].astype(str).str[:60],
+        }
+    ).sort_values("created")
+    return out.reset_index(drop=True)
+
+
 def factor_report(trials: pd.DataFrame, factor: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """单因子详单：(逐 trial 表, 逐 horizon 最佳 |ic_nw_t| 表)。
 
     trials 行是 (trial_id, horizon, metric) 长表；逐 trial 表按 trial_id 折叠，
-    ic_nw_t 取该 trial 各 horizon 的最大绝对值。
+    ic_nw_t 取该 trial 各 horizon 的最大绝对值。study 行不进此表（见 study_report）。
     """
+    trials, _ = _split_kinds(trials)
     rows = trials[trials["factor_name"] == factor].copy()
     if rows.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -154,24 +200,33 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.factor:
         per_trial, by_horizon = factor_report(trials, args.factor)
-        if per_trial.empty:
+        studies = study_report(trials, args.factor)
+        if per_trial.empty and studies.empty:
             known = ", ".join(sorted(trials["factor_name"].dropna().unique()))
             print(f"因子 {args.factor!r} 无 trial；已有: {known}")
             return 1
-        n_trials, n_params = len(per_trial), per_trial["params_hash"].nunique()
-        z_thresh = bonferroni_z(n_trials)
-        print(f"== {args.factor} 查账 ==")
-        print(f"trial 数（多重检验/Bonferroni 分母）: {n_trials}；参数口径 {n_params} 种")
-        print(f"双侧 Bonferroni z 阈值（alpha=0.05, m={n_trials}）: {z_thresh:.2f}\n")
-        print("-- 逐 trial（时间序）--")
-        print(per_trial.to_string())
-        if not by_horizon.empty:
-            print(f"\n-- 逐 horizon 最佳 |ic_nw_t|（* |t| 须过上面的阈值 {z_thresh:.2f} 才算显著）--")
-            print(by_horizon.to_string())
+        if not per_trial.empty:
+            n_trials, n_params = len(per_trial), per_trial["params_hash"].nunique()
+            z_thresh = bonferroni_z(n_trials)
+            print(f"== {args.factor} 查账 ==")
+            print(f"trial 数（多重检验/Bonferroni 分母，study 行不计入）: {n_trials}；参数口径 {n_params} 种")
+            print(f"双侧 Bonferroni z 阈值（alpha=0.05, m={n_trials}）: {z_thresh:.2f}\n")
+            print("-- 逐 trial（时间序）--")
+            print(per_trial.to_string())
+            if not by_horizon.empty:
+                print(f"\n-- 逐 horizon 最佳 |ic_nw_t|（* |t| 须过上面的阈值 {z_thresh:.2f} 才算显著）--")
+                print(by_horizon.to_string())
+        if not studies.empty:
+            print("\n-- study 行（部署判定痕迹，不入 Bonferroni 分母；判据用各自预注册阈值）--")
+            print(studies.to_string())
     else:
         print(f"== trials 概览（{args.trials_path}）==")
         print(overview(trials).to_string())
         print("\n* bonf_z = 该因子分母下的双侧 Bonferroni z 阈值（alpha=0.05）")
+        studies = study_report(trials)
+        if not studies.empty:
+            print(f"\n-- study 行（{len(studies)} 条部署判定，不入分母）--")
+            print(studies.to_string())
     missing_shas = unreachable_git_shas(trials)
     if missing_shas:
         preview = ", ".join(s[:12] for s in missing_shas[:5])

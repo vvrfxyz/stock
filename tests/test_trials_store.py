@@ -17,7 +17,7 @@ else:
     pa = None
     pq = None
 
-from research._trials_store import _git_meta, append_trial, load_trials
+from research._trials_store import _git_meta, append_study, append_trial, load_trials
 from research.evaluate import EvaluationResult, _params_hash
 
 
@@ -254,3 +254,147 @@ def test_load_trials_latest_only_logs_summary_not_full_id_list(tmp_path, monkeyp
     warnings = [message for level, message in messages if level == "warning"]
     assert any("latest_only collapsed" in message for message in warnings)
     assert not any("latest_only dropped trial_ids=[" in message for message in warnings)
+
+
+# ---------------------------------------------------------------------------
+# W0-P3：study 行（trial_kind='study'，部署判定入台账、不入 Bonferroni 分母）
+# ---------------------------------------------------------------------------
+
+def _study_kwargs(**overrides):
+    from datetime import date
+
+    base = dict(
+        study="retail_reality",
+        factor_name="composite_v1",
+        verdict=True,
+        criteria="40bps alpha t>=2 且子组合中位超额>0",
+        params={"holdings": 30, "n_sims": 1000, "caliber": "delist_realized_v2"},
+        eval_start=date(2016, 1, 4),
+        eval_end=date(2026, 7, 2),
+        report_path="research/output/retail_reality_x.md",
+        criterion_values={"alpha_nw_t_40bps": 2.31, "sub_median_ann": 0.086},
+    )
+    base.update(overrides)
+    return base
+
+
+def test_append_study_writes_kind_and_verdict(tmp_path):
+    path = tmp_path / "trials.parquet"
+    trial_id = append_study(path=path, **_study_kwargs())
+
+    df = load_trials(path)
+    assert set(df["trial_id"].astype(str)) == {trial_id}
+    assert set(df["trial_kind"].astype(str)) == {"study"}
+    verdict_rows = df[df["metric"] == "study_verdict"]
+    assert len(verdict_rows) == 1
+    assert verdict_rows["value"].iloc[0] == 1.0
+    crits = df[df["metric"] == "study_criterion"]
+    assert set(crits["note"]) == {"alpha_nw_t_40bps", "sub_median_ann"}
+
+
+def test_append_study_idempotent_same_window_same_params(tmp_path):
+    path = tmp_path / "trials.parquet"
+    first = append_study(path=path, **_study_kwargs())
+    n = len(load_trials(path))
+    second = append_study(path=path, **_study_kwargs())  # 同口径同 verdict 重跑 → 静默跳过
+    assert first == second
+    assert len(load_trials(path)) == n
+
+
+def test_append_study_verdict_drift_appends_new_row(tmp_path):
+    # 同代码同口径同窗口 verdict 漂移（= 数据变了）：不静默吞，追加新行、旧行保留（审核 #8/#10）
+    path = tmp_path / "trials.parquet"
+    first = append_study(path=path, **_study_kwargs(verdict=True))
+    drifted = append_study(path=path, **_study_kwargs(verdict=False))
+    assert first != drifted
+    df = load_trials(path)
+    verdicts = df[df["metric"] == "study_verdict"].set_index("trial_id")["value"]
+    assert verdicts[first] == 1.0 and verdicts[drifted] == 0.0  # 新旧结局都留账
+
+
+def test_append_study_window_enters_params_hash(tmp_path):
+    # 窗口进 params_hash：同 params 不同窗口是两条账，latest_only 不互相折叠（审核 #3）
+    from datetime import date
+
+    path = tmp_path / "trials.parquet"
+    first = append_study(path=path, **_study_kwargs())
+    second = append_study(path=path, **_study_kwargs(eval_end=date(2024, 7, 2)))
+    df = load_trials(path)
+    assert df.set_index("trial_id").loc[[first, second], "params_hash"].nunique() == 2
+    latest = load_trials(path, latest_only=True)
+    assert {first, second} <= set(latest["trial_id"].astype(str))
+
+
+def test_append_study_new_params_new_trial(tmp_path):
+    path = tmp_path / "trials.parquet"
+    first = append_study(path=path, **_study_kwargs())
+    second = append_study(path=path, **_study_kwargs(params={"holdings": 20, "n_sims": 1000}))
+    assert first != second
+    assert load_trials(path)["trial_id"].nunique() == 2
+
+
+def test_append_study_rejects_unknown_kind(tmp_path):
+    with pytest.raises(ValueError, match="unknown study kind"):
+        append_study(path=tmp_path / "t.parquet", **_study_kwargs(study="ad_hoc"))
+
+
+def test_study_rows_coexist_with_evaluate_trials(tmp_path):
+    path = tmp_path / "trials.parquet"
+    eval_id = append_trial(_result(), path)
+    study_id = append_study(path=path, **_study_kwargs())
+
+    df = load_trials(path)
+    kind = df["trial_kind"].fillna("evaluate").astype(str)
+    assert set(df.loc[kind == "study", "trial_id"]) == {study_id}
+    assert set(df.loc[kind != "study", "trial_id"]) == {eval_id}
+    # 历史行（trial_kind NULL）按 evaluate 解释
+    assert df.loc[df["trial_id"] == eval_id, "trial_kind"].isna().all() or (
+        df.loc[df["trial_id"] == eval_id, "trial_kind"].astype(str) == "evaluate"
+    ).all()
+
+
+def test_study_rows_excluded_from_bonferroni_denominator(tmp_path):
+    from research.trials import factor_report, overview, study_report
+
+    path = tmp_path / "trials.parquet"
+    append_trial(_result(factor_name="composite_v1"), path)
+    append_study(path=path, **_study_kwargs())
+
+    df = load_trials(path)
+    ov = overview(df)
+    assert int(ov.loc["composite_v1", "trials"]) == 1  # study 行不计入分母
+
+    per_trial, _ = factor_report(df, "composite_v1")
+    assert len(per_trial) == 1
+
+    st = study_report(df, "composite_v1")
+    assert len(st) == 1
+    assert st["verdict"].iloc[0] == "PASS"
+
+
+def test_report_survives_v1_null_kind_plus_study_rows(tmp_path):
+    # 审核 #0 金测试：v1 老账（trial_kind 全 NULL）+ 只追加过 study 行 → parquet 读回
+    # trial_kind 是 categories={'study'} 的 Categorical，naive fillna('evaluate') 会抛
+    # TypeError。overview/factor_report/study_report 必须不抛且分母正确。
+    from research._trials_store import _arrow_schema
+    from research.trials import factor_report, overview, study_report
+
+    path = tmp_path / "trials.parquet"
+    old_row = {
+        "trial_id": "legacy01", "schema_version": 1, "trial_kind": None,
+        "created_at": pd.Timestamp("2026-07-01", tz="UTC"),
+        "factor_name": "composite_v1", "factor_version": "v1",
+        "eval_start": pd.Timestamp("2016-01-04").date(),
+        "eval_end": pd.Timestamp("2026-07-02").date(),
+        "horizon": 5, "metric": "ic_nw_t", "value": 3.1, "params_hash": "abc",
+    }
+    pq.write_table(pa.Table.from_pylist([old_row], schema=_arrow_schema()), path)
+    append_study(path=path, **_study_kwargs())
+
+    df = load_trials(path)
+    ov = overview(df)                                     # 不得抛 TypeError
+    assert int(ov.loc["composite_v1", "trials"]) == 1     # 老行计入分母，study 行不计
+    per_trial, _ = factor_report(df, "composite_v1")
+    assert set(per_trial.index) == {"legacy01"[:12]}
+    st = study_report(df, "composite_v1")
+    assert len(st) == 1

@@ -33,6 +33,7 @@ from research.data import (
 from research.factors.builtins import bar_geometry as _bar_geometry  # noqa: F401
 from research.factors.builtins import classic_pillars as _classic_pillars  # noqa: F401
 from research.factors.builtins import classic_price as _classic_price  # noqa: F401
+from research.factors.builtins import composite_v1 as _composite_v1  # noqa: F401
 from research.factors.builtins import days_to_cover as _days_to_cover  # noqa: F401
 from research.factors.builtins import delta_institutional_ownership as _delta_inst_own  # noqa: F401
 from research.factors.builtins import earnings_yield as _earnings_yield  # noqa: F401
@@ -285,11 +286,69 @@ def _decay_halflife(ic_decay: pd.DataFrame, horizon: int) -> float:
     return float(hits.index[0]) if not hits.empty else np.inf
 
 
-def _forward_return(adj_close: pd.DataFrame, horizon: int) -> pd.DataFrame:
+def _forward_return(
+    adj_close: pd.DataFrame,
+    horizon: int,
+    *,
+    terminal_return: float | pd.Series | None = None,
+    terminal_return_fallback: float | None = None,
+) -> pd.DataFrame:
+    """未来 horizon 交易日的价格前向收益（ffill 后按行移位；停牌/缺口跳空计入复牌日）。
+
+    退市终局注入（terminal_return 非 None 时启用，语义与 run_backtest 逐位对齐）：
+    设证券最后有效价日为 t_last（= backtest first_terminal 前一日）、退市实测收益 r_d。
+    对满足 t <= t_last < t+horizon 的观察（退市落在前瞻窗内），前向收益并入 r_d：
+        fwd(t) = (1 + price[t_last]/price[t] - 1) × (1 + r_d) − 1
+               = price[t_last]/price[t] × (1 + r_d) − 1
+    这与 run_backtest 的逐日复合恒等：t+1..t_last 走价格路径、t_last+1（退市事件日）
+    这一天注入 r_d、其后各日 0。r_d 的解析与 run_backtest 完全同构：Series 按证券
+    reindex、fallback 补洞后仍缺的列不注入；标量对所有退市列统一注入；None 不注入。
+    价格路径分量用 t_last 的价（ffill 末值）直取，退市落在面板尾 horizon 内（t+horizon
+    越界）时仍可注入——退市已提前锁定收益，不因面板不够长而丢观察。t_last 之后的行
+    保持 NaN（退市后无观察，不改变旧行为）。
+
+    默认 terminal_return=None 时行为与旧实现逐位一致（纯 ffill 前向收益）。
+    """
     filled = adj_close.ffill()
     shifted = filled.shift(-horizon)
     valid_pair = adj_close.notna() & shifted.notna()
-    return (shifted / filled - 1).where(valid_pair)
+    fwd = (shifted / filled - 1).where(valid_pair)
+    if terminal_return is None:
+        return fwd
+
+    columns = adj_close.columns
+    if isinstance(terminal_return, pd.Series):
+        per_security = terminal_return.reindex(columns).astype("float64")
+        if terminal_return_fallback is not None:
+            per_security = per_security.fillna(terminal_return_fallback)
+        r_d = per_security.to_numpy()
+    else:
+        r_d = np.full(len(columns), float(terminal_return), dtype="float64")
+
+    valid = adj_close.notna().to_numpy()
+    n_rows = valid.shape[0]
+    any_valid = valid.any(axis=0)
+    # 每列最后有效价日 t_last（全 NaN 列记 -1）；退市事件日 f_pos = t_last + 1，恰等于
+    # backtest 的 first_terminal（trailing 永久缺失块首日）——内部停牌不误判为退市。
+    last_valid_pos = np.where(any_valid, n_rows - 1 - valid[::-1].argmax(axis=0), -1)
+    f_pos = last_valid_pos + 1
+    has_terminal = last_valid_pos < (n_rows - 1)          # 尾部转永久缺失才算退市
+    injectable = has_terminal & ~np.isnan(r_d)            # 无实测/无 fallback 的列不注入
+    if not injectable.any():
+        return fwd
+
+    row_idx = np.arange(n_rows)[:, None]
+    within_window = (row_idx < f_pos[None, :]) & (row_idx >= (f_pos - horizon)[None, :])
+    inject_mask = within_window & injectable[None, :]
+    # 价格路径分量 = price[t_last] / price[t]；last 价取 ffill 末行（注入列 = t_last 价）。
+    # base 用原始价（非 ffill）：停牌行 base=NaN -> 结果 NaN，与旧口径 halt 行一致。
+    last_valid_price = filled.to_numpy()[-1]
+    base_price = adj_close.to_numpy()
+    r_d_row = np.where(injectable, r_d, 0.0)[None, :]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        compounded = last_valid_price[None, :] / base_price * (1.0 + r_d_row) - 1.0
+    out = np.where(inject_mask, compounded, fwd.to_numpy())
+    return pd.DataFrame(out, index=adj_close.index, columns=columns)
 
 
 def _quantile_weights_for_day(signal: pd.Series, eligible: pd.Series, n_quantiles: int) -> dict[str, pd.Series]:
@@ -838,6 +897,7 @@ def run_evaluation(
     risk_free_series: str | None = DEFAULT_RISK_FREE_SERIES,
     terminal_return: float | None = None,
     use_delisting_returns: bool = True,
+    ic_delisting_returns: bool = True,
     fund_closure_par: bool = True,
     exchange_drop_fallback: float | None = None,
     existing_trial_ids: frozenset[str] | None = None,
@@ -946,6 +1006,12 @@ def run_evaluation(
         "run_id": run_id,
         "note": note,
     }
+    # IC/前向收益路径的退市终局注入口径进 params_hash（--no-ic-delisting-returns 回旧
+    # ffill 口径，退市证券前向收益≈0%）。只在有可注入终局（resolved_terminal 非 None）时
+    # 记键：否则 IC 行为新旧完全一致，多记键会让无退市 trial 无谓换 hash（同 fund_closure_par
+    # 的"不起作用即归一"精神，这里更进一步——直接不记键，与本改动前的无退市 trial 位级同 hash）。
+    if resolved_terminal is not None:
+        config["ic_delisting_returns"] = ic_delisting_returns
     params_hash_value = _params_hash(config)
     factor_version_value = _factor_version(factor_obj, code_git_sha)
     prospective_trial_id = compute_trial_id(
@@ -1003,7 +1069,16 @@ def run_evaluation(
             )
     if factor_values.dropna(how="all", axis=0).empty:
         raise FactorEvaluationError(f"factor {factor_obj.name!r} is empty or all NaN")
-    forward_returns = {h: _forward_return(adj_close, h).reindex(index=eval_dates, columns=universe) for h in horizons}
+    # 前向收益退市终局注入（口径与分位路径 _quantile_metrics 同源 resolved_terminal/
+    # resolved_fallback）；--no-ic-delisting-returns 回旧 ffill 口径（退市证券前向收益≈0%）。
+    ic_terminal = resolved_terminal if ic_delisting_returns else None
+    ic_fallback = resolved_fallback if ic_delisting_returns else None
+    forward_returns = {
+        h: _forward_return(
+            adj_close, h, terminal_return=ic_terminal, terminal_return_fallback=ic_fallback
+        ).reindex(index=eval_dates, columns=universe)
+        for h in horizons
+    }
     eval_start_ts = pd.Timestamp(effective_eval_start)
     for panel_returns in forward_returns.values():
         panel_returns.loc[panel_returns.index < eval_start_ts] = np.nan
@@ -1257,6 +1332,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-delisting-returns", action="store_true",
                         help="不读 delisting_events 的逐证券实测退市收益，只用 --terminal-return "
                              "全局假设（复现旧口径运行）。")
+    parser.add_argument("--no-ic-delisting-returns", action="store_true",
+                        help="逃生舱：IC/前向收益路径回旧 ffill 口径（退市证券前向收益≈0%%），"
+                             "不注入实测/标量退市终局。默认新口径与分位路径同源注入退市收益。"
+                             "分位回测路径不受此旗标影响（始终按 --terminal-return/实测口径）。"
+                             "口径进 params_hash，新旧口径 trial 不互相顶替。")
     parser.add_argument("--no-fund-closure-par", action="store_true",
                         help="关闭读取层 par 合成（ETF 清盘 FUND_CLOSURE 与 SPAC 赎回 LIQUIDATION+"
                              "redemption_provision 的 NULL 实测行合成 0.0），只用纯实测行。")
@@ -1304,6 +1384,7 @@ def main(argv: list[str] | None = None) -> int:
         risk_free_series=None if args.no_risk_free else args.risk_free_series,
         terminal_return=args.terminal_return,
         use_delisting_returns=not args.no_delisting_returns,
+        ic_delisting_returns=not args.no_ic_delisting_returns,
         fund_closure_par=not args.no_fund_closure_par,
         exchange_drop_fallback=args.exchange_drop_fallback,
         trials_path=args.trials_path,

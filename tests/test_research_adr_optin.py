@@ -27,9 +27,11 @@ class TestTypeConstants:
 
 
 class TestAdrUnsafeMarkers:
-    """§E.3：恰好这三个因子除以股本/市值，多标漏标都是错。"""
+    """§E.3：恰好这些因子的 ADR 列不可信——size/earnings_yield/short_interest_ratio
+    直接除以股本/市值；composite_v1 复合含 size 成分故经传播继承 adr_unsafe
+    （成分不安全则复合分不安全）。多标漏标都是错。"""
 
-    SHARE_SENSITIVE = {"size", "earnings_yield", "short_interest_ratio"}
+    SHARE_SENSITIVE = {"size", "earnings_yield", "short_interest_ratio", "composite_v1"}
 
     def test_exactly_the_share_sensitive_factors_are_marked(self):
         import research.evaluate  # noqa: F401  # 触发全部 builtins 注册

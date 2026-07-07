@@ -29,8 +29,14 @@ import pandas as pd
 from sqlalchemy import text
 
 from research.backtest import eligibility_mask
-from research.data import research_engine
-from research.evaluate import _markdown_table, _masked_rowwise_corr, _newey_west_t, default_nw_lag
+from research.data import load_delisting_returns, research_engine, resolve_terminal_returns
+from research.evaluate import (
+    _forward_return,
+    _markdown_table,
+    _masked_rowwise_corr,
+    _newey_west_t,
+    default_nw_lag,
+)
 from research.factors.price_cache import adjusted_close_panel, raw_bar_panels
 from research.factors.protocol import FactorContext, get
 
@@ -86,9 +92,12 @@ def main(argv: list[str] | None = None) -> int:
 
     adj_close = adjusted_close_panel(engine, dates=probe_dates, security_ids=ids, buffer_days=400)
     adj_close = adj_close.reindex(index=dates, columns=universe)
-    filled = adj_close.ffill()
-    shifted = filled.shift(-args.horizon)
-    fwd = (shifted / filled - 1).where(adj_close.notna() & shifted.notna())
+    # 前向收益收口到 evaluate._forward_return（删内联 ffill 复制体），退市终局与 evaluate
+    # 同口径注入（实测 delisting_return 优先）——否则三关对照与 evaluate 结论口径分裂。
+    realized = load_delisting_returns(engine)
+    resolved_terminal, resolved_fallback = resolve_terminal_returns(realized, None, use_realized=True)
+    fwd = _forward_return(adj_close, args.horizon,
+                          terminal_return=resolved_terminal, terminal_return_fallback=resolved_fallback)
     fwd_rank = fwd.rank(axis=1, method="average", na_option="keep").to_numpy()
     fwd_valid = fwd.notna().to_numpy()
 
