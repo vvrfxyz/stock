@@ -413,3 +413,15 @@ trials.parquet 台账同步。h=21 汇总（Rank IC / Newey-West t / 多空净 S
   生产实测零违规——杂项条目'706 行'系订正前旧数，就此收案）。
 - **short_interest 缝合切换**：裁决为挂起（分子 FINRA 数据 2024-05 起，缝分母
   无意义），见上节订正。
+
+### tail_mismatch 207 的裁决（2026-07-07 中午，收案为下窗口人工件）
+
+runbook 处方"update_massive_events 刷新 live 再重考据"已执行（208 只 processed /
+229 行 written / 0 failed），重考据后桶**不降**（207 保持）。样本解剖（report
+20260707_044526）：这批是**快照后改名的退市实体**——archive 事件链尾是新代码
+（如 uly→ulyx @2026-03-18），DB 身份行还挂旧 symbol 且 is_active=false。修复
+需要逐实体 `rename_security` 身份手术（symbol/current_symbol + symbol_history
+区间），而退市实体的改名与 ticker 回收在同一雷区（旧代码可能已被新实体占用），
+**不适合自动批跑**。工作队列已固化：/tmp/tail_mismatch_symbols.txt（Mac 与 253
+各一份）+ 全量明细 buckets_full.json；下窗口用 repair_identity 式 plan/apply
+流程逐只裁决。
