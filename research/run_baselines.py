@@ -35,6 +35,7 @@ from research.data import (
     securities_with_uncovered_events,
     to_wide,
 )
+from research.progress import Progress
 from research.strategies import momentum_12_1, short_term_reversal, sma_trend
 from research.universe import build_universe_mask
 
@@ -110,6 +111,7 @@ def main(argv: list[str] | None = None) -> int:
 
     types = RESEARCH_TYPES_WITH_ADR if args.include_adr else DEFAULT_RESEARCH_TYPES
     print(f"加载 {'/'.join(types)} 面板 {args.start} ~ {args.end} ...")
+    prog = Progress("run_baselines", total=4)  # 3 策略 + 等权参考；面板装载在 data.py 内自带进度
     panel = load_adjusted_panel(engine, start=args.start, end=args.end, types=types)
     adj_close = panel["adj_close"]
 
@@ -164,15 +166,21 @@ def main(argv: list[str] | None = None) -> int:
                       else f"全局假设 {terminal_return:+.1%}")
         print(f"退市收益模式: {why}，全部退市持仓使用: {assumption}")
 
-    results = [
-        run_backtest("momentum_12_1 (top10%, 月调)", momentum_12_1(adj_close, eligible), adj_close, cost_bps=args.cost_bps, terminal_return=terminal_return, terminal_return_fallback=terminal_fallback),
-        run_backtest("sma_50_200 趋势 (周调)", sma_trend(adj_close, eligible), adj_close, cost_bps=args.cost_bps, terminal_return=terminal_return, terminal_return_fallback=terminal_fallback),
-        run_backtest("5日反转 (bottom10%, 周调)", short_term_reversal(adj_close, eligible), adj_close, cost_bps=args.cost_bps, terminal_return=terminal_return, terminal_return_fallback=terminal_fallback),
+    strategy_specs = [
+        ("momentum_12_1 (top10%, 月调)", lambda: momentum_12_1(adj_close, eligible)),
+        ("sma_50_200 趋势 (周调)", lambda: sma_trend(adj_close, eligible)),
+        ("5日反转 (bottom10%, 周调)", lambda: short_term_reversal(adj_close, eligible)),
     ]
+    results = []
+    for i, (name, weights_fn) in enumerate(strategy_specs, 1):
+        with prog.stage(f"回测 {name}", item=i):
+            results.append(run_backtest(name, weights_fn(), adj_close, cost_bps=args.cost_bps, terminal_return=terminal_return, terminal_return_fallback=terminal_fallback))
 
-    ew_weights = eligible.astype(float)
-    ew_weights = ew_weights.div(ew_weights.sum(axis=1).where(lambda s: s > 0), axis=0).fillna(0.0)
-    results.append(run_backtest("等权全样本（参考）", ew_weights, adj_close, cost_bps=args.cost_bps))
+    with prog.stage("回测 等权全样本（参考）", item=4):
+        ew_weights = eligible.astype(float)
+        ew_weights = ew_weights.div(ew_weights.sum(axis=1).where(lambda s: s > 0), axis=0).fillna(0.0)
+        results.append(run_backtest("等权全样本（参考）", ew_weights, adj_close, cost_bps=args.cost_bps))
+    prog.done()
 
     results = [trim(r, args.eval_start) for r in results]
 

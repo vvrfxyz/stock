@@ -22,6 +22,7 @@ from datetime import date
 
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 from sqlalchemy import text
 
 from research.backtest import TRADING_DAYS, eligibility_mask, run_backtest
@@ -31,6 +32,7 @@ from research.factors.price_cache import adjusted_close_panel, raw_bar_panels
 from research.factors.protocol import FactorContext, get
 from research.lowvol_monetization import _capm_stats, _expand_daily, _security_flags
 from research.market_cap import load_market_cap_panel
+from research.progress import Progress
 from research.size_neutral_study import _bucket_labels
 from utils.risk_free_rates import load_risk_free_daily_returns
 
@@ -72,20 +74,23 @@ def _pick_with_continuity(members: np.ndarray, holdings: int, rng: np.random.Gen
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv()  # systemd-run 洗净环境（run_research.sh 发射）下 .env 是唯一的连库配置来源
     args = parse_args(argv)
     engine = research_engine()
+    prog = Progress("retail_reality")
     with engine.connect() as conn:
         ids = [int(r[0]) for r in conn.execute(
             text("select id from securities where upper(type) = 'CS' order by id"))]
     flags = _security_flags(engine, ids)
 
     probe_dates = pd.bdate_range(args.start, args.end)
-    bars = raw_bar_panels(engine, dates=probe_dates, security_ids=ids,
-                          columns=("close", "volume"), buffer_days=200)
-    close = bars["close"]
-    dates = close.index[(close.index >= pd.Timestamp(args.start)) & (close.index <= pd.Timestamp(args.end))]
-    adj_close = adjusted_close_panel(engine, dates=probe_dates, security_ids=ids, buffer_days=200)
-    adj_close = adj_close.reindex(index=close.index, columns=close.columns)
+    with prog.stage("装载 bar/复权面板"):
+        bars = raw_bar_panels(engine, dates=probe_dates, security_ids=ids,
+                              columns=("close", "volume"), buffer_days=200)
+        close = bars["close"]
+        dates = close.index[(close.index >= pd.Timestamp(args.start)) & (close.index <= pd.Timestamp(args.end))]
+        adj_close = adjusted_close_panel(engine, dates=probe_dates, security_ids=ids, buffer_days=200)
+        adj_close = adj_close.reindex(index=close.index, columns=close.columns)
     universe = close.columns
     eligible = eligibility_mask(close, close * bars["volume"]).loc[dates]
     eligible = eligible & pd.Series(universe.isin(flags.index[flags["is_common"]]), index=universe)
@@ -95,9 +100,10 @@ def main(argv: list[str] | None = None) -> int:
 
     ctx = FactorContext(engine=engine, dates=dates, security_universe=universe,
                         as_of=pd.Timestamp(args.end))
-    signal = get(args.factor).compute(ctx)
-    mcap = load_market_cap_panel(engine, dates=dates, security_ids=ids).reindex(
-        index=dates, columns=universe)
+    with prog.stage(f"因子 {args.factor} + 市值面板"):
+        signal = get(args.factor).compute(ctx)
+        mcap = load_market_cap_panel(engine, dates=dates, security_ids=ids).reindex(
+            index=dates, columns=universe)
     covered = eligible & signal.notna() & mcap.notna()
     sig_np, mcap_np, cov_np = signal.to_numpy(), mcap.to_numpy(), covered.to_numpy()
     adj_for_bt = adj_close.loc[dates]
@@ -152,7 +158,10 @@ def main(argv: list[str] | None = None) -> int:
     sub_ann = []
     daily_rets = adj_for_bt.pct_change(fill_method=None).to_numpy()
     pos0 = np.searchsorted(reb0.values, dates.values, side="right") - 1
-    for _ in range(args.n_sims):
+    sim_step = max(1, args.n_sims // 20)  # 抽样打行：journald 有 burst rate-limit
+    for sim_i in range(args.n_sims):
+        if sim_i % sim_step == 0:
+            prog.log(f"模拟 {sim_i}/{args.n_sims}")
         # 持仓延续：保留仍在 q5 的旧持仓，只补充离场者（语义与首版 bug 见 _pick_with_continuity）
         picks = _pick_with_continuity(members0, args.holdings, rng)
         w = _weights_from(picks)[np.clip(pos0, 0, None)]
@@ -183,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n== 整分位 ==\n{full_table.round(4).to_string()}", flush=True)
     print(f"\n== {args.holdings} 只子组合 ==\n{sim_table.round(4).to_string()}\nbench40 ={bench_ann:.4f}", flush=True)
     print(f"\n预注册判据：{'PASS' if verdict else 'FAIL'}\nreport: {out}", flush=True)
+    prog.done()
     return 0
 
 

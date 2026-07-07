@@ -17,6 +17,8 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
+from research.progress import Progress
+
 DEFAULT_METHODOLOGY_VERSION = "raw_actions_v1"
 # 2026-07 corporate-actions 20 年回填后（docs/corp_actions_archive_2026-07.md），
 # MASSIVE 源事件与因子链覆盖到 2003；更早无价格、无事件，仍是硬地板。
@@ -209,26 +211,33 @@ def load_adjusted_panel(
     effective_as_of = as_of or end
     cache_key = (str(engine.url), start, end, tuple(types), effective_as_of, include_inactive)
     cached = _ADJUSTED_PANEL_CACHE.get(cache_key)
+    # 纯打印插桩（2026-07-07）：面板装载是所有 study 脚本最重的黑盒，跨网冷拉
+    # 曾造成"假死→误杀重跑"事故；冷/热路径一眼可辨，不动任何数据路径。
+    prog = Progress(f"panel[{start}~{end}]")
     if cached is not None:
+        prog.log("cache hit")
         return dict(cached)
     # adj_close 由 close 派生、dollar_volume = close×volume：只拉 2 列长表
-    prices = load_price_long(
-        engine, start=start, end=end, types=types,
-        include_inactive=include_inactive, columns=("close", "volume"),
-    )
-    events = load_factor_events(engine, as_of=effective_as_of)
-    prices = apply_adjustment(prices, events, as_of=effective_as_of)
-    prices["dollar_volume"] = prices["close"] * prices["volume"]
-    panel = {
-        "adj_close": to_wide(prices, "adj_close"),
-        "close": to_wide(prices, "close"),
-        "volume": to_wide(prices, "volume"),
-        "dollar_volume": to_wide(prices, "dollar_volume"),
-    }
-    del prices, events  # 长表（长窗口 GB 级）在宽表建成后立即释放
+    with prog.stage("COPY 长表 close/volume"):
+        prices = load_price_long(
+            engine, start=start, end=end, types=types,
+            include_inactive=include_inactive, columns=("close", "volume"),
+        )
+    with prog.stage("复权 + pivot 宽表"):
+        events = load_factor_events(engine, as_of=effective_as_of)
+        prices = apply_adjustment(prices, events, as_of=effective_as_of)
+        prices["dollar_volume"] = prices["close"] * prices["volume"]
+        panel = {
+            "adj_close": to_wide(prices, "adj_close"),
+            "close": to_wide(prices, "close"),
+            "volume": to_wide(prices, "volume"),
+            "dollar_volume": to_wide(prices, "dollar_volume"),
+        }
+        del prices, events  # 长表（长窗口 GB 级）在宽表建成后立即释放
     while len(_ADJUSTED_PANEL_CACHE) >= _ADJUSTED_PANEL_CACHE_MAX:
         _ADJUSTED_PANEL_CACHE.pop(next(iter(_ADJUSTED_PANEL_CACHE)))
     _ADJUSTED_PANEL_CACHE[cache_key] = panel
+    prog.done()
     return dict(panel)
 
 
