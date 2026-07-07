@@ -98,28 +98,34 @@ class TestLoadRows:
         assert quarantine[("IBM", "spinoff_pseudo_split")] == 1
 
     def test_split_loader_recovers_allowlisted_pseudo_split(self, tmp_path):
-        # round-2：allowlist 点名的 P 行放行并强制打伪拆股标记；未点名的照旧隔离
+        # round-2：allowlist 点名的 P 行放行——带 override 的打抑制标记，
+        # 不带 override 的透传 vendor 值（真实拆股）；未点名的照旧隔离
         frame = pd.DataFrame({
-            "id": ["P1", "P2"],
-            "ticker": ["IBM", "MMM"],
-            "execution_date": ["2021-11-04", "2024-04-01"],
-            "adjustment_type": ["spinoff", None],
-            "split_from": [1000.0, 1000.0],
-            "split_to": [1046.0, 1196.0],
+            "id": ["P1", "P2", "P3"],
+            "ticker": ["IBM", "MMM", "ANDE"],
+            "execution_date": ["2021-11-04", "2024-04-01", "2014-02-19"],
+            "adjustment_type": ["forward_split", None, "forward_split"],
+            "split_from": [1000.0, 1000.0, 2.0],
+            "split_to": [1046.0, 1196.0, 3.0],
         })
         path = tmp_path / "splits.parquet"
         frame.to_parquet(path)
         stats, quarantine = Counter(), Counter()
         detail = []
-        rows = load_split_rows(path, stats, quarantine, detail, allowlist_ids={"P1"})
-        assert [r["id"] for r in rows] == ["P1"]
-        assert rows[0]["adjustment_type"] == "spinoff_pseudo_split"  # vendor 值不透传，强制标记
-        assert stats["split_spinoff_recovered_by_allowlist"] == 1
+        allowlist = {
+            "P1": {"adjustment_type_override": "spinoff_pseudo_split"},  # Kyndryl 分拆
+            "P3": {"adjustment_type_override": None},                    # 真实 3-for-2
+        }
+        rows = load_split_rows(path, stats, quarantine, detail, allowlist=allowlist)
+        assert [r["id"] for r in rows] == ["P1", "P3"]
+        assert rows[0]["adjustment_type"] == "spinoff_pseudo_split"  # override 生效
+        assert rows[1]["adjustment_type"] == "forward_split"         # 透传 vendor 值
+        assert stats["split_spinoff_recovered_by_allowlist"] == 2
         assert stats["split_spinoff_quarantined"] == 1  # P2 未点名照旧隔离
         assert quarantine[("MMM", "spinoff_pseudo_split")] == 1
 
     def test_split_loader_without_allowlist_keeps_r3_wholesale(self, tmp_path):
-        # 非 allowlist 模式（allowlist_ids=None）行为位级不变
+        # 非 allowlist 模式（allowlist=None）行为位级不变
         frame = pd.DataFrame({
             "id": ["P1"], "ticker": ["IBM"], "execution_date": ["2021-11-04"],
             "adjustment_type": ["spinoff"], "split_from": [1000.0], "split_to": [1046.0],
@@ -127,7 +133,7 @@ class TestLoadRows:
         path = tmp_path / "splits.parquet"
         frame.to_parquet(path)
         stats = Counter()
-        rows = load_split_rows(path, stats, Counter(), [], allowlist_ids=None)
+        rows = load_split_rows(path, stats, Counter(), [], allowlist=None)
         assert rows == []
         assert stats["split_spinoff_quarantined"] == 1
 
@@ -534,8 +540,25 @@ class TestParseAdjudicatedAllowlist:
                  "E2\t11\tAGFY\t2024-10-08\tsplit\n"]
         allowlist = parse_adjudicated_allowlist(lines)
         assert allowlist["E1"] == {"security_id": 10, "ticker": "REUSE",
-                                   "ex_date": date(2012, 1, 1), "kind": "dividend"}
+                                   "ex_date": date(2012, 1, 1), "kind": "dividend",
+                                   "adjustment_type_override": None}
         assert allowlist["E2"]["kind"] == "split"
+
+    def test_parses_six_column_override(self):
+        # round-2 扩展列：override 只允许 spinoff_pseudo_split，留空=None
+        header = ALLOWLIST_HEADER.rstrip("\n") + "\tadjustment_type_override\n"
+        lines = [header,
+                 "P1\t10\tIBM\t2021-11-04\tsplit\tspinoff_pseudo_split\n",
+                 "P2\t11\tANDE\t2014-02-19\tsplit\t\n"]
+        allowlist = parse_adjudicated_allowlist(lines)
+        assert allowlist["P1"]["adjustment_type_override"] == "spinoff_pseudo_split"
+        assert allowlist["P2"]["adjustment_type_override"] is None
+
+    def test_bad_override_value_raises(self):
+        header = ALLOWLIST_HEADER.rstrip("\n") + "\tadjustment_type_override\n"
+        with pytest.raises(ValueError):
+            parse_adjudicated_allowlist(
+                [header, "P1\t10\tIBM\t2021-11-04\tsplit\tforward_split\n"])
 
     def test_identical_duplicate_rows_converge(self):
         lines = [ALLOWLIST_HEADER,
