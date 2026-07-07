@@ -32,7 +32,7 @@ Core architecture rules:
 - `utils/security_identity.py`: Centralized `SecurityIdentityResolver` — FIGI→CIK→symbol→history priority chain for identity resolution; `sync_massive_universe` uses it for rename/recycle detection.
 - `utils/key_rate_limiter.py`: Per-key, process-shared Massive rate limiter.
 - `alembic/versions/`: PostgreSQL migrations.
-- `research/`: 离线研究层（只读，绝不回写事实表）——`data.py` 批量复权面板加载（与 `utils/adjusted_prices` 同口径，有一致性测试锁定），`fundamentals.py` 基本面 PIT 归一化（`sec_fundamental_facts` -> TTM/时点指标 as-of 面板：重述感知 vintage 口径——as-of t 取 filed_date <= t 的最新已申报值，TTM 三分量锁同一 concept、任一分量重述即发新事件，营收同义概念按标准营收族优先级在事件流层 coalesce（含银行/保险的 RevenuesNetOfInterestExpense 等行业概念），270 天新鲜度门槛置 NaN），`backtest.py` 向量化回测引擎（t 日权重赚 t+1 收益，换手计成本），`strategies.py` 技术基线，`run_baselines.py` 入口。连库优先 `RESEARCH_DATABASE_URL`（指向 253 生产库）。
+- `research/`: 离线研究层（只读，绝不回写事实表）——`data.py` 批量复权面板加载（与 `utils/adjusted_prices` 同口径，有一致性测试锁定），`fundamentals.py` 基本面 PIT 归一化（`sec_fundamental_facts` -> TTM/时点指标 as-of 面板：重述感知 vintage 口径——as-of t 取 filed_date <= t 的最新已申报值，TTM 三分量锁同一 concept、任一分量重述即发新事件，营收同义概念按标准营收族优先级在事件流层 coalesce（含银行/保险的 RevenuesNetOfInterestExpense 等行业概念），270 天新鲜度门槛置 NaN），`backtest.py` 向量化回测引擎（t 日权重赚 t+1 收益，换手计成本），`strategies.py` 技术基线，`run_baselines.py` 入口。连库优先 `RESEARCH_DATABASE_URL`（指向 253 生产库）。只读铁律的唯一挂号例外：`research/minute_features.py` 允许 INSERT 写 ClickHouse 派生特征缓存表 `stock.minute_daily_features`（幂等重建的计算输出，非事实表；除此之外 research/ 不得写任何库表）。
   - 回测数据边界：`computed_adjustment_factors` 覆盖 ex_date >= 2003-01-01（2026-07 corporate-actions 归档回填，见 `docs/corp_actions_archive_2026-07.md`；pre-2024-05-14 段无 vendor reference 可对账，靠价格跳变抽验兜底），面板下限 `FACTOR_TRUST_FLOOR = 2003-01-01`；存在无因子覆盖事件的证券（值冲突挂起、POLYGON legacy 孤行、归档缺漏、退市缺口）须用 `securities_with_uncovered_events` 整体剔除——该函数对非 MASSIVE 孤行（同日无 MASSIVE 对应行）也判为洞；默认 straddle_v2 口径只计"跨立"价格序列（min_date < ex_date <= max_date）的事件（事件前/后无价格则无假跳空），`require_straddle=False` 复现旧口径；2026-07-07 孤行裁决（398 删 / 8,440 allowlist 导入 / FX 补链）后剔除数 325。20 年长面板内存大，`run_baselines`/`evaluate` 默认窗口仍为 2024-05-14 起，长窗口显式传 `--start`。
   - 因子库（`research/factors/`）：PIT 因子框架，详见 `docs/factors.md`。当前 9 个 builtin 因子——`size`（log 市值）、`earnings_yield`（盈利收益率）、`short_interest_ratio`（空头仓位占比）、`short_volume_ratio`（日做空成交占比）、`days_to_cover`（空头天数覆盖）、`institutional_breadth`（13F 持仓机构数）、`delta_institutional_ownership`（季度 IO 变化）、`ownership_concentration`（持仓 HHI）、`insider_net_buy`（内部人净买入）。新增因子只需在 `builtins/` 下写一个 `@dataclass(frozen=True)` 类 + `register()` 即可。评估用 `python -m research.evaluate --factors size --start 2024-05-14`。
   - PIT 股本/市值（2026-07 起）：`research/shares.py` 从 `sec_fundamental_facts` 载入 XBRL 股本事件流（dei→us-gaap coalesce、value>0、270 天新鲜度锚 period_end、拆股前滚锚 period_end——XBRL 股本是申报口径不随拆股回溯），经 `stitch_shares_events` 缝在 vendor `historical_shares` 段之下（vendor 优先、MASSIVE>POLYGON）；`load_market_cap_panel(include_xbrl=True 默认)` 输出缝合后市值面板，size/earnings_yield 经此获得 2009+ 历史。`include_xbrl=False` 复现纯 vendor 旧口径；AAPL 2020 拆股金样本测试锁定接缝（`tests/test_shares_pit.py`）。多类股分摊：`earnings_yield` 自二期起在读取层做公司 join（分子取锚证券广播回成员、分母 = `research/company_market_cap.py` 公司级合并市值；无 company_id 或公司无 common-equity 成员时回退证券级旧口径）；common-equity 判别 `is_common_equity`（share_class_figi 结构化正证据 > 名称启发式）。
@@ -181,7 +181,9 @@ python -m pytest tests/ -q -m "not integration"  # 仅纯单元测试
   {200,420} 档跨因子共享——v1 曾因缓存键含精确起始日被 8 因子各拉 8 遍，引以为戒）；
   评估层用 `data.load_adjusted_panel`（容量 2 记忆化）。read_sql 在 30M 行量级慢 5-10 倍，禁用。
 - **性能改动必须带等价性金测试**（新旧实现在含 NaN/并列/停牌/退市尾巴的合成面板上
-  1e-12 一致，参照 `tests/test_evaluate_fast_equivalence.py`），速度绝不以数字漂移换。
+  1e-12 一致，参照 `tests/test_evaluate_fast_equivalence.py`；已挂号例外：该文件分位
+  指标用例（`TestQuantileMetricsEquivalence`，:173 附近）容差为 rtol=1e-10/atol=1e-12），
+  速度绝不以数字漂移换。
 - **数值安全**：病理值置 NaN 剔除排名，绝不 clip 成极值信号（residual_vol 曾把负残差
   方差 clip(0) 排进最强分位——教训）；零方差/零量/零区间一律 NaN；除法全部走
   `np.errstate` + 显式掩码，不吞 warning。
