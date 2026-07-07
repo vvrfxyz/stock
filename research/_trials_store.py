@@ -226,7 +226,11 @@ def append_trial(result: "EvaluationResult", path: Path) -> str:
     return trial_id
 
 
-def load_trials(path: Path = Path("research/output/trials.parquet"), *, latest_only: bool = False) -> pd.DataFrame:
+def load_trials(path: Path | None = None, *, latest_only: bool = False) -> pd.DataFrame:
+    if path is None:
+        # 与 evaluate.py 写侧同锚（__file__ 绝对路径）：cwd 相对默认值会在错目录下
+        # 把有账读成空帧（_read_frame 对不存在路径静默返回空）。
+        path = Path(__file__).resolve().parent / "output" / "trials.parquet"
     df = _read_frame(path)
     if df.empty or not latest_only:
         return df

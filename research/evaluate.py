@@ -79,6 +79,37 @@ def _engine_code_fingerprint() -> str:
     return "-".join(digests)
 
 
+def compute_trial_id(
+    *,
+    factor_name: str,
+    factor_version: str,
+    universe_hash: str,
+    params_hash: str,
+    eval_start: str,
+    eval_end: str,
+    as_of: str,
+    code_git_sha: str | None,
+) -> str:
+    """trial_id 的唯一推导（EvaluationResult._trial_id_value 与 --skip-existing 共用）。
+
+    注意 universe_hash 是面板装载 + gate 之后才有的量——skip 判定因此只能活在
+    run_evaluation 内部（factor.compute 之前），做不到"跑之前"就构造 trial_id。
+    """
+    raw = "|".join(
+        [
+            factor_name,
+            factor_version,
+            universe_hash,
+            params_hash,
+            f"{eval_start}:{eval_end}",
+            as_of,
+            code_git_sha or "",
+            _engine_code_fingerprint(),
+        ]
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
 def _normalize_dates(index: pd.Index) -> pd.DatetimeIndex:
     return pd.DatetimeIndex(pd.to_datetime(index)).astype("datetime64[ns]")
 
@@ -496,19 +527,16 @@ class EvaluationResult:
         eval_start = self.eval_dates.min().date().isoformat() if len(self.eval_dates) else ""
         eval_end = self.eval_dates.max().date().isoformat() if len(self.eval_dates) else ""
         as_of = self.as_of.date().isoformat() if self.as_of is not None else ""
-        raw = "|".join(
-            [
-                self.factor_name,
-                self.factor_version,
-                self.universe_hash,
-                self.params_hash,
-                f"{eval_start}:{eval_end}",
-                as_of,
-                self.code_git_sha or "",
-                _engine_code_fingerprint(),
-            ]
+        return compute_trial_id(
+            factor_name=self.factor_name,
+            factor_version=self.factor_version,
+            universe_hash=self.universe_hash,
+            params_hash=self.params_hash,
+            eval_start=eval_start,
+            eval_end=eval_end,
+            as_of=as_of,
+            code_git_sha=self.code_git_sha,
         )
-        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
     def to_trial_rows(self) -> list[dict[str, Any]]:
         from research._trials_store import TRIALS_SCHEMA_VERSION
@@ -811,6 +839,7 @@ def run_evaluation(
     terminal_return: float | None = None,
     use_delisting_returns: bool = True,
     fund_closure_par: bool = True,
+    existing_trial_ids: frozenset[str] | None = None,
 ) -> EvaluationResult:
     from research._trials_store import _git_meta, append_trial
 
@@ -861,23 +890,10 @@ def run_evaluation(
     factor_obj = get(factor) if isinstance(factor, str) else factor
     factor_params = _factor_params_snapshot(factor_obj)
     ctx = FactorContext(engine=engine, dates=ctx_dates, security_universe=universe, as_of=pd.Timestamp(effective_as_of))
-    factor_values = factor_obj.compute(ctx).reindex(index=ctx_dates, columns=universe).astype("float64")
-    # §E.3 股本口径门：ADR 的 ADS/公司股本混杂，声明 adr_unsafe 的因子
-    # （size/earnings_yield/short_interest_ratio）在 ADR opt-in 宇宙里对
-    # ADR 列置 NaN——其余证券照常评估，禁入直至 ADS 比率归一化。
-    adr_gated_count = 0
-    if getattr(factor_obj, "adr_unsafe", False) and any(t in ADR_TYPES for t in types):
-        adr_ids = _load_type_ids(engine, ADR_TYPES)
-        gated_cols = [c for c in factor_values.columns if int(c) in adr_ids]
-        if gated_cols:
-            factor_values.loc[:, gated_cols] = np.nan
-            adr_gated_count = len(gated_cols)
-            logger.warning(
-                "factor={} 声明 adr_unsafe：{} 只 ADR 列已置 NaN（股本口径未归一化，§E.3）",
-                factor_obj.name, adr_gated_count,
-            )
-    if factor_values.dropna(how="all", axis=0).empty:
-        raise FactorEvaluationError(f"factor {factor_obj.name!r} is empty or all NaN")
+    # ---- eval 窗口 / config / trial_id 全部前移到 factor.compute 之前 ----
+    # 这些量只依赖面板与参数、不依赖因子值（纯重排序）；意义有二：
+    # (1) 窗口不足类错误在昂贵的 compute 之前就抛（fail fast）；
+    # (2) --skip-existing 能在 compute 之前用 compute_trial_id 判定"这一跑已有 trial"。
     default_eval_start = ctx_dates[252].date() if eval_start is None and len(ctx_dates) > 252 else None
     effective_eval_start = eval_start or default_eval_start
     if effective_eval_start is None:
@@ -888,10 +904,6 @@ def run_evaluation(
     quantile_adj_close = adj_close.reindex(index=ctx_dates, columns=universe).loc[pd.Timestamp(effective_eval_start):]
     if risk_free_returns is None and risk_free_series:
         risk_free_returns = load_risk_free_daily_returns(engine, quantile_adj_close.index, series_id=risk_free_series)
-    forward_returns = {h: _forward_return(adj_close, h).reindex(index=eval_dates, columns=universe) for h in horizons}
-    eval_start_ts = pd.Timestamp(effective_eval_start)
-    for panel_returns in forward_returns.values():
-        panel_returns.loc[panel_returns.index < eval_start_ts] = np.nan
     code_git_sha, code_git_dirty = _git_meta()
     config = {
         "start": start,
@@ -928,15 +940,76 @@ def run_evaluation(
         "run_id": run_id,
         "note": note,
     }
+    params_hash_value = _params_hash(config)
+    factor_version_value = _factor_version(factor_obj, code_git_sha)
+    prospective_trial_id = compute_trial_id(
+        factor_name=factor_obj.name,
+        factor_version=factor_version_value,
+        universe_hash=_universe_hash(universe),
+        params_hash=params_hash_value,
+        eval_start=eval_dates.min().date().isoformat(),
+        eval_end=eval_dates.max().date().isoformat(),
+        as_of=pd.Timestamp(effective_as_of).date().isoformat(),
+        code_git_sha=code_git_sha,
+    )
+    if existing_trial_ids is not None and prospective_trial_id in existing_trial_ids:
+        logger.info(
+            "factor={} trial 已存在（trial_id={}…），--skip-existing 跳过 compute/evaluate",
+            factor_obj.name, prospective_trial_id[:12],
+        )
+        return EvaluationResult(
+            factor_name=factor_obj.name,
+            factor_version=factor_version_value,
+            code_git_sha=code_git_sha,
+            code_git_dirty=code_git_dirty,
+            horizons=tuple(horizons),
+            eval_dates=eval_dates,
+            as_of=pd.Timestamp(effective_as_of),
+            cost_bps=cost_bps,
+            n_quantiles=n_quantiles,
+            universe_hash=_universe_hash(universe),
+            universe_size_mean=0.0,
+            universe_size_min=0,
+            params_hash=params_hash_value,
+            config=config,
+            ic_table=pd.DataFrame(),
+            ic_decay=pd.DataFrame(columns=["horizon", "lag", "ic"]),
+            quantile_metrics=pd.DataFrame(),
+            coverage=pd.DataFrame(),
+            diagnostics={"skipped_existing": True},
+            status="skipped_existing",
+            trial_id=prospective_trial_id,
+        )
+    factor_values = factor_obj.compute(ctx).reindex(index=ctx_dates, columns=universe).astype("float64")
+    # §E.3 股本口径门：ADR 的 ADS/公司股本混杂，声明 adr_unsafe 的因子
+    # （size/earnings_yield/short_interest_ratio）在 ADR opt-in 宇宙里对
+    # ADR 列置 NaN——其余证券照常评估，禁入直至 ADS 比率归一化。
+    adr_gated_count = 0
+    if getattr(factor_obj, "adr_unsafe", False) and any(t in ADR_TYPES for t in types):
+        adr_ids = _load_type_ids(engine, ADR_TYPES)
+        gated_cols = [c for c in factor_values.columns if int(c) in adr_ids]
+        if gated_cols:
+            factor_values.loc[:, gated_cols] = np.nan
+            adr_gated_count = len(gated_cols)
+            logger.warning(
+                "factor={} 声明 adr_unsafe：{} 只 ADR 列已置 NaN（股本口径未归一化，§E.3）",
+                factor_obj.name, adr_gated_count,
+            )
+    if factor_values.dropna(how="all", axis=0).empty:
+        raise FactorEvaluationError(f"factor {factor_obj.name!r} is empty or all NaN")
+    forward_returns = {h: _forward_return(adj_close, h).reindex(index=eval_dates, columns=universe) for h in horizons}
+    eval_start_ts = pd.Timestamp(effective_eval_start)
+    for panel_returns in forward_returns.values():
+        panel_returns.loc[panel_returns.index < eval_start_ts] = np.nan
     factor_eval = factor_values.reindex(index=eval_dates, columns=universe)
     factor_eval.attrs.update(
         {
             "as_of": pd.Timestamp(effective_as_of),
-            "factor_version": _factor_version(factor_obj, code_git_sha),
+            "factor_version": factor_version_value,
             "code_git_sha": code_git_sha,
             "code_git_dirty": code_git_dirty,
             "config": config,
-            "params_hash": _params_hash(config),
+            "params_hash": params_hash_value,
         }
     )
     result = evaluate_factor(
@@ -985,16 +1058,39 @@ def evaluate_all(
     start: date,
     end: date,
     names: list[str] | None = None,
+    skip_existing: bool = False,
     **kwargs: Any,
 ) -> list[EvaluationResult]:
     factor_names = names or list_factors()
     results: list[EvaluationResult] = []
     run_id = hashlib.sha1(f"{pd.Timestamp.now(tz='UTC').isoformat()}:{factor_names}".encode()).hexdigest()
     prog = Progress("evaluate", total=len(factor_names))
+    # --skip-existing 断点续跑：完成集就是 trials.parquet 本身（trial_id 全指纹幂等），
+    # 不引入新台账文件。OOM 死在第 7 个因子后，同一条命令 + --skip-existing 只重跑 7、8；
+    # 每个因子仍要付面板装载（进程内缓存只付一次），省掉的是逐因子 compute/evaluate 大头。
+    existing_trial_ids: frozenset[str] | None = None
+    if skip_existing:
+        trials_path = kwargs.get("trials_path", DEFAULT_TRIALS_PATH)
+        if trials_path is None:
+            logger.warning("--skip-existing 在 --no-persist 下无台账可查，忽略跳过")
+        else:
+            from research._trials_store import load_trials
+            trials = load_trials(Path(trials_path))
+            existing_trial_ids = (
+                frozenset(trials["trial_id"].dropna().astype(str)) if not trials.empty else frozenset()
+            )
+            prog.log(f"--skip-existing: 台账已有 {len(existing_trial_ids)} 个 trial_id")
+    skipped = 0
     for i, name in enumerate(factor_names, 1):
         try:
             with prog.stage(f"因子 {name}", item=i):
-                result = run_evaluation(name, engine=engine, start=start, end=end, run_id=run_id, **kwargs)
+                result = run_evaluation(
+                    name, engine=engine, start=start, end=end, run_id=run_id,
+                    existing_trial_ids=existing_trial_ids, **kwargs,
+                )
+            if result.status == "skipped_existing":
+                skipped += 1
+                prog.log(f"skip {name}: trial 已存在（{(result.trial_id or '')[:12]}…）", item=i)
             results.append(result)
         except Exception as exc:
             if kwargs.get("strict"):
@@ -1023,6 +1119,13 @@ def evaluate_all(
                     diagnostics={"error": repr(exc)},
                     status="failed",
                 )
+            )
+    if skip_existing and existing_trial_ids:
+        prog.log(f"--skip-existing 命中 {skipped}/{len(factor_names)}")
+        if skipped == 0:
+            logger.warning(
+                "--skip-existing 零命中：trial_id 含源码指纹/参数/宇宙，任一漂移都会全量重跑——"
+                "确认这是有意的（如改了 evaluate/backtest/因子源码）"
             )
     return results
 
@@ -1153,6 +1256,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     persist_group = parser.add_mutually_exclusive_group()
     persist_group.add_argument("--trials-path", type=Path, default=None)
     persist_group.add_argument("--no-persist", action="store_true")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="断点续跑：trial_id（因子版本+参数+宇宙+窗口全指纹）已在 trials 台账里的"
+                             "因子跳过 compute/evaluate（OOM 死在第 7 个因子后，重跑只算 7、8）。"
+                             "任何源码/参数/宇宙漂移都会导致零命中并全量重跑（有 WARN 提示）。")
     parser.add_argument("--note")
     parser.add_argument("--strict", action="store_true")
     args = parser.parse_args(argv)
@@ -1190,10 +1297,14 @@ def main(argv: list[str] | None = None) -> int:
         trials_path=args.trials_path,
         note=args.note,
         strict=args.strict,
+        skip_existing=args.skip_existing,
     )
     for result in results:
         if result.status == "failed":
             print(f"## {result.factor_name}\n\nfailed: {result.diagnostics.get('error')}")
+            continue
+        if result.status == "skipped_existing":
+            print(f"## {result.factor_name}\n\nskipped: trial 已存在（--skip-existing，trial_id={(result.trial_id or '')[:12]}…）")
             continue
         print(f"## {result.factor_name}")
         print(_markdown_table(_result_summary(result)))

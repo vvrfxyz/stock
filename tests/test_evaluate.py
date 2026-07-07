@@ -622,3 +622,50 @@ def test_run_evaluation_raises_when_trial_append_fails(monkeypatch, tmp_path):
             trials_path=tmp_path / "trials.parquet",
             risk_free_series=None,
         )
+
+
+def test_skip_existing_trial_id_equivalence_and_early_return(monkeypatch):
+    """--skip-existing 金测试：compute 之前推导的 prospective trial_id 必须与
+
+    实际结果的 _trial_id_value() 位级一致（两处推导共用 compute_trial_id，
+    这里锁住"重排 config 前移后 params_hash/trial_id 不漂移"）；命中时
+    factor.compute 绝不被调用（断点续跑省的就是这一步）。
+    """
+    import research.evaluate as ev
+
+    dates, universe, _ = _panel(n_dates=30, n_names=120)
+    end = dates[19].date()
+    panel = {
+        "adj_close": pd.DataFrame(100.0, index=dates, columns=universe),
+        "close": pd.DataFrame(100.0, index=dates, columns=universe),
+        "dollar_volume": pd.DataFrame(10_000_000.0, index=dates, columns=universe),
+    }
+    monkeypatch.setattr(ev, "load_adjusted_panel", lambda *args, **kwargs: panel)
+    monkeypatch.setattr(ev, "securities_with_uncovered_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ev, "load_delisting_returns", lambda *args, **kwargs: pd.Series(dtype="float64"))
+    common = dict(
+        engine=object(),
+        start=dates.min().date(),
+        end=end,
+        horizons=(5,),
+        eval_start=dates[5].date(),
+        min_median_dollar_volume=1,
+        eligibility_window=1,
+        trials_path=None,
+        risk_free_series=None,
+    )
+
+    full = ev.run_evaluation(RecordingFactor(), **common)
+    expected_trial_id = full._trial_id_value()
+
+    hit_factor = RecordingFactor()
+    skipped = ev.run_evaluation(hit_factor, existing_trial_ids=frozenset({expected_trial_id}), **common)
+    assert skipped.status == "skipped_existing"
+    assert skipped.trial_id == expected_trial_id
+    assert hit_factor.seen_max_date is None  # compute 未被调用
+
+    miss_factor = RecordingFactor()
+    rerun = ev.run_evaluation(miss_factor, existing_trial_ids=frozenset({"deadbeef"}), **common)
+    assert rerun.status != "skipped_existing"
+    assert miss_factor.seen_max_date is not None
+    assert rerun._trial_id_value() == expected_trial_id  # miss 路径推导仍一致
