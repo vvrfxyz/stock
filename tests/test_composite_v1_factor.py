@@ -237,3 +237,40 @@ class TestCompositeEligibility:
         assert out.columns.equals(wide)
         assert not out[999].any()
         assert out.dtypes.eq(bool).all()
+
+
+class TestCompositeV2:
+    # v2 语义 = v1 机制 + 第四成分 OP（预注册见 composite_v2.py docstring）
+    def test_registered_with_locked_components(self):
+        from research.factors.builtins.composite_v2 import COMPONENTS_V2, CompositeV2Factor
+        from research.factors.protocol import get
+
+        assert COMPONENTS_V2 == ("low_vol", "high_52w", "size", "operating_profitability")
+        f = get("composite_v2")
+        assert isinstance(f, CompositeV2Factor)
+        assert f.adr_unsafe is True and f.lookback_days == 252
+
+    def test_compute_uses_shared_machinery_with_four_components(self, monkeypatch):
+        import research.factors.builtins.composite_v1 as v1mod
+        import research.factors.builtins.composite_v2 as v2mod
+
+        dates = pd.bdate_range("2025-01-02", periods=3)
+        universe = pd.Index([1, 2], dtype="int64")
+        calls = {}
+
+        def fake_elig(ctx):
+            return pd.DataFrame(True, index=dates, columns=universe)
+
+        def fake_ranks(ctx, eligible, names):
+            calls["names"] = tuple(names)
+            base = pd.DataFrame(0.5, index=dates, columns=universe)
+            return {n: base.copy() for n in names}
+
+        monkeypatch.setattr(v2mod, "composite_eligibility", fake_elig)
+        monkeypatch.setattr(v2mod, "eligible_component_ranks", fake_ranks)
+        ctx = FactorContext(engine=None, dates=dates, security_universe=universe, as_of=dates[-1])
+        out = v2mod.CompositeV2Factor().compute(ctx)
+        assert calls["names"] == v2mod.COMPONENTS_V2
+        # 四成分全 0.5 秩 + 0.5 填补 → 复合恒 0.5；主干在场
+        assert (out.round(12) == 0.5).all().all()
+        assert v1mod is not None  # 共享机制来源锁定

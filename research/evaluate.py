@@ -36,6 +36,7 @@ from research.factors.builtins import bar_geometry as _bar_geometry  # noqa: F40
 from research.factors.builtins import classic_pillars as _classic_pillars  # noqa: F401
 from research.factors.builtins import classic_price as _classic_price  # noqa: F401
 from research.factors.builtins import composite_v1 as _composite_v1  # noqa: F401
+from research.factors.builtins import composite_v2 as _composite_v2  # noqa: F401
 from research.factors.builtins import days_to_cover as _days_to_cover  # noqa: F401
 from research.factors.builtins import delta_institutional_ownership as _delta_inst_own  # noqa: F401
 from research.factors.builtins import earnings_yield as _earnings_yield  # noqa: F401
