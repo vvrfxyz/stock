@@ -27,6 +27,58 @@ TRADING_DAYS = 252
 # 以 (id, shape) 为键 + 对象身份复核缓存，最多驻留 2 份（评估面板 + 基准面板）。
 _DERIVED_CACHE: dict[tuple, dict] = {}
 
+# 退市注入结果缓存（Series 口径）：retail_reality 1000 次 sim 传同一个 adj_sub 面板
+# 对象 + 同一个 terminal_return Series，注入的**价格视角**部分（每列价格永久缺失首日
+# 注入 per_security，与持仓无关）逐 sim 相同，可缓存。以 (id(adj_close), id(terminal_return),
+# fallback) 为键 + 双对象身份复核；最多驻留 2 份（评估面板 + 基准面板）。
+_TERMINAL_INJECTION_CACHE: dict[tuple, dict] = {}
+
+
+def _price_perspective_injection(
+    adj_close: pd.DataFrame,
+    derived: dict,
+    terminal_return: pd.Series,
+    terminal_return_fallback: float | None,
+) -> dict:
+    """价格视角（与持仓无关）的退市注入：在每列价格**永久缺失首日**注入 per_security。
+
+    注入点 = price_first_terminal（价格永久缺失段首日，只依赖 adj_close），非引擎现行
+    的 first_terminal（依赖 held）。二者在"持仓先于退市开始"的正常列上落在同一日、
+    取同一值，故价格视角注入的 returns_filled 对这些列与现行逐位一致；差异只出现在
+    持仓晚于退市或未持仓的列上，由 run_backtest 的 gross 贡献守卫逐列甄别（见调用处）。
+    只依赖 adj_close + terminal_return(Series) + fallback，跨 sim 缓存。
+    """
+    key = (id(adj_close), id(terminal_return), terminal_return_fallback)
+    hit = _TERMINAL_INJECTION_CACHE.get(key)
+    if hit is not None and hit["adj_ref"] is adj_close and hit["tr_ref"] is terminal_return:
+        return hit
+    returns = derived["returns"]
+    price_terminal = adj_close.isna() & ~derived["ever_future_price"]
+    price_first_terminal = price_terminal & ~price_terminal.shift(1, fill_value=False)
+    per_security = terminal_return.reindex(returns.columns).astype("float64")
+    if terminal_return_fallback is not None:
+        per_security = per_security.fillna(terminal_return_fallback)
+    per_security_notna = per_security.notna()
+    inject = price_first_terminal & per_security_notna  # 按列广播
+    returns_injected = returns.mask(inject, per_security, axis=1)
+    entry = {
+        "adj_ref": adj_close,
+        "tr_ref": terminal_return,
+        "returns_filled": returns_injected.fillna(0.0),
+        "price_first_terminal": price_first_terminal,
+        "per_security": per_security,
+        "per_security_notna": per_security_notna,
+        # 有价格永久缺失段且会注入的列（守卫只需在这些列上比较）
+        "check_cols": returns.columns[
+            (price_first_terminal.any(axis=0) & per_security_notna).to_numpy()
+        ],
+    }
+    if len(_TERMINAL_INJECTION_CACHE) >= 2:
+        _TERMINAL_INJECTION_CACHE.clear()
+    _TERMINAL_INJECTION_CACHE[key] = entry
+    return entry
+
+
 
 def _derived_from_prices(adj_close: pd.DataFrame) -> dict:
     key = (id(adj_close), adj_close.shape)
@@ -39,13 +91,17 @@ def _derived_from_prices(adj_close: pd.DataFrame) -> dict:
     returns = returns.where(valid_pair)
     missing = adj_close.isna()
     prev_missing = missing.shift(1, fill_value=False)
+    carry_zone = missing | (~missing & prev_missing)
     entry = {
         "ref": adj_close,
         "returns": returns,
         "returns_filled": returns.fillna(0.0),
         "ever_future_price": adj_close.notna()[::-1].cummax()[::-1],
         "gap_entry": missing & ~prev_missing,
-        "carry_zone": missing | (~missing & prev_missing),
+        "carry_zone": carry_zone,
+        # 有停牌/退市缺口的列（面板级、跨 sim 复用）：hold_through_gaps 冻结只需在这些
+        # 列上做 where/ffill，其余列 effective_held 恒等于 held（carry_zone 全 False）。
+        "gap_cols": adj_close.columns[carry_zone.any(axis=0).to_numpy()],
     }
     if len(_DERIVED_CACHE) >= 2:
         _DERIVED_CACHE.clear()
@@ -135,6 +191,24 @@ def run_backtest(
     ever_future_price = derived["ever_future_price"]
     terminal_mask = held.gt(0) & adj_close.isna() & ~ever_future_price
     terminal_missing_position_days = int(terminal_mask.sum().sum())
+
+    # 停牌期冻结持仓（默认开启；可关以复现旧口径）——数值与注入无关、只依赖 held + 缺口
+    # 结构，故提前到注入之前算：退市注入的 gross 贡献守卫需要 effective_held。
+    # 冻结只作用于有缺口的列（carry_zone.any，面板级缓存 gap_cols，~15%）：无缺口列
+    # carry_zone 全 False -> where 恒保留 held、fillna 无操作 -> effective_held ≡ held，
+    # 故只在 gap_cols 上做 where/ffill，其余列直接沿用 held（held 为本 sim 私有、之后不
+    # 再引用，原地改挂 gap 列即得 effective_held，避免全面板 ffill 与整表复制）。
+    if hold_through_gaps:
+        gap_cols = derived["gap_cols"]
+        if len(gap_cols):
+            held_g = held[gap_cols].copy()  # 私有化 gap 列，令下面对 held 的改挂在位（不 CoW 整表）
+            carry_g = derived["carry_zone"][gap_cols]
+            frozen_g = held_g.where(derived["gap_entry"][gap_cols]).ffill().where(carry_g)
+            held[gap_cols] = held_g.where(~carry_g, frozen_g).fillna(held_g)
+        effective_held = held
+    else:
+        effective_held = held
+
     # 退市/终止收益政策：持仓后价格永久缺失时，默认 _returns_with_gap_recovery 给 NaN，
     # fillna(0.0) 后等于静默赚 0%。terminal_return 让调用方为"退市当日"注入一个收益假设
     # （如 -1.0=-100%）。只在永久缺失的第一天（退市事件日）注入一次，避免重复相乘炸掉数学。
@@ -142,27 +216,43 @@ def run_backtest(
     # Series 缺失/NaN 的证券回退到 terminal_return_fallback（None 则不注入，保持旧口径）。
     returns_filled = derived["returns_filled"]
     if terminal_return is not None and terminal_missing_position_days > 0:
-        first_terminal = terminal_mask & ~terminal_mask.shift(1, fill_value=False)
-        returns = returns.copy()
         if isinstance(terminal_return, pd.Series):
-            # 向量化按列注入：把 Series 对齐到面板列（security_id），fallback 补洞后
-            # 仍缺值的列不注入（等价于该证券沿用 terminal_return=None 的旧口径）。
-            per_security = terminal_return.reindex(returns.columns).astype("float64")
-            if terminal_return_fallback is not None:
-                per_security = per_security.fillna(terminal_return_fallback)
-            inject = first_terminal & per_security.notna()
-            returns = returns.mask(inject, per_security, axis=1)
+            # 价格视角注入结果缓存化（跨 sim 复用），配 gross 贡献语义守卫。
+            cache = _price_perspective_injection(
+                adj_close, derived, terminal_return, terminal_return_fallback
+            )
+            check_cols = cache["check_cols"]
+            first_terminal = None
+            unsafe_cols = check_cols[:0]
+            if len(check_cols):
+                # 守卫（逐列，只在有注入的退市列上）：比较**现行注入**（落在 first_terminal，
+                # 依赖 held）与**价格视角注入**（落在 price_first_terminal）经 effective_held
+                # 加权后的 gross 贡献。二者的每列贡献相等 <=> 该列缓存结果对 gross 逐位等价
+                # （per_security 每列单值可提出，故比较 Σ effective_held 即可）。不等的列
+                # （持仓晚于退市开始 / 尾巴中途重入 / 空头位于尾巴）逐列回退现行路径。
+                tm_c = terminal_mask[check_cols]
+                first_terminal = tm_c & ~tm_c.shift(1, fill_value=False)
+                eh_c = effective_held[check_cols].to_numpy()
+                curr_contrib = (eh_c * first_terminal.to_numpy()).sum(axis=0)
+                cached_contrib = (
+                    eh_c * cache["price_first_terminal"][check_cols].to_numpy()
+                ).sum(axis=0)
+                unsafe_cols = check_cols[curr_contrib != cached_contrib]
+            if len(unsafe_cols) == 0:
+                returns_filled = cache["returns_filled"]  # 快路径：只读复用，不 copy
+            else:
+                # 逐列回退：从缓存拷贝，仅对 unsafe 列按现行 first_terminal 口径重算注入。
+                returns_filled = cache["returns_filled"].copy()
+                base = returns[unsafe_cols]
+                inject = first_terminal[unsafe_cols] & cache["per_security_notna"][unsafe_cols]
+                returns_filled[unsafe_cols] = base.mask(
+                    inject, cache["per_security"][unsafe_cols], axis=1
+                ).fillna(0.0)
         else:
+            first_terminal = terminal_mask & ~terminal_mask.shift(1, fill_value=False)
+            returns = returns.copy()
             returns[first_terminal] = terminal_return
-        returns_filled = returns.fillna(0.0)
-    # 停牌期冻结持仓，避免复牌跨缺口收益被清零的权重吞掉（默认开启；可关以复现旧口径）。
-    if hold_through_gaps:
-        carry_zone = derived["carry_zone"]
-        entry_held = held.where(derived["gap_entry"])
-        frozen = entry_held.ffill().where(carry_zone)
-        effective_held = held.where(~carry_zone, frozen).fillna(held)
-    else:
-        effective_held = held
+            returns_filled = returns.fillna(0.0)
     gross = (effective_held * returns_filled).sum(axis=1)
     turnover = (weights - weights.shift(1).fillna(0.0)).abs().sum(axis=1)
     cost = turnover * cost_bps / 10_000
