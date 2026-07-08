@@ -41,6 +41,7 @@ from research.factors.builtins import days_to_cover as _days_to_cover  # noqa: F
 from research.factors.builtins import delta_institutional_ownership as _delta_inst_own  # noqa: F401
 from research.factors.builtins import earnings_yield as _earnings_yield  # noqa: F401
 from research.factors.builtins import eod_pressure as _eod_pressure  # noqa: F401
+from research.factors.builtins import f_score as _f_score  # noqa: F401
 from research.factors.builtins import gross_profitability as _gross_profitability  # noqa: F401
 from research.factors.builtins import insider_cluster as _insider_cluster  # noqa: F401
 from research.factors.builtins import insider_net_buy as _insider_net_buy  # noqa: F401

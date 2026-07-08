@@ -186,7 +186,10 @@ python -m pytest tests/ -q -m "not integration"  # 仅纯单元测试
   速度绝不以数字漂移换。
 - **数值安全**：病理值置 NaN 剔除排名，绝不 clip 成极值信号（residual_vol 曾把负残差
   方差 clip(0) 排进最强分位——教训）；零方差/零量/零区间一律 NaN；除法全部走
-  `np.errstate` + 显式掩码，不吞 warning。
+  `np.errstate` + 显式掩码，不吞 warning。日期→自纪元天数一律走 `datetime64[D]`
+  转换（`_epoch_days` 模式），**禁 `astype("int64") // 纳秒常量`**——pandas 3 的
+  `pd.Timestamp` 字面量列是 us 分辨率，ns 常量除法静默出错值（2026-07-08 f_score
+  拆股 mask 永假事故；pandas 2 下全绿是假绿，测试须带显式 us 分辨率用例）。
 - **数据安全**：research/ 只读，绝不回写事实表；PIT 边界（filing_date/lag_days）先于
   一切优化；预注册判据写死在脚本 docstring 再跑数（改动留痕），试验全部进 trials.parquet。
 - 慢作业先 profile 定位（`/usr/bin/sample <pid>`）再改，禁止盲目重跑。

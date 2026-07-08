@@ -71,6 +71,50 @@ delisting_return）；宇宙 CS-only 默认；horizons (1,5,10,21)。
   大概率也是零，省下窗口）。组件子集在跑数前根据覆盖率钉死并提交，不做子集搜索。
 - **死刑**：同 H1。
 
+### 子集钉死（2026-07-08，覆盖率量化后 — 追加型执行记录，不改判据）
+
+启动条件已触发（H3 operating_profitability 过线）。按预注册"覆盖率 >80% 钉死子集"，
+在跑数前完成量化并钉死如下（253 只读，2012–2025 池化年度截面）：
+
+**覆盖率基线裁决 = core（NI & OCF & assets present）**。理由：F-score 定义上只对有
+ROA/CFO 核心财务的公司成立，对拿不到核心的公司量 Δ 组件覆盖率是伪问题。9 组件覆盖率
+（vs core 基线，42,200 池化格）：
+
+| # | 组件 | 覆盖率 | 入选 |
+|---|------|-------|------|
+| 1 | ROA (NI>0) | 100% | ✅ |
+| 2 | CFO (OCF>0) | 100% | ✅ |
+| 3 | ΔROA | 90.5% | ✅ |
+| 4 | ACCRUAL (CFO>NI) | 100% | ✅ |
+| 5 | ΔLEVER (LongTermDebt/A) | 45.8% | ✗ |
+| 6 | ΔLIQUID (CA/CL) | 76.6% | ✗ |
+| 7 | EQ_OFFER (Δshares≤0) | 85.9% | ✅ |
+| 8 | ΔMARGIN (GP/Rev) | 36.3% | ✗ |
+| 9 | ΔTURN (Rev/A) | 77.0% | ✗ |
+
+**钉死子集 = 5 组件 {ROA, CFO, ACCRUAL, ΔROA, EQ_OFFER}**（均 ≥85%）。出局的
+ΔLEVER/ΔMARGIN 是 XBRL 数据现实（LongTermDebt 多数公司不报/走租赁，GrossProfit 银行
+保险服务业不报，含 rev−cost 兜底仍 36%）；ΔLIQUID/ΔTURN 借线下（77%）。子集只需现有
+METRICS（NI/OCF/assets/shares_outstanding），零新增指标。
+
+**组成偏斜 caveat（照实留痕）**：5 个里 4 个是盈利/应计块（ROA/CFO/ACCRUAL/ΔROA），与
+已测的 operating_profitability、accruals 因子高度相关，只有 EQ_OFFER 是正交的融资信号。
+此"F-score lite"大概率是盈利族的复述，**evaluate 阶段按 H5 死刑条款速死是合法结局**——
+跑它的价值是把 wave-12 干净收官（全灭也要有账），且 EQ_OFFER 是本项目未测过的融资信号
+维度，万一贡献边际信息只有跑了才知道。
+
+**缺失分母口径裁决 = partial / k_available，下限 k_available ≥ 4，否则 NaN**。
+F = (Σ 可得组件 1/0 分) / k_available（[0,1] 均值）。Piotroski (2000) 原文 = 完整案例法
+（9 组件齐全才算，缺数据剔除）——损覆盖，不取；纯"缺失记 0"会系统性压低数据稀疏公司
+（小盘）分、把 F 与 size 虚假相关（CLAUDE.md 纪律点名的陷阱），亦不取。均值缩放覆盖中性、
+无偏；k≥4 下限防单组件极端分。符号原样（高 F=好），不翻。
+
+**EQ_OFFER 拆股污染裁决 = 拆股年该证券该 YoY 窗口 EQ_OFFER 置 NaN**。XBRL 股本是申报
+口径不随拆股回溯（research/shares.py 已知），拆股年 shares 跳增会被误判成增发。用
+corporate_actions 的 SPLIT 事件，若 split ex_date 落在该 YoY 窗口 (prior_pe, cur_pe] 内
+则置 NaN（恰落进上面的分母缩放语义，链条自洽）；不做拆股比例调整（更精但新增机器和
+错误面，保守优先）。窗口判定写死在 f_score.py docstring。
+
 ## 逐因子流水（每个都走完才动下一个）
 
 evaluate（2012+，P2 新口径，family 记账）→ 过动态阈值 → factor_correlation 三关

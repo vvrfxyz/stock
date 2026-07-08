@@ -167,6 +167,18 @@ _EVENT_COLUMNS = ["security_id", "concept", "period_end", "visible_date", "value
 
 _NS_PER_DAY = 86_400_000_000_000  # period_end -> 自纪元天数（float 精确，用于跨 metric 对齐）
 
+
+def _epoch_days(s: pd.Series) -> np.ndarray:
+    """时间序列 -> 自纪元天数（int64），**分辨率无关**。
+
+    pandas 3.x 里 pd.Timestamp 字面量建的列是 datetime64[us]（非 ns），
+    `astype("int64") // _NS_PER_DAY`（纳秒常量）会静默算出微秒天数（day=19
+    而非 19523），跨 metric period_end 对齐门/拆股窗口判定无声失效。
+    datetime64[D] 转换对 ns/us/s 任何源分辨率一律输出正确的自纪元天数。
+    """
+    return s.to_numpy().astype("datetime64[D]").astype("int64")
+
+
 _EMPTY_EVENTS = pd.DataFrame(
     {
         "security_id": pd.Series(dtype=np.int64),
@@ -481,6 +493,7 @@ def build_yoy_ratio_events(
     out_metric: str,
     target_days: int = _YOY_TARGET_DAYS,
     tolerance_days: int = _YOY_TOLERANCE_DAYS,
+    return_pair: bool = False,
 ) -> pd.DataFrame:
     """同 metric「当前期值 / 上一年度同期值 − 1」的 vintage 感知事件流。
 
@@ -500,8 +513,13 @@ def build_yoy_ratio_events(
       （老年份 YoY 的重述）不得让 as-of 序列倒退，丢弃；当前期的重述（period_end
       相等）保留。
 
-    输出 schema 同 build_metric_events：(security_id, metric=out_metric, period_end=cur_pe,
-    visible_date, value)，可直接喂 asof_panel。
+    默认输出 schema 同 build_metric_events：(security_id, metric=out_metric,
+    period_end=cur_pe, visible_date, value=比值)，可直接喂 asof_panel。
+
+    return_pair=True 改出**配对值**流（不算比值、不施 prior>0 病理门——供需要两腿
+    原值的场景，如 F-score 的 ΔROA=ROA_t−ROA_{t-1} 与 EQ_OFFER 的拆股窗口判定）：
+    (security_id, metric, period_end=cur_pe, prior_period_end=prior_pe, visible_date,
+    cur_value, prior_value)；去重按 (cur, prior) 任一变化，单调 period_end 护栏同上。
     """
     lookup = _concept_lookup((source_metric,))
     facts = facts.copy()
@@ -513,9 +531,22 @@ def build_yoy_ratio_events(
     rows = facts[facts["metric"] == source_metric][
         ["security_id", "concept", "period_end", "filed_date", "value"]
     ].copy()
-    empty = _EMPTY_EVENTS.assign(metric=pd.Series(dtype=object))[
-        ["security_id", "metric", "period_end", "visible_date", "value"]
-    ]
+    if return_pair:
+        empty = pd.DataFrame(
+            {
+                "security_id": pd.Series(dtype=np.int64),
+                "metric": pd.Series(dtype=object),
+                "period_end": pd.Series(dtype="datetime64[ns]"),
+                "prior_period_end": pd.Series(dtype="datetime64[ns]"),
+                "visible_date": pd.Series(dtype="datetime64[ns]"),
+                "cur_value": pd.Series(dtype=np.float64),
+                "prior_value": pd.Series(dtype=np.float64),
+            }
+        )
+    else:
+        empty = _EMPTY_EVENTS.assign(metric=pd.Series(dtype=object))[
+            ["security_id", "metric", "period_end", "visible_date", "value"]
+        ]
     if rows.empty:
         return empty
     # 同一 (security, concept, period) 同日多次申报只保留最后一条（与 build_metric_events 同）
@@ -574,6 +605,32 @@ def build_yoy_ratio_events(
             wide[role] = np.nan
     wide[["cur", "prior"]] = wide.groupby("pair_id")[["cur", "prior"]].ffill()
     wide = wide.dropna(subset=["cur", "prior"])
+    if return_pair:
+        if wide.empty:
+            return empty
+        prev_cur = wide.groupby("pair_id")["cur"].shift()
+        prev_prior = wide.groupby("pair_id")["prior"].shift()
+        wide = wide[(wide["cur"] != prev_cur) | (wide["prior"] != prev_prior)]
+        meta = matched[["pair_id", "security_id", "concept", "cur_pe", "prior_pe"]]
+        out = wide.merge(meta, on="pair_id")
+        events = pd.DataFrame(
+            {
+                "security_id": out["security_id"].astype(np.int64),
+                "metric": out_metric,
+                "period_end": out["cur_pe"],
+                "prior_period_end": out["prior_pe"],
+                "visible_date": out["filed"],
+                "cur_value": out["cur"].astype(np.float64),
+                "prior_value": out["prior"].astype(np.float64),
+            }
+        )
+        events = events.sort_values(["security_id", "metric", "visible_date", "period_end"])
+        running_max = events.groupby(["security_id", "metric"])["period_end"].cummax()
+        events = events[events["period_end"] >= running_max]
+        return events[
+            ["security_id", "metric", "period_end", "prior_period_end",
+             "visible_date", "cur_value", "prior_value"]
+        ].reset_index(drop=True)
     with np.errstate(divide="ignore", invalid="ignore"):
         ratio = np.where(wide["prior"] > 0, wide["cur"] / wide["prior"] - 1.0, np.nan)
     wide["ratio"] = ratio
@@ -639,9 +696,7 @@ def asof_panel(
             pe = ev.copy()
             # period_end 作 value：同 visible/staleness 参数 -> merge_asof 选中同一事件行，
             # 读出其 period_end；staleness 亦按 period_end 锚一致置 NaN。
-            pe["_period_end_days"] = (
-                pe["period_end"].astype("int64") // _NS_PER_DAY
-            ).astype("float64")
+            pe["_period_end_days"] = _epoch_days(pe["period_end"]).astype("float64")
             panels[f"{metric}__period_end"] = event_table_to_asof_panel(
                 pe,
                 dates=dates,
@@ -723,4 +778,55 @@ def load_yoy_ratio_panel(
         dtype="float64",
     )
     return panels.get(out_metric, empty)
+
+
+def load_yoy_pair_panels(
+    engine: Engine,
+    *,
+    dates: list[date] | pd.DatetimeIndex,
+    source_metric: str,
+    types: tuple[str, ...] = DEFAULT_RESEARCH_TYPES,
+    security_ids: list[int] | None = None,
+    max_staleness_days: int = 270,
+    visible_delay_days: int = 1,
+) -> dict[str, pd.DataFrame]:
+    """某 metric 的 YoY **配对值** as-of 面板（cur/prior 原值 + 两腿 period_end）。
+
+    走 build_yoy_ratio_events(return_pair=True)（事件层配对、vintage 感知），供需要两腿
+    原值的场景：F-score 的 ΔROA = ROA_t − ROA_{t-1}（用 cur/prior 的 NI、Assets 各算一次
+    ROA 再相减）、EQ_OFFER 的拆股窗口判定（split ex_date 是否落在 [prior_pe, cur_pe]）。
+    返回 {"cur","prior"}（原值宽表）与 {"cur_pe","prior_pe"}（自纪元天数 float，供窗口比较）。
+    四张面板同一 as-of 选择、逐格对齐。
+    """
+    dates = pd.DatetimeIndex(pd.to_datetime(list(dates))).astype("datetime64[ns]")
+    facts = load_fundamental_facts(
+        engine, metrics=(source_metric,), types=types, security_ids=security_ids
+    )
+    ev = build_yoy_ratio_events(
+        facts, source_metric=source_metric, out_metric=source_metric, return_pair=True
+    )
+    ev = _to_ns(ev, ("period_end", "prior_period_end", "visible_date"))
+    ev = ev.copy()
+    ev["cur_pe_days"] = _epoch_days(ev["period_end"]).astype("float64")
+    ev["prior_pe_days"] = _epoch_days(ev["prior_period_end"]).astype("float64")
+
+    def _asof(col: str) -> pd.DataFrame:
+        return event_table_to_asof_panel(
+            ev,
+            dates=dates,
+            value_column=col,
+            visible_date_column="visible_date",
+            staleness_anchor_column="period_end",
+            visible_delay_days=visible_delay_days,
+            max_staleness_days=max_staleness_days,
+        )
+
+    cur = _asof("cur_value")
+    valid = cur.notna()  # 同选格：其余三张按 cur 的非 NaN 对齐（新鲜度门在 cur 上生效）
+    return {
+        "cur": cur,
+        "prior": _asof("prior_value").where(valid),
+        "cur_pe": _asof("cur_pe_days").where(valid),
+        "prior_pe": _asof("prior_pe_days").where(valid),
+    }
 

@@ -11,6 +11,13 @@ from research.factors.protocol import Factor, FactorContext, get, list_factors, 
 
 @pytest.fixture(autouse=True)
 def _isolate_registry():
+    # 先触发全部 builtins 注册再快照——否则本文件在"builtins 尚未导入"的执行顺序下
+    # （如手选子集从 protocol 起跑）快照为空；本文件测试体内的 import（size/earnings_yield）
+    # 会注册这些因子，但 teardown 恢复到空快照把它们抹掉，且 Python 模块缓存使其无法再
+    # 注册 —— 污染后续 test_research_adr_optin 的"恰好这些因子标 adr_unsafe"断言。
+    # 全量 suite 侥幸通过是因为字母序里 test_factors_builtins 先跑、已把 builtins 注册满，
+    # 首次快照即完整；只有 protocol 先于任何 builtin-导入测试时才触发。
+    import research.evaluate  # noqa: F401  确保 _REGISTRY 完整后再快照
     saved = dict(_proto._REGISTRY)
     yield
     _proto._REGISTRY.clear()

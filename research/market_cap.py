@@ -25,6 +25,15 @@ _SPLIT_ANCHOR_COLUMN = "split_anchor"
 _NS_PER_DAY = 86_400_000_000_000
 
 
+def _epoch_days(s: pd.Series) -> np.ndarray:
+    """时间序列 -> 自纪元天数（int64），**分辨率无关**（见 fundamentals._epoch_days）。
+
+    datetime64[D] 转换对 ns/us/s 任何源分辨率一律输出正确的自纪元天数；避免
+    pandas 3.x 的 datetime64[us] 列经 `astype(int64)//_NS_PER_DAY` 静默算错。
+    """
+    return s.to_numpy().astype("datetime64[D]").astype("int64")
+
+
 def _empty_shares_events(include_source: bool = False) -> pd.DataFrame:
     df = pd.DataFrame(
         {
@@ -348,9 +357,7 @@ def compute_market_cap_panel(
             if _SPLIT_ANCHOR_COLUMN in extras
             else anchor_ev["visible_date"]
         )
-        anchor_ev["_anchor_days"] = (
-            anchor_source.astype("int64") // _NS_PER_DAY
-        ).astype(np.float64)
+        anchor_ev["_anchor_days"] = _epoch_days(anchor_source).astype(np.float64)
         anchor_days = event_table_to_asof_panel(
             anchor_ev,
             dates=dates,

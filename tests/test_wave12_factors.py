@@ -400,3 +400,44 @@ class TestAssetGrowthFactor:
         assert out.loc[DATES[0], 10] == pytest.approx(0.25)
         assert out.loc[DATES[0], 11] == pytest.approx(0.25)  # 广播自公司锚 10
         assert out.loc[DATES[0], 12] == pytest.approx(0.40)  # 无公司，自身值
+
+
+# --------------------------------------------------------------------------- #
+# build_yoy_ratio_events(return_pair=True)：配对值流（H5 F-score ΔROA/EQ_OFFER 用）
+# --------------------------------------------------------------------------- #
+class TestYoYReturnPair:
+    def test_pair_emits_cur_prior_and_period_ends(self):
+        facts = _yoy_facts(
+            (1, "Assets", "2022-12-31", "2023-02-15", 1000.0),
+            (1, "Assets", "2023-12-31", "2024-02-15", 1200.0),
+        )
+        ev = build_yoy_ratio_events(facts, source_metric="assets", out_metric="assets", return_pair=True)
+        assert set(ev.columns) == {"security_id", "metric", "period_end", "prior_period_end",
+                                   "visible_date", "cur_value", "prior_value"}
+        r = ev.iloc[0]
+        assert r["cur_value"] == 1200.0 and r["prior_value"] == 1000.0
+        assert r["period_end"] == pd.Timestamp("2023-12-31")
+        assert r["prior_period_end"] == pd.Timestamp("2022-12-31")
+        assert r["visible_date"] == pd.Timestamp("2024-02-15")
+
+    def test_pair_restatement_reemits(self):
+        # 上一期重述 -> 配对流在重述 filed 重发（cur 不变、prior 变）
+        facts = _yoy_facts(
+            (1, "Assets", "2022-12-31", "2023-02-15", 1000.0),
+            (1, "Assets", "2023-12-31", "2024-02-15", 1200.0),
+            (1, "Assets", "2022-12-31", "2024-05-01", 800.0),
+        )
+        ev = build_yoy_ratio_events(facts, source_metric="assets", out_metric="assets",
+                                    return_pair=True).sort_values("visible_date").reset_index(drop=True)
+        assert len(ev) == 2
+        assert ev.loc[0, "prior_value"] == 1000.0
+        assert ev.loc[1, "prior_value"] == 800.0 and ev.loc[1, "cur_value"] == 1200.0
+
+    def test_pair_no_prior_positive_guard(self):
+        # return_pair 不施 prior>0 病理门（负/零上一期值仍配对，供 ΔROA 用负 ROA）
+        facts = _yoy_facts(
+            (1, "Assets", "2022-12-31", "2023-02-15", -50.0),
+            (1, "Assets", "2023-12-31", "2024-02-15", 100.0),
+        )
+        ev = build_yoy_ratio_events(facts, source_metric="assets", out_metric="assets", return_pair=True)
+        assert len(ev) == 1 and ev.iloc[0]["prior_value"] == -50.0
