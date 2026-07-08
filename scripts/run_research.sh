@@ -23,13 +23,13 @@
 #   systemctl --user daemon-reload
 set -euo pipefail
 
-# 默认帽（2026-07-08 W0-OPS0 下调）：07-07 实测 5 次 global OOM 都在 RSS 5.7-6.4G
-# 时发生——11G 主机与 Plex/游戏服共存，MemoryMax=7G 的旧帽等于全局 OOM 先于硬帽
-# 触发（帽形同虚设）。降为 High=4.5G 软限流 / Max=5.5G 硬帽：宁可研究任务被自己的
-# 帽杀（Result=oom-kill 可验尸），不可拖全主机陪葬。特大作业显式抬
-# RESEARCH_MEMORY_* 环境变量并错峰跑。
-MEMORY_HIGH="${RESEARCH_MEMORY_HIGH:-4.5G}"
-MEMORY_MAX="${RESEARCH_MEMORY_MAX:-5.5G}"
+# 默认帽（2026-07-08 owner 指令：软限扩至 8G）：MemoryHigh=8G 软限流 / MemoryMax=9G
+# 硬帽。前情：07-07 曾 5 次 global OOM（无帽裸奔时代）→ OPS0 降为 4.5/5.5 + 白名单
+# 5.5/6.5；实测长窗作业在 5.5G 软限下 swap 拖慢明显（earnings_yield 54 分钟），owner
+# 裁决扩到 8G。残余风险已知：若研究 8G+ 与 PG(帽2.44G)/CH(帽4G) 同时峰值，理论峰值
+# 和超物理 11.7G——依赖 swap 与"研究/跑批错峰"兜底；PG/CH 容器帽仍在（防线未拆）。
+MEMORY_HIGH="${RESEARCH_MEMORY_HIGH:-8G}"
+MEMORY_MAX="${RESEARCH_MEMORY_MAX:-9G}"
 
 usage() {
   echo "用法: $0 <tag> -- <command...>" >&2
