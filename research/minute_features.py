@@ -230,6 +230,9 @@ def build_year(year: int) -> float:
     import requests
 
     start = time.monotonic()
+    # 开局先还账：追踪器虚账跨查询/跨会话存续（第七轮实测：上一批失败查询留下的
+    # 账面让 2025-01 开局即撞 4.5G），不能只在逐月间 purge。
+    requests.post(clickhouse_url(), params={"query": "SYSTEM JEMALLOC PURGE"}, timeout=120)
     requests.post(
         clickhouse_url(),
         params={"query": f"ALTER TABLE stock.minute_daily_features DROP PARTITION {year}"},
