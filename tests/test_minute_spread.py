@@ -81,10 +81,11 @@ class TestTemplateStructure:
 
     def test_renders_without_leftover_braces(self):
         sql = EXTRACT_SQL_TEMPLATE.format(
-            year=2020, month=7, cs_min_pairs=CS_MIN_PAIRS, roll_min_obs=ROLL_MIN_OBS
+            year=2020, month=7, n_shards=4, shard=1, cs_min_pairs=CS_MIN_PAIRS, roll_min_obs=ROLL_MIN_OBS
         )
         assert "{" not in sql and "}" not in sql
         assert "toYear(ts) = 2020 AND toMonth(ts) = 7" in sql
+        assert "cityHash64(security_id) % 4 = 1" in sql
         assert f"length(cs_valid) >= {CS_MIN_PAIRS}" in sql
         assert f"n_sub >= {ROLL_MIN_OBS}" in sql
 

@@ -68,6 +68,7 @@ from research.minute_bars import clickhouse_url, query_df
 
 # 病理/样本量门槛（预注册，roadmap §6）。CS 需足够多有效对求稳日均；Roll 复用矩量的
 # n_sub>=30 阈值（与 rskew/bipower 一致，>=29 个协方差配对）。
+N_SHARDS = 4  # 月内 security_id 哈希分片数（聚合预留账面 ÷N）
 CS_MIN_PAIRS = 10
 ROLL_MIN_OBS = 30
 
@@ -167,6 +168,7 @@ FROM (
                md BETWEEN 570 AND 959 AS rth
         FROM stock.minute_bars
         WHERE toYear(ts) = {year} AND toMonth(ts) = {month}
+          AND cityHash64(security_id) % {n_shards} = {shard}
     )
     GROUP BY security_id, d
 )
@@ -242,13 +244,20 @@ def build_year(year: int) -> float:
     # （external_group_by 对它无效——五轮实测：查询 RSS 压到 1.38G 总账仍 4.5G+），
     # 整年 ~250 万 (security,day) 组的子采样数组必须同驻内存。逐月把聚合态砍 12 倍，
     # DROP PARTITION 整年一次 + 12 次 INSERT，幂等语义不变。
+    # 分片终案（2026-07-09 九轮实测）：groupArrayIf 状态按【预留容量】进追踪器总账
+    # （账面精确爬到任意帽而 RSS 只及一半——虚拟预留非真实内存，参数/purge 皆不可治）。
+    # 月内按 security_id 哈希 4 片，聚合组数与预留账面确定性 ÷4；GROUP BY 键分片不相交，
+    # INSERT 追加语义与幂等（年分区 DROP 一次）不变。
     for month in range(1, 13):
-        sql = EXTRACT_SQL_TEMPLATE.format(
-            year=year, month=month, cs_min_pairs=CS_MIN_PAIRS, roll_min_obs=ROLL_MIN_OBS
-        )
-        response = requests.post(clickhouse_url(), data=sql.encode(), timeout=3600)
-        if response.status_code != 200:
-            raise RuntimeError(f"{year}-{month:02d} 特征提取失败: {response.text[:400]}")
+        for shard in range(N_SHARDS):
+            sql = EXTRACT_SQL_TEMPLATE.format(
+                year=year, month=month, n_shards=N_SHARDS, shard=shard,
+                cs_min_pairs=CS_MIN_PAIRS, roll_min_obs=ROLL_MIN_OBS
+            )
+            response = requests.post(clickhouse_url(), data=sql.encode(), timeout=3600)
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"{year}-{month:02d} shard {shard}/{N_SHARDS} 特征提取失败: {response.text[:400]}")
         # jemalloc 把释放内存留在 arena，CH 总账跨查询累积虚高（六轮实测：逐月分块后
         # 前 4 月过、第 5 月被虚账杀——RSS 1.5G 账面 4.5G）。逐月强制还账。
         requests.post(clickhouse_url(), params={"query": "SYSTEM JEMALLOC PURGE"}, timeout=120)
