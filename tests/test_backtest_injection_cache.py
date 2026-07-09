@@ -266,3 +266,64 @@ class TestEffectiveHeldGapRestriction:
                    2: [20, 21, 22, 23, 24, 25]}, n)  # 无 gap 列，持有
         w = _df({1: [0.5] * n, 2: [0.5] * n}, n)
         _assert_bit_equal(w, adj)
+
+
+# --------------------------------------------------------------------------- #
+# per-security cost_bps（measured 成本档接口）——标量零漂移 + Series 手算对拍
+# --------------------------------------------------------------------------- #
+class TestPerSecurityCost:
+    def test_scalar_cost_unchanged(self):
+        # 标量 cost_bps 逐位等于旧 turnover×cost/1e4
+        n = 4
+        adj = _df({1: [10, 11, 12, 13], 2: [20, 22, 24, 26]}, n)
+        w = _df({1: [0.5, 0.5, 0, 0], 2: [0.5, 0.5, 1.0, 1.0]}, n)
+        r = run_backtest("t", w, adj, cost_bps=30.0).daily_returns
+        ref = _reference_backtest("ref", w, adj, cost_bps=30.0)
+        pd.testing.assert_series_equal(r, ref, check_names=False, check_exact=True)
+
+    def test_series_cost_matches_hand_computation(self):
+        # 逐证券成本：cost_t = Σ_i |Δw_it| × c_i / 1e4
+        n = 3
+        adj = _df({1: [10, 11, 12], 2: [20, 22, 24]}, n)
+        w = _df({1: [1.0, 0.0, 0.0], 2: [0.0, 1.0, 1.0]}, n)
+        cost = pd.Series({1: 50.0, 2: 10.0})
+        got = run_backtest("t", w, adj, cost_bps=cost).daily_returns
+        # 手算换手成本：
+        # held/w: t0 w=(1,0); t1 w=(0,1) Δ=|0-1|_1 + |1-0|_2 =1+1; cost=(1*50+1*10)/1e4=60/1e4
+        # t2 w=(0,1) Δ=0 -> cost 0
+        trades = (w - w.shift(1).fillna(0.0)).abs()
+        exp_cost = (trades[1]*50 + trades[2]*10) / 1e4
+        # gross 用 effective_held*returns（无退市，直接复算）
+        ref = _reference_backtest("ref", w, adj, cost_bps=0.0)  # 零成本 gross
+        expected = ref - exp_cost
+        pd.testing.assert_series_equal(got, expected, check_names=False, check_exact=True)
+
+    def test_series_cost_missing_traded_security_raises(self):
+        # cost Series 缺某**换手**证券 -> 报错（不静默跳 NaN 让它免费交易）
+        n = 3
+        adj = _df({1: [10, 11, 12], 2: [20, 22, 24]}, n)
+        w = _df({1: [1.0, 0.0, 0.0], 2: [0.0, 1.0, 1.0]}, n)
+        cost = pd.Series({1: 50.0})  # 缺 sec2（有换手）
+        with pytest.raises(ValueError, match="缺换手证券的成本"):
+            run_backtest("t", w, adj, cost_bps=cost)
+
+    def test_series_cost_missing_untraded_security_ok(self):
+        # 缺的是**未换手**证券 -> 无害（贡献 0），不报错
+        n = 3
+        adj = _df({1: [10, 11, 12], 2: [20, 22, 24]}, n)
+        w = _df({1: [1.0, 0.0, 0.0], 2: [0.0, 0.0, 0.0]}, n)  # sec2 从不持有
+        cost = pd.Series({1: 50.0})  # 缺 sec2（但 sec2 无换手）
+        got = run_backtest("t", w, adj, cost_bps=cost).daily_returns
+        assert not got.isna().any()
+
+    def test_zero_turnover_zero_cost_series(self):
+        # 无换手 -> 成本 0（Series 口径）
+        n = 3
+        adj = _df({1: [10, 11, 12]}, n)
+        w = _df({1: [1.0, 1.0, 1.0]}, n)  # held 恒定，无换手（除首日建仓）
+        got = run_backtest("t", w, adj, cost_bps=pd.Series({1: 999.0})).daily_returns
+        ref_gross = _reference_backtest("g", w, adj, cost_bps=0.0)
+        # 首日建仓 turnover=1 -> cost=999/1e4，其余 0
+        trades = (w - w.shift(1).fillna(0.0)).abs()
+        exp = ref_gross - trades[1]*999/1e4
+        pd.testing.assert_series_equal(got, exp, check_names=False, check_exact=True)

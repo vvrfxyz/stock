@@ -178,7 +178,7 @@ def run_backtest(
     weights: pd.DataFrame,
     adj_close: pd.DataFrame,
     *,
-    cost_bps: float = 10.0,
+    cost_bps: float | pd.Series = 10.0,
     hold_through_gaps: bool = True,
     terminal_return: float | pd.Series | None = None,
     terminal_return_fallback: float | None = None,
@@ -254,8 +254,27 @@ def run_backtest(
             returns[first_terminal] = terminal_return
             returns_filled = returns.fillna(0.0)
     gross = (effective_held * returns_filled).sum(axis=1)
-    turnover = (weights - weights.shift(1).fillna(0.0)).abs().sum(axis=1)
-    cost = turnover * cost_bps / 10_000
+    trades = (weights - weights.shift(1).fillna(0.0)).abs()
+    turnover = trades.sum(axis=1)
+    # 成本 = Σ_i |Δw_it| × cost_bps_i / 1e4（每单位换手的单边成本）。
+    # cost_bps 标量：整组合统一档（逐位等于旧 turnover×cost_bps/1e4）；
+    # pd.Series（index=security_id）：逐证券成本（measured 模式的价差档），
+    # 缺失证券的成本由调用方补齐（如 fallback 档），此处不再兜底。
+    if isinstance(cost_bps, pd.Series):
+        cost_vec = cost_bps.reindex(trades.columns).astype("float64")
+        # 缺任一**发生换手**的证券成本即报错——静默跳 NaN（sum skipna）会让漏补成本的
+        # 证券免费交易（与数值安全纪律相悖，宁炸不静默）。未换手列的缺失无害（贡献 0）。
+        traded = trades.to_numpy().sum(axis=0) > 0
+        missing = cost_vec.isna().to_numpy() & traded
+        if missing.any():
+            bad = trades.columns[missing].tolist()
+            raise ValueError(
+                f"cost_bps(Series) 缺换手证券的成本: {bad[:5]}"
+                f"{'…' if len(bad) > 5 else ''}（共 {len(bad)} 只；调用方须补齐 fallback）"
+            )
+        cost = (trades * cost_vec.fillna(0.0)).sum(axis=1) / 10_000
+    else:
+        cost = turnover * cost_bps / 10_000
     net = gross - cost
 
     equity = (1 + net).cumprod()

@@ -166,3 +166,49 @@ def test_weights_from_zero_rows():
     assert w[0].tolist() == pytest.approx([0.5, 0.5, 0.0])
     assert w[1].tolist() == [0.0, 0.0, 0.0]
     assert np.isfinite(w).all()
+
+
+# --------------------------------------------------------------------------- #
+# measured 成本档口径（_measured_cost_bps）：cs/2×(1+mult)、fallback、覆盖率
+# --------------------------------------------------------------------------- #
+class TestMeasuredCost:
+    def _mock_loader(self, monkeypatch, cs_panel):
+        import research.factors.minute_loader as ml
+        import research.retail_reality_study as rr
+        # _measured_cost_bps 内部 from ... import load_minute_feature_panel，故 patch 源模块
+        monkeypatch.setattr(ml, "load_minute_feature_panel",
+                            lambda dates, ids, cols, **kw: {"cs_spread": cs_panel})
+
+    def test_one_side_caliber_and_fallback(self, monkeypatch):
+        from research.retail_reality_study import _measured_cost_bps
+        dates = pd.date_range("2024-01-01", periods=70, freq="B")
+        # sec1 cs 恒 0.0020（20bps 全宽）；sec2 恒 0.0040；sec3 全 NaN（无覆盖→fallback）
+        cs = pd.DataFrame({1: [0.0020]*70, 2: [0.0040]*70, 3: [np.nan]*70}, index=dates)
+        self._mock_loader(monkeypatch, cs)
+        cost, diag = _measured_cost_bps(dates, pd.Index([1, 2, 3], dtype="int64"),
+                                        stress_mult=0.5, fallback_bps=40.0)
+        # 单边 = 全宽/2 × 1.5 -> sec1: 20/2*1.5=15bps; sec2: 40/2*1.5=30bps
+        assert cost[1] == pytest.approx(15.0)
+        assert cost[2] == pytest.approx(30.0)
+        assert cost[3] == pytest.approx(40.0)  # fallback
+        assert diag["n_covered"] == 2
+        assert diag["coverage"] == pytest.approx(2/3)
+
+    def test_stress_mult_zero_is_half_spread(self, monkeypatch):
+        from research.retail_reality_study import _measured_cost_bps
+        dates = pd.date_range("2024-01-01", periods=30, freq="B")
+        cs = pd.DataFrame({1: [0.0030]*30}, index=dates)  # 30bps 全宽
+        self._mock_loader(monkeypatch, cs)
+        cost, _ = _measured_cost_bps(dates, pd.Index([1], dtype="int64"),
+                                     stress_mult=0.0, fallback_bps=40.0)
+        assert cost[1] == pytest.approx(15.0)  # 30/2×1.0
+
+    def test_uses_rolling_median_not_mean(self, monkeypatch):
+        from research.retail_reality_study import _measured_cost_bps
+        dates = pd.date_range("2024-01-01", periods=63, freq="B")
+        vals = [0.0020]*62 + [0.5]  # 一个极端尾值：中位不受影响、均值会爆
+        cs = pd.DataFrame({1: vals}, index=dates)
+        self._mock_loader(monkeypatch, cs)
+        cost, _ = _measured_cost_bps(dates, pd.Index([1], dtype="int64"),
+                                     stress_mult=0.5, fallback_bps=40.0)
+        assert cost[1] == pytest.approx(15.0)  # 中位=0.0020 -> 15bps，未被 0.5 尾值污染
