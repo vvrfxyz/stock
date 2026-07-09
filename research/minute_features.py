@@ -170,6 +170,9 @@ FROM (
     )
     GROUP BY security_id, d
 )
+-- 外部聚合溢盘（2026-07-09）：整年 GROUP BY 聚合态实测 3.2G+ 撞服务端预算（CH 优雅拒绝，
+-- OPS0 防线按设计工作）；1.5G 起溢盘换有界内存，覆盖任意年份体量。query 级 3G < 服务端 3.2G。
+SETTINGS max_bytes_before_external_group_by = 1500000000, max_memory_usage = 3000000000
 """
 
 
