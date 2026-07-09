@@ -173,7 +173,7 @@ FROM (
 -- 内存策略（2026-07-09，七轮实测定案）：数组聚合态（groupArrayIf/maxMapIf）不可外部溢盘
 -- ——溢盘文件读回合并阶段（SourceFromNativeStream）集中物化数组，比不溢盘更炸且非确定。
 -- 定案 = 逐月分块（单月聚合态 ~1.5G）+ max_threads=4 + query 4G ≤ 服务端 4.5G，不溢盘。
-SETTINGS max_memory_usage = 4000000000, max_threads = 4
+SETTINGS max_memory_usage = 4000000000, max_threads = 2
 """
 
 
