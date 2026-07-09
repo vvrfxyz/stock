@@ -166,7 +166,7 @@ FROM (
                toHour(ts, 'America/New_York') * 60 + toMinute(ts, 'America/New_York') AS md,
                md BETWEEN 570 AND 959 AS rth
         FROM stock.minute_bars
-        WHERE toYear(ts) = {year}
+        WHERE toYear(ts) = {year} AND toMonth(ts) = {month}
     )
     GROUP BY security_id, d
 )
@@ -235,12 +235,17 @@ def build_year(year: int) -> float:
         params={"query": f"ALTER TABLE stock.minute_daily_features DROP PARTITION {year}"},
         timeout=600,
     )
-    sql = EXTRACT_SQL_TEMPLATE.format(
-        year=year, cs_min_pairs=CS_MIN_PAIRS, roll_min_obs=ROLL_MIN_OBS
-    )
-    response = requests.post(clickhouse_url(), data=sql.encode(), timeout=3600)
-    if response.status_code != 200:
-        raise RuntimeError(f"{year} 特征提取失败: {response.text[:400]}")
+    # 按月分块 INSERT（2026-07-09 定案）：groupArrayIf 的数组聚合状态不可溢盘收缩
+    # （external_group_by 对它无效——五轮实测：查询 RSS 压到 1.38G 总账仍 4.5G+），
+    # 整年 ~250 万 (security,day) 组的子采样数组必须同驻内存。逐月把聚合态砍 12 倍，
+    # DROP PARTITION 整年一次 + 12 次 INSERT，幂等语义不变。
+    for month in range(1, 13):
+        sql = EXTRACT_SQL_TEMPLATE.format(
+            year=year, month=month, cs_min_pairs=CS_MIN_PAIRS, roll_min_obs=ROLL_MIN_OBS
+        )
+        response = requests.post(clickhouse_url(), data=sql.encode(), timeout=3600)
+        if response.status_code != 200:
+            raise RuntimeError(f"{year}-{month:02d} 特征提取失败: {response.text[:400]}")
     return time.monotonic() - start
 
 
