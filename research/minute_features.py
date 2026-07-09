@@ -56,6 +56,8 @@
 from __future__ import annotations
 
 import argparse
+
+from dotenv import load_dotenv
 import sys
 import time
 from datetime import timedelta
@@ -239,6 +241,7 @@ def build_year(year: int) -> float:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv()  # systemd-run 洗净环境（run_research.sh 发射）下 .env 是唯一的连库配置来源
     parser = argparse.ArgumentParser(description="构建分钟级日频特征表。")
     parser.add_argument("--years", default="2003-2026", help="年份范围，如 2003-2026 或 2014。")
     args = parser.parse_args(argv)
