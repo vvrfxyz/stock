@@ -246,6 +246,9 @@ def build_year(year: int) -> float:
         response = requests.post(clickhouse_url(), data=sql.encode(), timeout=3600)
         if response.status_code != 200:
             raise RuntimeError(f"{year}-{month:02d} 特征提取失败: {response.text[:400]}")
+        # jemalloc 把释放内存留在 arena，CH 总账跨查询累积虚高（六轮实测：逐月分块后
+        # 前 4 月过、第 5 月被虚账杀——RSS 1.5G 账面 4.5G）。逐月强制还账。
+        requests.post(clickhouse_url(), params={"query": "SYSTEM JEMALLOC PURGE"}, timeout=120)
     return time.monotonic() - start
 
 
