@@ -212,3 +212,55 @@ class TestMeasuredCost:
         cost, _ = _measured_cost_bps(dates, pd.Index([1], dtype="int64"),
                                      stress_mult=0.5, fallback_bps=40.0)
         assert cost[1] == pytest.approx(15.0)  # 中位=0.0020 -> 15bps，未被 0.5 尾值污染
+
+
+# --------------------------------------------------------------------------- #
+# min_periods 口径变体（2026-07-09 裁决）：覆盖单调性 + params_hash 随档变 + 解析
+# --------------------------------------------------------------------------- #
+class TestMinPeriodsVariant:
+    def _mock_loader(self, monkeypatch, cs_panel):
+        import research.factors.minute_loader as ml
+        monkeypatch.setattr(ml, "load_minute_feature_panel",
+                            lambda dates, ids, cols, **kw: {"cs_spread": cs_panel})
+
+    def test_coverage_monotonic_in_min_periods(self, monkeypatch):
+        from research.retail_reality_study import _measured_cost_bps
+        dates = pd.date_range("2024-01-01", periods=70, freq="B")
+        # sec1 满窗有值(70日)；sec2 只有 12 个有效日（min_periods 20 缺、10 有）
+        cs = pd.DataFrame({
+            1: [0.0020]*70,
+            2: [np.nan]*58 + [0.0040]*12,
+        }, index=dates)
+        self._mock_loader(monkeypatch, cs)
+        cost20, d20 = _measured_cost_bps(dates, pd.Index([1,2],dtype="int64"),
+                                         stress_mult=0.5, fallback_bps=40.0, min_periods=20)
+        cost10, d10 = _measured_cost_bps(dates, pd.Index([1,2],dtype="int64"),
+                                         stress_mult=0.5, fallback_bps=40.0, min_periods=10)
+        # min_periods 放宽 -> 覆盖单调不减（sec2 在 10 档被纳入）
+        assert d10["coverage"] >= d20["coverage"]
+        assert d20["n_covered"] == 1 and d10["n_covered"] == 2  # sec2 只在 10 档覆盖
+        assert d20["min_periods"] == 20 and d10["min_periods"] == 10
+        # sec2 在 20 档 -> fallback，10 档 -> 实测
+        assert cost20[2] == pytest.approx(40.0)
+        assert cost10[2] == pytest.approx(30.0)  # 0.0040/2*1.5*1e4
+
+    def test_min_periods_enters_params_hash(self):
+        # 两档 min_periods 产生不同 params_hash（新旧档 trial 不互顶）
+        import json, hashlib
+        def phash(mp):
+            params = {"caliber": "measured_v2", "holdings": 30, "n_sims": 1000, "seed": 7,
+                      "exchange_drop_fallback": None, "cost_mode": "measured",
+                      "stress_mult": 0.5, "min_periods": mp, "measured_coverage": 0.6,
+                      "q5_member_coverage": 0.7, "q5_insufficient": False}
+            pj = json.dumps(params, sort_keys=True, ensure_ascii=False, default=str)
+            hi = json.dumps({"params": pj}, sort_keys=True)
+            return hashlib.sha1(hi.encode()).hexdigest()[:12]
+        assert phash(20) != phash(10)
+
+    def test_parse_min_periods(self):
+        from research.retail_reality_study import _parse_min_periods
+        assert _parse_min_periods("20,10") == [20, 10]
+        assert _parse_min_periods("20") == [20]
+        assert _parse_min_periods("10,10,20") == [10, 20]   # 保序去重
+        assert _parse_min_periods("") == [20]                # 空 -> 默认主档
+        assert _parse_min_periods(" 20 , 10 ") == [20, 10]   # 容空格

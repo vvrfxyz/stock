@@ -88,6 +88,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--measured-fallback-bps", type=float, default=40.0,
         help="measured 模式下无价差覆盖证券的固定回退单边档（默认 40bps）",
     )
+    parser.add_argument(
+        "--measured-min-periods", default="20,10",
+        help="measured rolling(63) 中位的有效天数下限，逗号分隔多档并排跑（默认 20,10）；"
+             "20=预注册主档，10=覆盖资格线变体（2026-07-09 裁决，见 _measured_cost_bps docstring）",
+    )
     return parser.parse_args(argv)
 
 
@@ -127,6 +132,7 @@ def _measured_cost_bps(
     *,
     stress_mult: float,
     fallback_bps: float,
+    min_periods: int = 20,
     url: str | None = None,
 ) -> tuple[pd.Series, dict]:
     """逐证券单边成本（bps）Series，供 run_backtest 的 per-security cost 接口。
@@ -143,6 +149,18 @@ def _measured_cost_bps(
     - **无价差覆盖证券 → 固定 fallback_bps（默认 40bps 单边）并计数**：多为低流动/OTC
       填缝票（全库 cs 无效 42.3%）。覆盖率进报告；若 q5 成员覆盖 <70% 结论标"覆盖不足"。
 
+    ## min_periods 口径变体（2026-07-09，team-lead 裁决——覆盖资格线而非结果偏好）
+    rolling(63) 中位的 min_periods = 有效价差天数下限。**调整动机 = 提高覆盖资格线，
+    非结果偏好**：2026-07-09 两份只读诊断显示 q5 缺覆盖的构成——(c) join bug=0、
+    (a) 真无分钟史仅 6-7%、主体是 (b) n_bars<100 稀薄交易 + (d) 63 窗内有效天数不足。
+    min_periods 20→10 把 (d) 段"真有 100+ bar 但窗口内天数不足"的**干净票**纳入覆盖
+    （2020 q5 覆盖 61%→68%、2025 48%→56%），不触碰 thin-bar 段——那段 cs 向下偏 2.4×
+    + 负估计剔除率高 6-8pp，n_bars 门 100 永久不降（ledger 方法论节）。**两档 20/10
+    并排跑、verdict 翻转显著标注**；min_periods 进 study params_hash，新旧档 trial 不互顶。
+    **诚实预期**：①后 2020 达标（~68-70%）而 2025 大概率仍 <70%；若终裁呈"早年 PASS、
+    近年覆盖不足"分裂形态，结论按最弱一环表述（v2 翻案仅在覆盖达标窗口内成立），不做
+    全窗断言——这是数据边界的真实形状。
+
     返回 (cost_bps Series[index=security_id], diagnostics dict)。cost 为**期内恒定**的
     逐证券标量（全窗中位）——run_backtest 的 per-security 成本接口按此逐列计换手成本。
     """
@@ -154,8 +172,8 @@ def _measured_cost_bps(
     )
     cs = feat.get("cs_spread", pd.DataFrame(index=dates))
     cs = cs.reindex(index=dates)
-    # 全窗 63 交易日滚动中位的期末值（近似期内恒定成本）；不足 63 日用现有窗口中位
-    med = cs.rolling(63, min_periods=20).median().iloc[-1] if len(cs) else pd.Series(dtype="float64")
+    # 全窗 63 交易日滚动中位的期末值（近似期内恒定成本）；有效天数下限 = min_periods
+    med = cs.rolling(63, min_periods=min_periods).median().iloc[-1] if len(cs) else pd.Series(dtype="float64")
     med = med.reindex(universe)
     one_side_frac = med / 2.0 * (1.0 + stress_mult)  # 相对价差半宽 × 压力
     cost = (one_side_frac * 10_000).astype("float64")  # 转 bps
@@ -168,6 +186,7 @@ def _measured_cost_bps(
         "median_cost_bps_covered": float(cost[covered].median()) if covered.any() else float("nan"),
         "fallback_bps": float(fallback_bps),
         "stress_mult": float(stress_mult),
+        "min_periods": int(min_periods),
     }
     return cost, diag
 
@@ -209,6 +228,40 @@ def _subportfolio_net_returns(
         name, w_df, adj_sub, cost_bps=cost_bps, hold_through_gaps=True,
         terminal_return=terminal_return, terminal_return_fallback=terminal_return_fallback,
     ).daily_returns
+
+
+def _concentration_sim(
+    members0, reb0, dates, universe, adj_sub, *, holdings, n_sims, rng, sim_cost,
+    terminal, term_fallback, prog,
+) -> pd.Series:
+    """集中度模拟：n_sims 次随机 holdings 只子组合的年化收益分布（同引擎、同成本档）。"""
+    sub_ann = []
+    sim_step = max(1, n_sims // 20)  # 抽样打行：journald 有 burst rate-limit
+    for sim_i in range(n_sims):
+        if sim_i % sim_step == 0:
+            prog.log(f"模拟 {sim_i}/{n_sims}")
+        picks = _pick_with_continuity(members0, holdings, rng)
+        net = _subportfolio_net_returns(
+            picks, reb0, dates, universe, adj_sub, cost_bps=sim_cost,
+            terminal_return=terminal, terminal_return_fallback=term_fallback,
+            name=f"retail_sim_{sim_i}",
+        )
+        sub_ann.append(float((1 + net).prod() ** (TRADING_DAYS / len(net)) - 1))
+    return pd.Series(sub_ann)
+
+
+def _parse_min_periods(spec: str) -> list[int]:
+    """'20,10' -> [20, 10]（保序去重，供 measured 双档并排）。"""
+    seen, out = set(), []
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        v = int(tok)
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out or [20]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -280,14 +333,7 @@ def main(argv: list[str] | None = None) -> int:
                   for reb, _, b in member_frames) / len(member_frames)
 
     # measured 成本档（可选）：逐证券单边 bps Series；覆盖率诊断入报告。
-    measured_cost = None
-    measured_diag = None
-    if args.cost_mode == "measured":
-        with prog.stage("measured 成本档（cs_spread 63d 中位）"):
-            measured_cost, measured_diag = _measured_cost_bps(
-                dates, universe, stress_mult=args.stress_mult,
-                fallback_bps=args.measured_fallback_bps)
-
+    # 固定成本三档（对照，两模式都算——measured 报告并排展示以佐证"固定档高估小盘"）
     rows = []
     for cost in (20.0, 40.0, 80.0):
         port = run_backtest(f"retail_q5_c{cost:g}", port_w, adj_for_bt,
@@ -303,145 +349,156 @@ def main(argv: list[str] | None = None) -> int:
                                           ("ann_ret", "alpha_ann", "alpha_nw_t", "ir")}})
     full_table = pd.DataFrame(rows).set_index("cost_bps")
 
-    measured_table = None
-    if measured_cost is not None:
-        port_m = run_backtest("retail_q5_measured", port_w, adj_for_bt,
-                              cost_bps=measured_cost, hold_through_gaps=True,
-                              terminal_return=terminal,
-                              terminal_return_fallback=term_fallback).daily_returns
-        bench_m = run_backtest("retail_bench_measured", bench_w, adj_for_bt,
-                               cost_bps=measured_cost, hold_through_gaps=True,
-                               terminal_return=terminal,
-                               terminal_return_fallback=term_fallback).daily_returns
-        stats_m = _capm_stats(port_m, bench_m, rf)
-        measured_table = pd.DataFrame([{"cost_mode": "measured",
-                                        **{k: stats_m[k] for k in
-                                           ("ann_ret", "alpha_ann", "alpha_nw_t", "ir")}}]
-                                      ).set_index("cost_mode")
-
-    # 集中度模拟：offset 0 的成员矩阵上抽 N 只（同权重、同 40bps）。
-    # 口径 v2：走 _subportfolio_net_returns（与整分位同引擎）；裁列到 q5 成员并集，
-    # adj_sub 单一对象贯穿全部 sim 吃 _DERIVED_CACHE（勿在循环内引入第三个面板对象）。
     reb0, members0, _ = member_frames[0]
     sub_cols = universe[members0.any(axis=0)]
     adj_sub = adj_for_bt[sub_cols]
-    # 集中度 sim 的成本档：fixed 模式 40bps（对照口径不变）；measured 模式用逐证券价差档
-    # 裁到 sub_cols。q5 成员价差覆盖率进诊断（B.2 资格线：<70% 结论标"覆盖不足"）。
-    sim_cost = 40.0
-    q5_coverage = None
-    if measured_cost is not None:
-        sim_cost = measured_cost.reindex(sub_cols).astype("float64")
-        # 覆盖率 = sub_cols 中 cs 实测（非 fallback）占比
-        is_fallback = np.isclose(sim_cost.to_numpy(), args.measured_fallback_bps)
-        q5_coverage = float((~is_fallback).mean()) if len(sub_cols) else 0.0
-        measured_diag["q5_member_coverage"] = q5_coverage
-        measured_diag["q5_insufficient"] = bool(q5_coverage < 0.70)
-    sub_ann = []
-    sim_step = max(1, args.n_sims // 20)  # 抽样打行：journald 有 burst rate-limit
-    for sim_i in range(args.n_sims):
-        if sim_i % sim_step == 0:
-            prog.log(f"模拟 {sim_i}/{args.n_sims}")
-        # 持仓延续：保留仍在 q5 的旧持仓，只补充离场者（语义与首版 bug 见 _pick_with_continuity）
-        picks = _pick_with_continuity(members0, args.holdings, rng)
-        net = _subportfolio_net_returns(
-            picks, reb0, dates, universe, adj_sub, cost_bps=sim_cost,
-            terminal_return=terminal, terminal_return_fallback=term_fallback,
-            name=f"retail_sim_{sim_i}",
-        )
-        sub_ann.append(float((1 + net).prod() ** (TRADING_DAYS / len(net)) - 1))
-    sub_ann = pd.Series(sub_ann)
-    # 基准腿成本：measured 模式用价差档，fixed 用 40bps（判据锚，见下）
-    bench_cost = measured_cost if measured_cost is not None else 40.0
-    bench40 = run_backtest("retail_bench_c40", bench_w, adj_for_bt,
-                           cost_bps=bench_cost, hold_through_gaps=True,
-                           terminal_return=terminal,
-                           terminal_return_fallback=term_fallback).daily_returns
-    bench_ann = float((1 + bench40).prod() ** (TRADING_DAYS / len(bench40)) - 1)
-    sim_table = pd.DataFrame({
-        f"{args.holdings}只子组合年化": sub_ann.describe(percentiles=[0.05, 0.25, 0.5, 0.75, 0.95]),
-    })
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # 判据锚：fixed 模式用 40bps 行 alpha t（对照口径不变，逐位复现旧结论）；
-    # measured 模式用 measured 行 alpha t（同 sim 亦 measured 成本），口径自洽不混。
-    if measured_cost is not None:
-        verdict_alpha_t = float(measured_table.loc["measured", "alpha_nw_t"])
-        criteria = "measured alpha t>=2 且子组合中位超额>0"
-    else:
+    if args.cost_mode == "fixed":
+        # fixed 模式：单 sim@40bps + 40bps 判据锚，逐位复现旧结论（对照口径不动）。
+        sub_ann = _concentration_sim(
+            members0, reb0, dates, universe, adj_sub, holdings=args.holdings,
+            n_sims=args.n_sims, rng=rng, sim_cost=40.0,
+            terminal=terminal, term_fallback=term_fallback, prog=prog)
+        bench40 = run_backtest("retail_bench_c40", bench_w, adj_for_bt,
+                               cost_bps=40.0, hold_through_gaps=True,
+                               terminal_return=terminal,
+                               terminal_return_fallback=term_fallback).daily_returns
+        bench_ann = float((1 + bench40).prod() ** (TRADING_DAYS / len(bench40)) - 1)
+        sim_table = pd.DataFrame({
+            f"{args.holdings}只子组合年化": sub_ann.describe(percentiles=[0.05, 0.25, 0.5, 0.75, 0.95])})
         verdict_alpha_t = float(full_table.loc[40.0, "alpha_nw_t"])
         criteria = "40bps alpha t>=2 且子组合中位超额>0"
-    verdict = (verdict_alpha_t >= 2 and float(sub_ann.median()) - bench_ann > 0)
-    insufficient = bool(measured_diag and measured_diag.get("q5_insufficient"))
-    caliber = ("measured_v2" if measured_cost is not None else "delist_realized_v2") + (
+        verdict = (verdict_alpha_t >= 2 and float(sub_ann.median()) - bench_ann > 0)
+        caliber = "delist_realized_v2" + (
+            f"+edf{args.exchange_drop_fallback:g}" if args.exchange_drop_fallback is not None else "")
+        suffix = "_v2" + (
+            f"_edf{args.exchange_drop_fallback:g}" if args.exchange_drop_fallback is not None else "")
+        out = os.path.join(
+            OUTPUT_DIR,
+            f"retail_reality_{args.factor}_{dates[0].date()}_{dates[-1].date()}{suffix}.md")
+        with open(out, "w") as fh:
+            fh.write(f"# 散户口径重审（{args.factor}，$20k/{args.holdings} 只） {dates[0].date()} ~ {dates[-1].date()}\n\n"
+                     f"口径：{caliber}（引擎统一 run_backtest + 退市实测注入，2026-07-08 口径 v2；"
+                     f"数字与 wave-10b 旧口径不可直比）\n\n"
+                     f"## 小盘桶 q5 整分位 vs 小盘桶等权（固定成本三档）\n\n{_markdown_table(full_table.round(4))}\n\n"
+                     f"## 集中度模拟（{args.n_sims} 次随机 {args.holdings} 只，40bps）\n\n"
+                     f"{_markdown_table(sim_table.round(4))}\n\n小盘桶基准年化：{bench_ann:.4f}\n\n"
+                     f"预注册判据（{criteria}）：{'PASS' if verdict else 'FAIL'}\n")
+        print(f"\n== 整分位 ==\n{full_table.round(4).to_string()}", flush=True)
+        print(f"\n== {args.holdings} 只子组合 ==\n{sim_table.round(4).to_string()}\nbench40 ={bench_ann:.4f}", flush=True)
+        print(f"\n预注册判据：{'PASS' if verdict else 'FAIL'}\nreport: {out}", flush=True)
+        append_study(
+            study="retail_reality", factor_name=args.factor, verdict=bool(verdict),
+            criteria=criteria,
+            params={"caliber": caliber, "holdings": args.holdings, "n_sims": args.n_sims,
+                    "seed": args.seed, "exchange_drop_fallback": args.exchange_drop_fallback,
+                    "cost_mode": args.cost_mode},
+            eval_start=dates[0].date(), eval_end=dates[-1].date(),
+            report_path=os.path.relpath(out, os.path.dirname(os.path.dirname(__file__))),
+            criterion_values={"alpha_nw_t_40bps": verdict_alpha_t,
+                              "sub_median_ann": float(sub_ann.median()),
+                              "bench_ann_40bps": bench_ann})
+        prog.done()
+        return 0
+
+    # measured 模式：min_periods 双档并排（覆盖资格线变体，2026-07-09 裁决）。
+    # 每档独立算成本/表/sim/verdict/覆盖；verdict 翻转显著标注；每档一条台账行
+    # （min_periods 进 params_hash，新旧档不互顶）。
+    tiers = _parse_min_periods(args.measured_min_periods)
+    tier_results = []
+    for mp in tiers:
+        with prog.stage(f"measured 成本档 min_periods={mp}"):
+            measured_cost, mdiag = _measured_cost_bps(
+                dates, universe, stress_mult=args.stress_mult,
+                fallback_bps=args.measured_fallback_bps, min_periods=mp)
+        port_m = run_backtest(f"retail_q5_measured_mp{mp}", port_w, adj_for_bt,
+                              cost_bps=measured_cost, hold_through_gaps=True,
+                              terminal_return=terminal, terminal_return_fallback=term_fallback).daily_returns
+        bench_m = run_backtest(f"retail_bench_measured_mp{mp}", bench_w, adj_for_bt,
+                               cost_bps=measured_cost, hold_through_gaps=True,
+                               terminal_return=terminal, terminal_return_fallback=term_fallback).daily_returns
+        stats_m = _capm_stats(port_m, bench_m, rf)
+        sim_cost = measured_cost.reindex(sub_cols).astype("float64")
+        is_fb = np.isclose(sim_cost.to_numpy(), args.measured_fallback_bps)
+        q5_cov = float((~is_fb).mean()) if len(sub_cols) else 0.0
+        mdiag["q5_member_coverage"] = q5_cov
+        mdiag["q5_insufficient"] = bool(q5_cov < 0.70)
+        sub_ann = _concentration_sim(
+            members0, reb0, dates, universe, adj_sub, holdings=args.holdings,
+            n_sims=args.n_sims, rng=rng, sim_cost=sim_cost,
+            terminal=terminal, term_fallback=term_fallback, prog=prog)
+        bench_ann = float((1 + bench_m).prod() ** (TRADING_DAYS / len(bench_m)) - 1)
+        alpha_t = float(stats_m["alpha_nw_t"])
+        verdict = (alpha_t >= 2 and float(sub_ann.median()) - bench_ann > 0)
+        tier_results.append({
+            "mp": mp, "stats": stats_m, "diag": mdiag, "sub_ann": sub_ann,
+            "bench_ann": bench_ann, "alpha_t": alpha_t, "verdict": verdict,
+        })
+
+    # verdict 翻转检测（不同 min_periods 档判据不一致 = 重要敏感性信息）
+    verdicts = {t["mp"]: t["verdict"] for t in tier_results}
+    verdict_flip = len(set(verdicts.values())) > 1
+    caliber = "measured_v2" + (
         f"+edf{args.exchange_drop_fallback:g}" if args.exchange_drop_fallback is not None else "")
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    # 文件名编入引擎口径版本（_v2）：v2 数字与 wave-10b 旧口径不可直比，
-    # 同名覆盖会毁掉历史判定的纸面依据（审核 #4）；edf 分支再加后缀防双口径互覆。
-    # measured 模式再加 _measured 后缀防与 fixed 报告互覆。
-    suffix = "_v2" + ("_measured" if measured_cost is not None else "") + (
+    suffix = "_v2_measured" + (
         f"_edf{args.exchange_drop_fallback:g}" if args.exchange_drop_fallback is not None else "")
     out = os.path.join(
-        OUTPUT_DIR,
-        f"retail_reality_{args.factor}_{dates[0].date()}_{dates[-1].date()}{suffix}.md")
-    measured_section = ""
-    if measured_table is not None:
-        cov = measured_diag
-        flag = "  ⚠**覆盖不足（q5<70%）**" if insufficient else ""
-        measured_section = (
-            f"## measured 成本档（cs_spread 逐股，压力乘数 {args.stress_mult}）\n\n"
-            f"{_markdown_table(measured_table.round(4))}\n\n"
-            f"宇宙价差覆盖 {cov['coverage']*100:.0f}%（{cov['n_covered']}/{cov['n_universe']}）、"
-            f"covered 中位单边 {cov['median_cost_bps_covered']:.1f}bps、"
-            f"q5 成员覆盖 {cov.get('q5_member_coverage', float('nan'))*100:.0f}%、"
-            f"fallback {cov['fallback_bps']:.0f}bps{flag}\n\n")
+        OUTPUT_DIR, f"retail_reality_{args.factor}_{dates[0].date()}_{dates[-1].date()}{suffix}.md")
+    # 并排 measured 表 + 每档覆盖/判据
+    mrows = []
+    for t in tier_results:
+        d = t["diag"]
+        mrows.append({"min_periods": t["mp"],
+                      **{k: t["stats"][k] for k in ("ann_ret", "alpha_ann", "alpha_nw_t", "ir")},
+                      "sub_median": float(t["sub_ann"].median()), "bench_ann": t["bench_ann"],
+                      "q5_cov": round(d["q5_member_coverage"], 3),
+                      "verdict": "PASS" if t["verdict"] else "FAIL",
+                      "insufficient": d["q5_insufficient"]})
+    measured_table = pd.DataFrame(mrows).set_index("min_periods")
     with open(out, "w") as fh:
-        fh.write(f"# 散户口径重审（{args.factor}，$20k/{args.holdings} 只） {dates[0].date()} ~ {dates[-1].date()}\n\n"
-                 f"口径：{caliber}（引擎统一 run_backtest + 退市实测注入，2026-07-08 口径 v2；"
-                 f"数字与 wave-10b 旧口径不可直比）\n\n"
-                 f"## 小盘桶 q5 整分位 vs 小盘桶等权（固定成本三档）\n\n{_markdown_table(full_table.round(4))}\n\n"
-                 f"{measured_section}"
-                 f"## 集中度模拟（{args.n_sims} 次随机 {args.holdings} 只，"
-                 f"{'measured 价差档' if measured_cost is not None else '40bps'}）\n\n"
-                 f"{_markdown_table(sim_table.round(4))}\n\n小盘桶基准年化：{bench_ann:.4f}\n\n"
-                 f"预注册判据（{criteria}）：{'PASS' if verdict else 'FAIL'}"
-                 f"{'（覆盖不足，结论仅供参考）' if insufficient else ''}\n")
-    print(f"\n== 整分位 ==\n{full_table.round(4).to_string()}", flush=True)
-    if measured_table is not None:
-        print(f"\n== measured ==\n{measured_table.round(4).to_string()}", flush=True)
-    print(f"\n== {args.holdings} 只子组合 ==\n{sim_table.round(4).to_string()}\nbench ={bench_ann:.4f}", flush=True)
-    print(f"\n预注册判据：{'PASS' if verdict else 'FAIL'}\nreport: {out}", flush=True)
-    # 部署判定入机器台账（W0-P3；不入 Bonferroni 分母，见 _trials_store.append_study）
-    # fixed 模式的 params/criterion_values 键与旧版逐字保持（台账 schema 不破、新旧口径
-    # trial 可比）；measured 特有键仅在 measured 模式下追加。
-    study_params = {
-        "caliber": caliber, "holdings": args.holdings, "n_sims": args.n_sims,
-        "seed": args.seed, "exchange_drop_fallback": args.exchange_drop_fallback,
-        "cost_mode": args.cost_mode,
-    }
-    anchor_key = "alpha_nw_t" if measured_cost is not None else "alpha_nw_t_40bps"
-    bench_key = "bench_ann" if measured_cost is not None else "bench_ann_40bps"
-    study_values = {
-        anchor_key: verdict_alpha_t,
-        "sub_median_ann": float(sub_ann.median()),
-        bench_key: bench_ann,
-    }
-    if measured_cost is not None:
-        study_params.update({
-            "stress_mult": args.stress_mult,
-            "measured_coverage": measured_diag["coverage"],
-            "q5_member_coverage": measured_diag.get("q5_member_coverage"),
-            "q5_insufficient": insufficient,
-        })
-    append_study(
-        study="retail_reality",
-        factor_name=args.factor,
-        verdict=bool(verdict),
-        criteria=criteria,
-        params=study_params,
-        eval_start=dates[0].date(),
-        eval_end=dates[-1].date(),
-        report_path=os.path.relpath(out, os.path.dirname(os.path.dirname(__file__))),
-        criterion_values=study_values,
-    )
+        fh.write(f"# 散户口径重审（{args.factor}，$20k/{args.holdings} 只，measured 双档） "
+                 f"{dates[0].date()} ~ {dates[-1].date()}\n\n"
+                 f"口径：{caliber}（引擎统一 run_backtest + 退市实测注入；min_periods 双档=覆盖资格线变体，"
+                 f"2026-07-09 裁决，n_bars 门 100 不降）\n\n"
+                 f"## 固定成本三档（对照）\n\n{_markdown_table(full_table.round(4))}\n\n"
+                 f"## measured 逐股价差档 × min_periods 双档（压力乘数 {args.stress_mult}）\n\n"
+                 f"{_markdown_table(measured_table.round(4))}\n\n")
+        if verdict_flip:
+            fh.write(f"⚠**verdict 随 min_periods 翻转**：{verdicts}——覆盖达标档为准，"
+                     f"但翻转本身是重要敏感性信息（v2 翻案对覆盖资格线敏感）。\n\n")
+        for t in tier_results:
+            d = t["diag"]
+            flag = "  ⚠**覆盖不足（q5<70%）**" if d["q5_insufficient"] else ""
+            fh.write(f"- min_periods={t['mp']}：宇宙覆盖 {d['coverage']*100:.0f}%"
+                     f"（{d['n_covered']}/{d['n_universe']}）、covered 中位单边 "
+                     f"{d['median_cost_bps_covered']:.1f}bps、q5 成员覆盖 "
+                     f"{d['q5_member_coverage']*100:.0f}%、fallback {d['fallback_bps']:.0f}bps、"
+                     f"判据 {'PASS' if t['verdict'] else 'FAIL'}{flag}\n")
+        fh.write("\n**结论口径**：分裂形态（早年 PASS/近年覆盖不足）按最弱一环表述——"
+                 "v2 翻案仅在覆盖达标窗口内成立，不做全窗断言（数据边界的真实形状）。\n")
+    print(f"\n== 整分位（固定档）==\n{full_table.round(4).to_string()}", flush=True)
+    print(f"\n== measured 双档 ==\n{measured_table.round(4).to_string()}", flush=True)
+    if verdict_flip:
+        print(f"\n⚠ verdict 随 min_periods 翻转: {verdicts}", flush=True)
+    print(f"report: {out}", flush=True)
+    # 每档一条台账行（min_periods 进 params_hash）
+    for t in tier_results:
+        d = t["diag"]
+        append_study(
+            study="retail_reality", factor_name=args.factor, verdict=bool(t["verdict"]),
+            criteria=f"measured(min_periods={t['mp']}) alpha t>=2 且子组合中位超额>0",
+            params={"caliber": caliber, "holdings": args.holdings, "n_sims": args.n_sims,
+                    "seed": args.seed, "exchange_drop_fallback": args.exchange_drop_fallback,
+                    "cost_mode": args.cost_mode, "stress_mult": args.stress_mult,
+                    "min_periods": t["mp"], "measured_coverage": d["coverage"],
+                    "q5_member_coverage": d["q5_member_coverage"],
+                    "q5_insufficient": d["q5_insufficient"]},
+            eval_start=dates[0].date(), eval_end=dates[-1].date(),
+            report_path=os.path.relpath(out, os.path.dirname(os.path.dirname(__file__))),
+            criterion_values={"alpha_nw_t": t["alpha_t"],
+                              "sub_median_ann": float(t["sub_ann"].median()),
+                              "bench_ann": t["bench_ann"]})
     prog.done()
     return 0
 
