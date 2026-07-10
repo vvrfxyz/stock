@@ -49,8 +49,8 @@
 先执行 ADD_COLUMNS_DDL 建列（DEFAULT nan——旧行未重跑前新列缺席而非 0），
 再逐年 build_year 幂等重跑填值。
 
-用法（Mac 上直连 253，或 253 本机）：
-    RESEARCH_CLICKHOUSE_URL=http://192.168.1.253:8123 \
+用法（253 本机；Mac 先按 docs/deployment.md 建 SSH 隧道后改用 127.0.0.1:18123）：
+    RESEARCH_CLICKHOUSE_URL=http://127.0.0.1:8123 \
         .venv/bin/python -m research.minute_features --years 2003-2026
 """
 from __future__ import annotations
@@ -65,6 +65,7 @@ from datetime import timedelta
 import numpy as np
 
 from research.minute_bars import clickhouse_url, query_df
+from utils.clickhouse import clickhouse_request_kwargs
 
 # 病理/样本量门槛（预注册，roadmap §6）。CS 需足够多有效对求稳日均；Roll 复用矩量的
 # n_sub>=30 阈值（与 rskew/bipower 一致，>=29 个协方差配对）。
@@ -166,7 +167,7 @@ FROM (
         SELECT security_id, ts, open, close, high, low, volume,
                toHour(ts, 'America/New_York') * 60 + toMinute(ts, 'America/New_York') AS md,
                md BETWEEN 570 AND 959 AS rth
-        FROM stock.minute_bars
+        FROM stock.minute_bars FINAL
         WHERE toYear(ts) = {year} AND toMonth(ts) = {month}
           AND cityHash64(security_id) % {n_shards} = {shard}
     )
@@ -234,11 +235,13 @@ def build_year(year: int) -> float:
     start = time.monotonic()
     # 开局先还账：追踪器虚账跨查询/跨会话存续（第七轮实测：上一批失败查询留下的
     # 账面让 2025-01 开局即撞 4.5G），不能只在逐月间 purge。
-    requests.post(clickhouse_url(), params={"query": "SYSTEM JEMALLOC PURGE"}, timeout=120)
+    auth = clickhouse_request_kwargs()
+    requests.post(clickhouse_url(), params={"query": "SYSTEM JEMALLOC PURGE"}, timeout=120, **auth)
     requests.post(
         clickhouse_url(),
         params={"query": f"ALTER TABLE stock.minute_daily_features DROP PARTITION {year}"},
         timeout=600,
+        **auth,
     )
     # 按月分块 INSERT（2026-07-09 定案）：groupArrayIf 的数组聚合状态不可溢盘收缩
     # （external_group_by 对它无效——五轮实测：查询 RSS 压到 1.38G 总账仍 4.5G+），
@@ -254,13 +257,13 @@ def build_year(year: int) -> float:
                 year=year, month=month, n_shards=N_SHARDS, shard=shard,
                 cs_min_pairs=CS_MIN_PAIRS, roll_min_obs=ROLL_MIN_OBS
             )
-            response = requests.post(clickhouse_url(), data=sql.encode(), timeout=3600)
+            response = requests.post(clickhouse_url(), data=sql.encode(), timeout=3600, **auth)
             if response.status_code != 200:
                 raise RuntimeError(
                     f"{year}-{month:02d} shard {shard}/{N_SHARDS} 特征提取失败: {response.text[:400]}")
         # jemalloc 把释放内存留在 arena，CH 总账跨查询累积虚高（六轮实测：逐月分块后
         # 前 4 月过、第 5 月被虚账杀——RSS 1.5G 账面 4.5G）。逐月强制还账。
-        requests.post(clickhouse_url(), params={"query": "SYSTEM JEMALLOC PURGE"}, timeout=120)
+        requests.post(clickhouse_url(), params={"query": "SYSTEM JEMALLOC PURGE"}, timeout=120, **auth)
     return time.monotonic() - start
 
 

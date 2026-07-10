@@ -118,5 +118,15 @@ update_massive_prices 对**前一交易日**的请求出现**大面积 403 + 少
   `--max-mismatch-rate 0.02`（vendor 口径存量 ~177 只，绝对断言会每周必红）。
 - `pipeline_task_runs`：失败步的 error_sample 现含 ERROR 日志尾部（不再只有
   exit=1）；卡死 >12h 的 RUNNING 行开跑即标 ORPHANED。
+- `health_report` 同时检查 PG 日线与 CH 分钟线的最近交易日：日线落后超过 1 个 session、
+  周更分钟线落后超过 5 个 sessions 记 P1。健康检查固定排在当日全部采集步骤之后；CH
+  查询只扫描允许下限后的分区，不要改回无 WHERE 的 `max(toDate(ts))`，51 亿行全表扫描
+  会污染 4G cgroup 内存账。
+- `pipeline_task_runs` 的历史失败继续展示，但只有某任务的**最新一次**仍为 FAILED 才计 P1；
+  后续 SUCCESS 已恢复的旧失败不再制造持续告警。
+- `update_minute_bars` 的 API 抓取保留 8 并发，但跨证券累计 50,000 行后由主线程串行
+  INSERT，并关闭 ClickHouse parallel parsing；生产首跑实证这是 3.2G 服务端预算下的稳定写法。
+  所有消费 `ReplacingMergeTree` 分钟事实的聚合/修复查询必须使用 `FINAL`，避免重叠窗口
+  写入尚未后台合并时重复累计成交量或读取旧值。
 - audit_security_identity 的"审计有发现待人工"是 advisory：2026-07-07 起 exit=0
   只留日志告警（此前 exit=1 被 pipeline_task_runs 记为 FAILED 假故障）。

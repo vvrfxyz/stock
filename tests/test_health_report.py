@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from loguru import logger
 
 from scripts.health_report import (
     report_institutional_holdings_completeness,
+    report_market_data_freshness,
     report_pipeline_runs,
 )
 
@@ -19,6 +21,9 @@ class _Result:
         self._rows = rows
 
     def all(self):
+        return self._rows
+
+    def scalar(self):
         return self._rows
 
 
@@ -113,6 +118,134 @@ def test_pipeline_runs_all_green_without_zombies():
     ]
 
     assert report_pipeline_runs(_Session(grouped, [], []), days=7) == 0
+
+
+def test_pipeline_runs_recovered_failure_is_history_not_p1():
+    grouped = [
+        ("update_massive_prices", "FAILED", 1, None, datetime(2026, 7, 1, 10, 30)),
+        ("update_massive_prices", "SUCCESS", 1, None, datetime(2026, 7, 2, 10, 30)),
+    ]
+
+    assert report_pipeline_runs(_Session(grouped, [], []), days=7) == 0
+
+
+def test_pipeline_runs_latest_failure_is_p1():
+    grouped = [
+        ("update_massive_prices", "FAILED", 1, None, datetime(2026, 7, 2, 10, 30)),
+    ]
+    latest_failures = [
+        ("update_massive_prices", "api down", datetime(2026, 7, 2, 9, 0)),
+    ]
+
+    assert report_pipeline_runs(_Session(grouped, [], latest_failures), days=7) == 1
+
+
+def test_market_data_freshness_allows_one_session_lag(monkeypatch):
+    import scripts.health_report as health
+
+    seen = {}
+    monkeypatch.setenv("CLICKHOUSE_USER", "default")
+    monkeypatch.setenv("CLICKHOUSE_PASSWORD", "test")
+
+    class Response:
+        status_code = 200
+        text = "2026-07-08\n"
+
+    monkeypatch.setattr(health, "get_last_completed_trading_date", lambda market: date(2026, 7, 9))
+    monkeypatch.setattr(
+        health,
+        "shift_trading_date",
+        lambda market, day, sessions: date(2026, 7, 8) if sessions == -1 else date(2026, 7, 2),
+    )
+    def post(*args, **kwargs):
+        seen["sql"] = kwargs["data"].decode()
+        return Response()
+
+    monkeypatch.setattr("requests.post", post)
+
+    assert report_market_data_freshness(_Session(date(2026, 7, 8)), "US") == 0
+    assert "WHERE ts >= toDateTime('2026-07-02 00:00:00'" in seen["sql"]
+
+
+def test_market_data_freshness_warns_each_stale_store(monkeypatch):
+    import scripts.health_report as health
+
+    monkeypatch.setenv("CLICKHOUSE_USER", "default")
+    monkeypatch.setenv("CLICKHOUSE_PASSWORD", "test")
+
+    class Response:
+        status_code = 200
+        text = "2026-07-01\n"
+
+    monkeypatch.setattr(health, "get_last_completed_trading_date", lambda market: date(2026, 7, 9))
+    monkeypatch.setattr(
+        health,
+        "shift_trading_date",
+        lambda market, day, sessions: date(2026, 7, 8) if sessions == -1 else date(2026, 7, 2),
+    )
+    monkeypatch.setattr("requests.post", lambda *a, **kw: Response())
+
+    assert report_market_data_freshness(_Session(date(2026, 7, 7)), "US") == 2
+
+
+def test_market_data_freshness_counts_clickhouse_failure(monkeypatch):
+    import scripts.health_report as health
+
+    monkeypatch.setenv("CLICKHOUSE_USER", "default")
+    monkeypatch.setenv("CLICKHOUSE_PASSWORD", "test")
+
+    class Response:
+        status_code = 503
+        text = "unavailable"
+
+    monkeypatch.setattr(health, "get_last_completed_trading_date", lambda market: date(2026, 7, 9))
+    monkeypatch.setattr(
+        health,
+        "shift_trading_date",
+        lambda market, day, sessions: date(2026, 7, 8) if sessions == -1 else date(2026, 7, 2),
+    )
+    monkeypatch.setattr("requests.post", lambda *a, **kw: Response())
+
+    assert report_market_data_freshness(_Session(date(2026, 7, 8)), "US") == 1
+
+
+def test_market_data_freshness_counts_missing_clickhouse_credentials(monkeypatch):
+    import scripts.health_report as health
+
+    for name in (
+        "RESEARCH_CLICKHOUSE_USER",
+        "RESEARCH_CLICKHOUSE_PASSWORD",
+        "CLICKHOUSE_USER",
+        "CLICKHOUSE_PASSWORD",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(health, "get_last_completed_trading_date", lambda market: date(2026, 7, 9))
+    monkeypatch.setattr(
+        health,
+        "shift_trading_date",
+        lambda market, day, sessions: date(2026, 7, 8) if sessions == -1 else date(2026, 7, 2),
+    )
+
+    assert report_market_data_freshness(_Session(date(2026, 7, 8)), "US") == 1
+
+
+def test_market_data_freshness_counts_invalid_clickhouse_date(monkeypatch):
+    import scripts.health_report as health
+
+    monkeypatch.setenv("CLICKHOUSE_USER", "default")
+    monkeypatch.setenv("CLICKHOUSE_PASSWORD", "test")
+    monkeypatch.setattr(health, "get_last_completed_trading_date", lambda market: date(2026, 7, 9))
+    monkeypatch.setattr(
+        health,
+        "shift_trading_date",
+        lambda market, day, sessions: date(2026, 7, 8) if sessions == -1 else date(2026, 7, 2),
+    )
+    monkeypatch.setattr(
+        "requests.post",
+        lambda *args, **kwargs: SimpleNamespace(status_code=200, text="not-a-date\n"),
+    )
+
+    assert report_market_data_freshness(_Session(date(2026, 7, 8)), "US") == 1
 
 
 # ---------------------------------------------------------------------------

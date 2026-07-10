@@ -35,13 +35,10 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from db_manager import DatabaseManager
+from utils.clickhouse import clickhouse_request_kwargs, clickhouse_url
 from utils.script_logging import setup_logging as configure_script_logging
 
 MINUTE_FLOOR = date(2003, 9, 10)
-
-
-def clickhouse_http() -> str:
-    return (os.environ.get("CLICKHOUSE_URL") or "http://localhost:8123").rstrip("/")
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -79,13 +76,14 @@ def minute_extremes(security_id: int, day: date) -> tuple[float, float] | None:
     """常规时段分钟重构 (high, low)；无分钟行返回 None。"""
     sql = f"""
         SELECT max(high), min(low), count()
-        FROM stock.minute_bars
+        FROM stock.minute_bars FINAL
         WHERE security_id = {security_id}
           AND toDate(ts, 'America/New_York') = '{day.isoformat()}'
           AND (toHour(ts, 'America/New_York') * 60 + toMinute(ts, 'America/New_York'))
               BETWEEN 570 AND 959
     """
-    response = requests.post(clickhouse_http(), data=sql.encode(), timeout=120)
+    response = requests.post(clickhouse_url(), data=sql.encode(), timeout=120,
+                             **clickhouse_request_kwargs())
     if response.status_code != 200:
         raise RuntimeError(f"ClickHouse 查询失败: {response.text[:300]}")
     high_s, low_s, n_s = response.text.strip().split("\t")

@@ -11,6 +11,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     ports:
       - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    mem_limit: 2500m
+    memswap_limit: 2500m
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -19,5 +21,32 @@ services:
       timeout: 5s
       retries: 12
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.12.6.70
+    container_name: stock-clickhouse
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-stock}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
+      CLICKHOUSE_PASSWORD_SHA256: ${CLICKHOUSE_PASSWORD_SHA256:?set CLICKHOUSE_PASSWORD_SHA256 in .env}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "0"
+    ports:
+      - "${CLICKHOUSE_BIND:-127.0.0.1}:${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+    mem_limit: 4g
+    memswap_limit: 4g
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+      - ./deploy/clickhouse/99-memory-cap.xml:/etc/clickhouse-server/config.d/99-memory-cap.xml:ro
+      - ./deploy/clickhouse/default-user.xml:/etc/clickhouse-server/users.d/zz-security.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user \"$${CLICKHOUSE_USER}\" --password \"$${CLICKHOUSE_PASSWORD}\" --query 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
 volumes:
   postgres-data:
+  clickhouse-data:
+  clickhouse-logs:

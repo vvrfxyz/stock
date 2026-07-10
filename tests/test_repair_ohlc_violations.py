@@ -42,6 +42,25 @@ ROWS = {
 }
 
 
+def test_minute_extremes_reads_replacing_merge_tree_with_final(monkeypatch):
+    seen = {}
+
+    class Response:
+        status_code = 200
+        text = "12.0\t8.0\t10\n"
+
+    def post(_url, **kwargs):
+        seen["sql"] = kwargs["data"].decode()
+        return Response()
+
+    monkeypatch.setattr(repair_mod.requests, "post", post)
+    monkeypatch.setattr(repair_mod, "clickhouse_url", lambda: "http://clickhouse")
+    monkeypatch.setattr(repair_mod, "clickhouse_request_kwargs", lambda: {})
+
+    assert repair_mod.minute_extremes(1, BAD_HIGH) == (12.0, 8.0)
+    assert "FROM stock.minute_bars FINAL" in seen["sql"]
+
+
 def _seed(pg_db):
     from data_models.models import DailyPrice, Security
 

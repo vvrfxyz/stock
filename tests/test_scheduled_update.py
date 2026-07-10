@@ -45,6 +45,7 @@ def test_scheduled_update_runs_daily_tasks_every_day():
     assert "check_data_integrity" in names
     assert names.index("check_data_integrity") > names.index("update_open_close_summary")
     assert "update_massive_actions_recent" in names
+    assert names[-1] == "health_report"
     recent_step = next(step for step in steps if step.name == "update_massive_actions_recent")
     assert "--recent-days" in recent_step.args
     assert "--force" not in recent_step.args
@@ -62,6 +63,9 @@ def test_scheduled_update_staggers_weekly_tasks():
     assert "update_massive_actions" not in saturday_names
     assert "update_massive_actions" in sunday_names
     assert "update_massive_shares" not in sunday_names
+    assert saturday_names[-1] == "health_report"
+    assert sunday_names[-1] == "health_report"
+    assert saturday_names.index("update_minute_bars_weekly") < saturday_names.index("health_report")
     assert "sync_sec_identifiers" in sunday_names
     assert "update_sec_filings_recent" in sunday_names
     assert "update_insider_transactions_recent" in sunday_names

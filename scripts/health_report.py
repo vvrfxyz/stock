@@ -18,6 +18,7 @@ if project_root not in sys.path:
 from db_manager import DatabaseManager
 from utils.massive_config import ALLOWED_US_SECURITY_TYPES
 from utils.script_logging import setup_logging as configure_script_logging
+from utils.trading_calendar import get_last_completed_trading_date, shift_trading_date
 
 
 def setup_logging():
@@ -173,16 +174,30 @@ def report_pipeline_runs(session, days: int) -> int:
         logger.info("  无 pipeline_task_runs 记录（首次运行前正常）。")
         return 0
 
+    latest_failures = session.execute(text("""
+        WITH latest AS (
+            SELECT DISTINCT ON (task_name)
+                   task_name, status, error_sample, started_at
+            FROM pipeline_task_runs
+            WHERE created_at > now() - make_interval(days => :days)
+            ORDER BY task_name, started_at DESC, id DESC
+        )
+        SELECT task_name, error_sample, started_at
+        FROM latest
+        WHERE status = 'FAILED'
+        ORDER BY started_at DESC
+    """), {"days": days}).all()
+    latest_failed_names = {row[0] for row in latest_failures}
+    issues += len(latest_failures)
+
     current_task = None
     for task_name, status, cnt, max_dur, last_run in rows:
         if task_name != current_task:
             current_task = task_name
             logger.info("")
-        mark = "!!" if status == "FAILED" else "  "
+        mark = "!!" if status == "FAILED" and task_name in latest_failed_names else "  "
         logger.info("{} {:40s}  {:8s}  count={:>3}  max_dur={}  last={}",
                     mark, task_name, status, cnt, max_dur or "-", last_run or "-")
-        if status == "FAILED":
-            issues += cnt
 
     if stuck_rows:
         issues += len(stuck_rows)
@@ -190,18 +205,10 @@ def report_pipeline_runs(session, days: int) -> int:
         for task_name, run_id, started_at in stuck_rows[:5]:
             logger.warning("    {} [{}] started={}", task_name, run_id, started_at)
 
-    # 最近失败样例
-    recent_failures = session.execute(text("""
-        SELECT task_name, error_sample, started_at
-        FROM pipeline_task_runs
-        WHERE status = 'FAILED' AND created_at > now() - make_interval(days => :days)
-        ORDER BY started_at DESC
-        LIMIT 5
-    """), {"days": days}).all()
-    if recent_failures:
+    if latest_failures:
         logger.info("")
-        logger.info("  最近失败样例:")
-        for task_name, error, started in recent_failures:
+        logger.info("  最新一次仍失败的任务:")
+        for task_name, error, started in latest_failures[:5]:
             logger.info("    {} [{}] {}", started, task_name, error or "")
 
     return issues
@@ -363,6 +370,60 @@ def report_staleness(session) -> int:
     return p2
 
 
+def report_market_data_freshness(session, market: str) -> int:
+    """P1: 日线落后超过 1 session，周更分钟线落后超过 5 sessions。"""
+    import requests
+
+    from utils.clickhouse import clickhouse_request_kwargs, clickhouse_url
+
+    _section("市场数据交易日 Freshness")
+    expected = get_last_completed_trading_date(market)
+    daily_minimum = shift_trading_date(market, expected, sessions=-1)
+    minute_minimum = shift_trading_date(market, expected, sessions=-5)
+    p1 = 0
+
+    latest_daily = session.execute(text("SELECT max(date) FROM daily_prices")).scalar()
+    if latest_daily is None or latest_daily < daily_minimum:
+        p1 += 1
+        logger.warning("  [P1] daily_prices latest={}，最近完整交易日={}，允许下限={}",
+                       latest_daily or "NULL", expected, daily_minimum)
+    else:
+        logger.info("  daily_prices latest={}，最近完整交易日={} (OK)", latest_daily, expected)
+
+    minute_sql = f"""
+        SELECT maxOrNull(toDate(ts, 'America/New_York'))
+        FROM stock.minute_bars
+        WHERE ts >= toDateTime('{minute_minimum.isoformat()} 00:00:00', 'America/New_York')
+    """
+    try:
+        response = requests.post(
+            clickhouse_url(),
+            data=minute_sql.encode(),
+            timeout=30,
+            **clickhouse_request_kwargs(),
+        )
+    except (requests.RequestException, RuntimeError) as exc:
+        logger.warning("  [P1] minute_bars freshness 查询失败: {}", exc)
+        return p1 + 1
+    if response.status_code != 200:
+        logger.warning("  [P1] minute_bars freshness 查询失败: HTTP {} {}",
+                       response.status_code, response.text[:300])
+        return p1 + 1
+    raw = response.text.strip()
+    try:
+        latest_minute = None if raw in ("", "\\N", "0000-00-00") else date.fromisoformat(raw)
+    except ValueError:
+        logger.warning("  [P1] minute_bars freshness 返回了无效日期: {!r}", raw[:100])
+        return p1 + 1
+    if latest_minute is None or latest_minute < minute_minimum:
+        p1 += 1
+        logger.warning("  [P1] minute_bars latest={}，最近完整交易日={}，允许下限={}",
+                       latest_minute or f"<{minute_minimum}", expected, minute_minimum)
+    else:
+        logger.info("  minute_bars latest={}，最近完整交易日={} (OK)", latest_minute, expected)
+    return p1
+
+
 def summarize(p0_total: int, p1_total: int, p2_total: int) -> int:
     """汇总分层计数并给出退出码。
 
@@ -403,6 +464,7 @@ def main(argv: list[str] | None = None) -> int:
                 ("delisting_outcomes", lambda: report_delisting_outcomes(session)),
                 ("pipeline_runs", lambda: report_pipeline_runs(session, args.days)),
                 ("staleness", lambda: report_staleness(session)),
+                ("market_data_freshness", lambda: report_market_data_freshness(session, args.market)),
             ]
             for name, fn in sections:
                 try:
@@ -422,6 +484,8 @@ def main(argv: list[str] | None = None) -> int:
                         p1_total += result
                     elif name == "staleness":
                         p2_total += result
+                    elif name == "market_data_freshness":
+                        p1_total += result
                 except Exception as exc:
                     session.rollback()
                     logger.opt(exception=exc).warning("报告 section {} 执行失败，跳过: {}", name, exc)

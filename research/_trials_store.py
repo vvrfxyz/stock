@@ -353,6 +353,19 @@ def load_trials(path: Path | None = None, *, latest_only: bool = False) -> pd.Da
         # 把有账读成空帧（_read_frame 对不存在路径静默返回空）。
         path = Path(__file__).resolve().parent / "output" / "trials.parquet"
     df = _read_frame(path)
+    if not df.empty and "trial_kind" in df.columns:
+        kind = df["trial_kind"].astype(object).fillna("evaluate").astype(str)
+        verdict_rows = (kind == "study") & (df["metric"] == "study_verdict") & (df["value"] == 1.0)
+        for index in df.index[verdict_rows]:
+            try:
+                params = json.loads(df.at[index, "params_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if params.get("q5_insufficient") is True:
+                df.at[index, "value"] = 0.0
+                note = str(df.at[index, "note"] or "")
+                if "q5 coverage" not in note:
+                    df.at[index, "note"] = f"{note}; FAIL: q5 coverage <70%"
     if df.empty or not latest_only:
         return df
     keys = ["factor_name", "factor_version", "horizon", "metric", "metric_param", "params_hash"]

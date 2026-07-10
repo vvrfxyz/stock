@@ -202,13 +202,6 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
             check_data_integrity_main,
             ["--limit", "5", "--window-days", "14"],
         ),
-        # 自愈感知：健康报告每日跑，P0 非零退出让 daily run 变红（评估结论：
-        # health_report 写好从未被调度，新闻停更 53 天无人发现）。
-        ScheduledStep(
-            "health_report",
-            health_report_main,
-            [],
-        ),
     ]
 
     if run_date.weekday() == 5:
@@ -381,6 +374,8 @@ def build_scheduled_update_steps(run_date: date, market: str = "US") -> list[Sch
                 ["--market", market, "--all", "--force"],
             )
         )
+    # 健康报告必须在当天全部采集/维护步骤之后，检查本轮写入后的终态。
+    steps.append(ScheduledStep("health_report", health_report_main, []))
     return steps
 
 
@@ -507,6 +502,24 @@ def run_update_massive_prices(args):
     if args.workers: cli_args.extend(['--workers', str(args.workers)])
     cli_args.extend(args.symbols)
     execute_script(update_massive_prices_main, cli_args)
+
+
+def run_update_minute_bars(args):
+    logger.info("执行: 更新 Massive 1 分钟线")
+    cli_args = []
+    if args.start:
+        cli_args.extend(['--start', args.start])
+    if args.lookback_days:
+        cli_args.extend(['--lookback-days', str(args.lookback_days)])
+    if args.market:
+        cli_args.extend(['--market', args.market])
+    if args.limit > 0:
+        cli_args.extend(['--limit', str(args.limit)])
+    if args.workers:
+        cli_args.extend(['--workers', str(args.workers)])
+    cli_args.extend(args.symbols)
+    execute_script(update_minute_bars_main, cli_args)
+
 
 def run_update_historical_shares(args):
     logger.info("执行: 更新 Massive 历史股本 (historical_shares)")
@@ -992,6 +1005,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_massive_prices.add_argument('--limit', type=int, default=0, help="限制处理的股票数量。")
     p_massive_prices.add_argument('--workers', type=int, help="并发线程数。")
     p_massive_prices.set_defaults(func=run_update_massive_prices)
+
+    p_minute_bars = subparsers.add_parser('update_minute_bars', help="增量同步 Massive 1 分钟线到 ClickHouse")
+    p_minute_bars.add_argument('symbols', nargs='*', help="要处理的股票代码列表。")
+    p_minute_bars.add_argument('--start', type=str, help="窗口起点 YYYY-MM-DD；缺省按 lookback-days 回看。")
+    p_minute_bars.add_argument('--lookback-days', type=int, default=8, help="未显式 --start 时的回看天数。")
+    p_minute_bars.add_argument('--market', type=str, default='US', help="当前仅支持 US。")
+    p_minute_bars.add_argument('--limit', type=int, default=0, help="限制处理的证券数量。")
+    p_minute_bars.add_argument('--workers', type=int, default=8, help="Massive API 抓取并发数。")
+    p_minute_bars.set_defaults(func=run_update_minute_bars)
 
     p_massive_shares = subparsers.add_parser('update_massive_shares', help="使用 Massive 更新 historical_shares")
     p_massive_shares.add_argument('symbols', nargs='*', help="要处理的股票代码列表。")

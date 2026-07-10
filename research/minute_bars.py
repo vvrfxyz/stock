@@ -1,7 +1,8 @@
 """ClickHouse 分钟线读取层（stock.minute_bars，2003+，含盘前盘后，未复权原始价）。
 
 只读研究入口，走 ClickHouse HTTP 接口（无额外依赖）。连接优先
-RESEARCH_CLICKHOUSE_URL（指向 253，如 http://192.168.1.253:8123），回退 CLICKHOUSE_URL。
+RESEARCH_CLICKHOUSE_URL，回退 CLICKHOUSE_URL。253 只监听 loopback；Mac 使用时先按
+docs/deployment.md 建 SSH 隧道，再指向 http://127.0.0.1:18123。
 
 复权与日线同口径：分钟价 × utils/adjusted_prices 的日级因子（分钟粒度不产生
 额外复权语义——因子按 ex_date 日级生效）。本模块只出原始价。
@@ -9,18 +10,14 @@ RESEARCH_CLICKHOUSE_URL（指向 253，如 http://192.168.1.253:8123），回退
 from __future__ import annotations
 
 import io
-import os
 from datetime import date
 
 import pandas as pd
 import requests
 
+from utils.clickhouse import clickhouse_request_kwargs, clickhouse_url
 
-def clickhouse_url(url: str | None = None) -> str:
-    resolved = url or os.environ.get("RESEARCH_CLICKHOUSE_URL") or os.environ.get("CLICKHOUSE_URL")
-    if not resolved:
-        raise RuntimeError("需要 RESEARCH_CLICKHOUSE_URL 或 CLICKHOUSE_URL")
-    return resolved.rstrip("/")
+MAX_BARS_PER_SECURITY_DAY = 2_000
 
 
 def query_df(sql: str, url: str | None = None) -> pd.DataFrame:
@@ -30,6 +27,7 @@ def query_df(sql: str, url: str | None = None) -> pd.DataFrame:
         params={"default_format": "TabSeparatedWithNames"},
         data=sql.encode(),
         timeout=600,
+        **clickhouse_request_kwargs(),
     )
     if response.status_code != 200:
         raise RuntimeError(f"ClickHouse 查询失败: {response.text[:500]}")
@@ -51,6 +49,8 @@ def load_minute_bars(
     regular_session_only=True 只取 09:30-16:00 ET（含 09:30 开盘分钟，
     不含 16:00 收盘竞价之后）。
     """
+    if not security_ids:
+        return pd.DataFrame()
     ids = ",".join(str(int(i)) for i in security_ids)
     session_filter = ""
     if regular_session_only:
@@ -69,6 +69,12 @@ def load_minute_bars(
         ORDER BY security_id, ts
     """
     frame = query_df(sql, url)
+    max_rows = len(security_ids) * ((end - start).days + 1) * MAX_BARS_PER_SECURITY_DAY
+    if len(frame) > max_rows:
+        raise RuntimeError(
+            f"ClickHouse 分钟结果体量异常: {len(frame):,} > {max_rows:,} "
+            f"({len(security_ids)} securities, {start}..{end})"
+        )
     if not frame.empty:
         frame["ts"] = pd.to_datetime(frame["ts"], utc=True)
     return frame

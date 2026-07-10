@@ -1,0 +1,14 @@
+<clickhouse>
+    <users>
+        <default>
+            <password remove="remove"/>
+            <password_sha256_hex from_env="CLICKHOUSE_PASSWORD_SHA256"/>
+            <access_management>0</access_management>
+            <networks replace="replace">
+                <ip>127.0.0.1</ip>
+                <ip>::1</ip>
+                <ip>172.16.0.0/12</ip>
+            </networks>
+        </default>
+    </users>
+</clickhouse>

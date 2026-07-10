@@ -72,6 +72,9 @@ class TestExistingColumnsUnchanged:
         for expr in _EXISTING_OUTPUT_EXPRS + _EXISTING_AGG_EXPRS:
             assert "high" not in expr and "low" not in expr
 
+    def test_replacing_merge_tree_is_read_with_final(self):
+        assert "FROM stock.minute_bars FINAL" in EXTRACT_SQL_TEMPLATE
+
 
 class TestTemplateStructure:
     def test_new_columns_in_insert_and_select(self):

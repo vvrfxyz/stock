@@ -148,6 +148,29 @@ def test_update_adjustment_factors_cli_defaults_omit_new_flags(monkeypatch):
     assert "--max-mismatch-rate" not in argv
 
 
+def test_update_minute_bars_cli_forwards_args(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        main_module, "execute_script",
+        lambda main_func, args_list: captured.update(main_func=main_func, argv=args_list),
+    )
+
+    args = main_module.build_parser().parse_args([
+        "update_minute_bars", "aapl", "--start", "2026-07-02",
+        "--lookback-days", "8", "--workers", "4",
+    ])
+    args.func(args)
+
+    from scripts.update_minute_bars import create_parser as minute_parser
+
+    forwarded = minute_parser().parse_args(captured["argv"])
+    assert captured["main_func"] is main_module.update_minute_bars_main
+    assert forwarded.symbols == ["aapl"]
+    assert forwarded.start == "2026-07-02"
+    assert forwarded.lookback_days == 8
+    assert forwarded.workers == 4
+
+
 def test_sync_openfigi_identifiers_cli_forwards_args(monkeypatch):
     captured = {}
     monkeypatch.setattr(

@@ -199,6 +199,29 @@ class TestUpsertSecuritiesBySymbol:
         assert new_id > 100
 
 
+class TestInsertBackfilledSecurities:
+    def test_forces_inactive_and_keeps_recycled_symbols_separate(self, pg_db):
+        _insert_security(pg_db, 1, "same", is_active=True)
+        inserted = pg_db.insert_backfilled_securities([
+            {"symbol": "same", "market": "US", "type": "CS",
+             "delist_date": date(2010, 1, 4), "is_active": True},
+            {"symbol": "same", "market": "US", "type": "CS",
+             "delist_date": date(2020, 1, 4)},
+            {"symbol": "missing-date", "market": "US", "type": "CS"},
+        ])
+
+        assert len(inserted) == 2
+        assert _scalar(pg_db, "SELECT count(*) FROM securities WHERE symbol='same'") == 3
+        assert _scalar(pg_db, "SELECT count(*) FROM securities WHERE symbol='same' AND is_active") == 1
+
+    def test_sequence_syncs_after_manual_id(self, pg_db):
+        _insert_security(pg_db, 100, "active")
+        inserted = pg_db.insert_backfilled_securities([
+            {"symbol": "dead", "market": "US", "type": "CS", "delist_date": date(2010, 1, 4)}
+        ])
+        assert inserted[0][0] > 100
+
+
 class TestSecurityIdentityChanges:
     def test_rename_updates_symbol_and_writes_history(self, pg_db):
         _insert_security(pg_db, 1, "fb", composite_figi="BBG000MM2P62", exchange="XNAS")

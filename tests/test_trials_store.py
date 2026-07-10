@@ -372,6 +372,22 @@ def test_study_rows_excluded_from_bonferroni_denominator(tmp_path):
     assert st["verdict"].iloc[0] == "PASS"
 
 
+def test_load_trials_requalifies_legacy_low_coverage_pass(tmp_path):
+    path = tmp_path / "trials.parquet"
+    append_study(
+        path=path,
+        **_study_kwargs(
+            params={"cost_mode": "measured", "q5_insufficient": True},
+            verdict=True,
+        ),
+    )
+
+    df = load_trials(path)
+    verdict = df[df["metric"] == "study_verdict"].iloc[0]
+    assert verdict["value"] == 0.0
+    assert "q5 coverage <70%" in verdict["note"]
+
+
 def test_report_survives_v1_null_kind_plus_study_rows(tmp_path):
     # 审核 #0 金测试：v1 老账（trial_kind 全 NULL）+ 只追加过 study 行 → parquet 读回
     # trial_kind 是 categories={'study'} 的 Categorical，naive fillna('evaluate') 会抛

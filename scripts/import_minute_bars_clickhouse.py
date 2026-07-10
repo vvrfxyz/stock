@@ -36,14 +36,12 @@ project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+from utils.clickhouse import clickhouse_request_kwargs, clickhouse_url
 from utils.script_logging import setup_logging as configure_script_logging
 
 LEDGER_PATH = "logs/manual_backfill/minute_bars_ledger.tsv"
 TICKER_RE = "^[A-Z][A-Z0-9.]*$"
 
-
-def clickhouse_http() -> str:
-    return (os.environ.get("CLICKHOUSE_URL") or "http://localhost:8123").rstrip("/")
 
 TRANSFORM_SQL = f"""
 INSERT INTO stock.minute_bars
@@ -103,11 +101,14 @@ def ch(query: str, *, input_file: Path | None = None, input_bytes: bytes | None 
     """ClickHouse HTTP 接口（8123）；input_file/input_bytes 作 INSERT 数据体流式上传。"""
     if input_file is not None:
         with input_file.open("rb") as f:
-            response = requests.post(clickhouse_http(), params={"query": query}, data=f, timeout=3600)
+            response = requests.post(clickhouse_url(), params={"query": query}, data=f,
+                                     timeout=3600, **clickhouse_request_kwargs())
     elif input_bytes is not None:
-        response = requests.post(clickhouse_http(), params={"query": query}, data=input_bytes, timeout=3600)
+        response = requests.post(clickhouse_url(), params={"query": query}, data=input_bytes,
+                                 timeout=3600, **clickhouse_request_kwargs())
     else:
-        response = requests.post(clickhouse_http(), data=query.encode(), timeout=3600)
+        response = requests.post(clickhouse_url(), data=query.encode(), timeout=3600,
+                                 **clickhouse_request_kwargs())
     if response.status_code != 200:
         raise RuntimeError(f"clickhouse HTTP 失败: {response.text[:500]}")
     return response.text

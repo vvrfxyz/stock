@@ -23,6 +23,7 @@ import argparse
 import os
 import sys
 import time
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -35,28 +36,30 @@ if project_root not in sys.path:
 from data_models.models import Security
 from data_sources.massive_source import MassiveSource
 from db_manager import DatabaseManager
+from utils.clickhouse import clickhouse_request_kwargs, clickhouse_url
 from utils.massive_config import ALLOWED_US_SECURITY_TYPES
 from utils.massive_task import build_standard_parser, run_concurrently, run_massive_task
 from utils.trading_calendar import get_last_completed_trading_date
 
 ET = ZoneInfo("America/New_York")
-CH_BATCH_ROWS = 200_000
-
-
-def clickhouse_http() -> str:
-    return (os.environ.get("CLICKHOUSE_URL") or "http://localhost:8123").rstrip("/")
+CH_BATCH_ROWS = 50_000
+FETCH_CHUNK_SIZE = 256
+MAX_BARS_PER_CALENDAR_DAY = 2_000
 
 
 def ch_insert_rows(rows: list[str]) -> None:
     import requests
 
     response = requests.post(
-        clickhouse_http(),
+        clickhouse_url(),
         params={"query": "INSERT INTO stock.minute_bars "
                          "(security_id, ts, vendor_symbol, open, high, low, close, "
-                         "volume, vwap, trade_count, source) FORMAT TabSeparated"},
+                         "volume, vwap, trade_count, source) FORMAT TabSeparated",
+                "input_format_parallel_parsing": "0",
+                "max_insert_threads": "1"},
         data="\n".join(rows).encode() + b"\n",
         timeout=600,
+        **clickhouse_request_kwargs(),
     )
     if response.status_code != 200:
         raise RuntimeError(f"ClickHouse INSERT 失败: {response.text[:300]}")
@@ -107,13 +110,31 @@ def process_security(
     start: date,
     end: date,
 ) -> str:
+    status, rows = prepare_security_rows(security, source, start, end)
+    for index in range(0, len(rows), CH_BATCH_ROWS):
+        ch_insert_rows(rows[index: index + CH_BATCH_ROWS])
+    return status
+
+
+def prepare_security_rows(
+    security: Security,
+    source: MassiveSource,
+    start: date,
+    end: date,
+) -> tuple[str, list[str]]:
     fetch_start = max(start, security.list_date) if security.list_date else start
     fetch_end = min(end, security.delist_date) if security.delist_date else end
     if fetch_start > fetch_end:
-        return "SKIP_WINDOW"
+        return "SKIP_WINDOW", []
     raw = source.get_minute_aggs(security.symbol, fetch_start.isoformat(), fetch_end.isoformat())
     if not raw:
-        return "SUCCESS_NO_BARS"
+        return "SUCCESS_NO_BARS", []
+    max_expected = ((fetch_end - fetch_start).days + 1) * MAX_BARS_PER_CALENDAR_DAY
+    if len(raw) > max_expected:
+        raise RuntimeError(
+            f"[{security.symbol}] 分钟响应体量异常: {len(raw):,} > {max_expected:,} "
+            f"({fetch_start}..{fetch_end})"
+        )
 
     list_floor = security.list_date
     delist_ceiling = security.delist_date
@@ -137,13 +158,11 @@ def process_security(
             f"{o!r}\t{h!r}\t{l!r}\t{c!r}\t{int(round(bar.get('v') or 0))}\t"
             f"{bar.get('vw') or 0.0!r}\t{int(bar.get('n') or 0)}\tmassive_1m"
         )
-    for index in range(0, len(rows), CH_BATCH_ROWS):
-        ch_insert_rows(rows[index: index + CH_BATCH_ROWS])
     if skipped_tenure:
         logger.info("[{}] 任期外丢弃 {} 根分钟 bar（回收防护）。", security.symbol, skipped_tenure)
     if skipped_zero:
         logger.debug("[{}] 零价丢弃 {} 根。", security.symbol, skipped_zero)
-    return "SUCCESS" if rows else "SUCCESS_NO_BARS"
+    return ("SUCCESS" if rows else "SUCCESS_NO_BARS"), rows
 
 
 def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseManager) -> tuple[int, dict]:
@@ -157,14 +176,25 @@ def run(args: argparse.Namespace, source: MassiveSource, db_manager: DatabaseMan
         return 0, {"processed": 0, "written": 0, "failed": 0}
     logger.info("分钟线增量：{} 只证券，窗口 [{}, {}]。", len(securities), start, end)
 
-    outputs, results_counter = run_concurrently(
-        securities,
-        lambda security: process_security(security, source, db_manager, start, end),
-        max_workers=args.workers,
-        desc="同步分钟线",
-    )
-    for status in outputs:
-        results_counter[status] += 1
+    results_counter = Counter()
+    pending_rows: list[str] = []
+    for index in range(0, len(securities), FETCH_CHUNK_SIZE):
+        chunk = securities[index:index + FETCH_CHUNK_SIZE]
+        outputs, chunk_counter = run_concurrently(
+            chunk,
+            lambda security: prepare_security_rows(security, source, start, end),
+            max_workers=args.workers,
+            desc=f"同步分钟线 {index + 1}-{index + len(chunk)}/{len(securities)}",
+        )
+        results_counter.update(chunk_counter)
+        for status, rows in outputs:
+            results_counter[status] += 1
+            pending_rows.extend(rows)
+            while len(pending_rows) >= CH_BATCH_ROWS:
+                ch_insert_rows(pending_rows[:CH_BATCH_ROWS])
+                del pending_rows[:CH_BATCH_ROWS]
+    if pending_rows:
+        ch_insert_rows(pending_rows)
 
     success = results_counter["SUCCESS"]
     no_bars = results_counter["SUCCESS_NO_BARS"] + results_counter["SKIP_WINDOW"]

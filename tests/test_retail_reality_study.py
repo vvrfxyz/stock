@@ -264,3 +264,10 @@ class TestMinPeriodsVariant:
         assert _parse_min_periods("10,10,20") == [10, 20]   # 保序去重
         assert _parse_min_periods("") == [20]                # 空 -> 默认主档
         assert _parse_min_periods(" 20 , 10 ") == [20, 10]   # 容空格
+
+    def test_coverage_gate_is_part_of_persisted_verdict(self):
+        from research.retail_reality_study import _measured_verdict
+
+        assert _measured_verdict(2.2, 0.15, 0.10, 0.69) == (True, False)
+        assert _measured_verdict(2.2, 0.15, 0.10, 0.70) == (True, True)
+        assert _measured_verdict(1.9, 0.15, 0.10, 0.90) == (False, False)

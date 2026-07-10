@@ -264,6 +264,13 @@ def _parse_min_periods(spec: str) -> list[int]:
     return out or [20]
 
 
+def _measured_verdict(alpha_t: float, sub_median: float, bench_ann: float,
+                      q5_coverage: float) -> tuple[bool, bool]:
+    """返回（统计判据通过，部署资格通过）；覆盖资格线是最终 verdict 的一部分。"""
+    statistical_pass = alpha_t >= 2 and sub_median - bench_ann > 0
+    return statistical_pass, statistical_pass and q5_coverage >= 0.70
+
+
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()  # systemd-run 洗净环境（run_research.sh 发射）下 .env 是唯一的连库配置来源
     args = parse_args(argv)
@@ -430,10 +437,13 @@ def main(argv: list[str] | None = None) -> int:
             terminal=terminal, term_fallback=term_fallback, prog=prog)
         bench_ann = float((1 + bench_m).prod() ** (TRADING_DAYS / len(bench_m)) - 1)
         alpha_t = float(stats_m["alpha_nw_t"])
-        verdict = (alpha_t >= 2 and float(sub_ann.median()) - bench_ann > 0)
+        statistical_pass, verdict = _measured_verdict(
+            alpha_t, float(sub_ann.median()), bench_ann, q5_cov
+        )
         tier_results.append({
             "mp": mp, "stats": stats_m, "diag": mdiag, "sub_ann": sub_ann,
-            "bench_ann": bench_ann, "alpha_t": alpha_t, "verdict": verdict,
+            "bench_ann": bench_ann, "alpha_t": alpha_t,
+            "statistical_pass": statistical_pass, "verdict": verdict,
         })
 
     # verdict 翻转检测（不同 min_periods 档判据不一致 = 重要敏感性信息）
@@ -453,7 +463,8 @@ def main(argv: list[str] | None = None) -> int:
                       **{k: t["stats"][k] for k in ("ann_ret", "alpha_ann", "alpha_nw_t", "ir")},
                       "sub_median": float(t["sub_ann"].median()), "bench_ann": t["bench_ann"],
                       "q5_cov": round(d["q5_member_coverage"], 3),
-                      "verdict": "PASS" if t["verdict"] else "FAIL",
+                      "statistical": "PASS" if t["statistical_pass"] else "FAIL",
+                      "qualified": "PASS" if t["verdict"] else "FAIL",
                       "insufficient": d["q5_insufficient"]})
     measured_table = pd.DataFrame(mrows).set_index("min_periods")
     with open(out, "w") as fh:
@@ -474,7 +485,8 @@ def main(argv: list[str] | None = None) -> int:
                      f"（{d['n_covered']}/{d['n_universe']}）、covered 中位单边 "
                      f"{d['median_cost_bps_covered']:.1f}bps、q5 成员覆盖 "
                      f"{d['q5_member_coverage']*100:.0f}%、fallback {d['fallback_bps']:.0f}bps、"
-                     f"判据 {'PASS' if t['verdict'] else 'FAIL'}{flag}\n")
+                     f"统计判据 {'PASS' if t['statistical_pass'] else 'FAIL'}；"
+                     f"最终资格 {'PASS' if t['verdict'] else 'FAIL'}{flag}\n")
         fh.write("\n**结论口径**：分裂形态（早年 PASS/近年覆盖不足）按最弱一环表述——"
                  "v2 翻案仅在覆盖达标窗口内成立，不做全窗断言（数据边界的真实形状）。\n")
     print(f"\n== 整分位（固定档）==\n{full_table.round(4).to_string()}", flush=True)
@@ -487,7 +499,8 @@ def main(argv: list[str] | None = None) -> int:
         d = t["diag"]
         append_study(
             study="retail_reality", factor_name=args.factor, verdict=bool(t["verdict"]),
-            criteria=f"measured(min_periods={t['mp']}) alpha t>=2 且子组合中位超额>0",
+            criteria=(f"measured(min_periods={t['mp']}) alpha t>=2 且子组合中位超额>0 "
+                      "且 q5 成员覆盖>=70%"),
             params={"caliber": caliber, "holdings": args.holdings, "n_sims": args.n_sims,
                     "seed": args.seed, "exchange_drop_fallback": args.exchange_drop_fallback,
                     "cost_mode": args.cost_mode, "stress_mult": args.stress_mult,
