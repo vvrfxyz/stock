@@ -43,6 +43,12 @@ def _capture_logs():
     return messages, handler_id
 
 
+def _configure_clickhouse(monkeypatch):
+    monkeypatch.setenv("CLICKHOUSE_URL", "http://clickhouse")
+    monkeypatch.setenv("CLICKHOUSE_USER", "default")
+    monkeypatch.setenv("CLICKHOUSE_PASSWORD", "test")
+
+
 # ---------------------------------------------------------------------------
 # 13F 覆盖：阈值分支（假 Session）
 # ---------------------------------------------------------------------------
@@ -144,8 +150,7 @@ def test_market_data_freshness_allows_one_session_lag(monkeypatch):
     import scripts.health_report as health
 
     seen = {}
-    monkeypatch.setenv("CLICKHOUSE_USER", "default")
-    monkeypatch.setenv("CLICKHOUSE_PASSWORD", "test")
+    _configure_clickhouse(monkeypatch)
 
     class Response:
         status_code = 200
@@ -170,8 +175,7 @@ def test_market_data_freshness_allows_one_session_lag(monkeypatch):
 def test_market_data_freshness_warns_each_stale_store(monkeypatch):
     import scripts.health_report as health
 
-    monkeypatch.setenv("CLICKHOUSE_USER", "default")
-    monkeypatch.setenv("CLICKHOUSE_PASSWORD", "test")
+    _configure_clickhouse(monkeypatch)
 
     class Response:
         status_code = 200
@@ -191,8 +195,7 @@ def test_market_data_freshness_warns_each_stale_store(monkeypatch):
 def test_market_data_freshness_counts_clickhouse_failure(monkeypatch):
     import scripts.health_report as health
 
-    monkeypatch.setenv("CLICKHOUSE_USER", "default")
-    monkeypatch.setenv("CLICKHOUSE_PASSWORD", "test")
+    _configure_clickhouse(monkeypatch)
 
     class Response:
         status_code = 503
@@ -212,6 +215,7 @@ def test_market_data_freshness_counts_clickhouse_failure(monkeypatch):
 def test_market_data_freshness_counts_missing_clickhouse_credentials(monkeypatch):
     import scripts.health_report as health
 
+    monkeypatch.setenv("CLICKHOUSE_URL", "http://clickhouse")
     for name in (
         "RESEARCH_CLICKHOUSE_USER",
         "RESEARCH_CLICKHOUSE_PASSWORD",
@@ -232,8 +236,7 @@ def test_market_data_freshness_counts_missing_clickhouse_credentials(monkeypatch
 def test_market_data_freshness_counts_invalid_clickhouse_date(monkeypatch):
     import scripts.health_report as health
 
-    monkeypatch.setenv("CLICKHOUSE_USER", "default")
-    monkeypatch.setenv("CLICKHOUSE_PASSWORD", "test")
+    _configure_clickhouse(monkeypatch)
     monkeypatch.setattr(health, "get_last_completed_trading_date", lambda market: date(2026, 7, 9))
     monkeypatch.setattr(
         health,
