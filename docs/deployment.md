@@ -124,7 +124,8 @@ systemctl --user daemon-reload
 
 ## 已知环境差异
 
-- 远端 venv 没有 pytest；测试只在本地跑（2026-07-10 全套 1,717 passed / 1 skipped）。
+- 远端 venv 没有 pytest；本地全套为 1,722 passed / 1 skipped，GitHub Actions 启用
+  PG + CH 服务后为 1,723 passed（2026-07-10）。
 - 远端 git 首次以 root 操作需要 `safe.directory` 配置（`/home/wenruifeng/projects/stock` 和 `.../.git` 两条）。
 - 数据库端口默认绑定 `127.0.0.1`；不要在 `.env` 把 `POSTGRES_BIND`/`CLICKHOUSE_BIND`
   改为 `0.0.0.0`，远程访问统一走 SSH 隧道。
