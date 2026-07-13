@@ -98,6 +98,7 @@ STUDY_KINDS: frozenset[str] = frozenset(
         "market_regime_overlay",
         "concentrated_topk",
         "market_intraday_momentum",
+        "calendar_technical",
         "retail_reality",
         "composite_study",
         "size_neutral",
