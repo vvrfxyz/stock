@@ -50,6 +50,7 @@
 | **wave-13 path_momentum 双假设**（residual_momentum_12_1 / information_discreteness_12_1，预注册 docs/wave13_path_momentum_hypotheses.md） | 日线 2007+ | H1 主判据 h21 IC .0015/t=0.204（门槛 t≥3；h1 t=2.21 但随 horizon 速衰），稳定腿 h21 t=0.235、LS 净 Sharpe 四 horizon 全负；H2 FIP 主样本 126d spread −1.5%/t=−0.499（预期为正）、21/63d 同负、loser 分量 −2.2%，稳定腿 ≈0（t=−0.012） | **全族死亡（2026-07-12）** | 残差路径与信息连续性在本市场横截面均无增量——"动量路径修饰"整族关闭，按停止条件不试 slope/R²/efficiency ratio 近义变体；市场代理与预注册"当日全 CS"有轻微口径偏差（evaluator 宇宙均值）已记录，不影响量级 | research/output/wave13_2026-07-12/ 全套报告+JSON+trials 快照、预注册文档 |
 | **wave-14 earnings_gap 双假设**（gap_atr / gap_atr_volume_confirmed，8-K Item 2.02 + accepted_at 事件锚，预注册 docs/wave14_earnings_gap_hypotheses.md） | SEC 8-K + 日线 | 主样本 75,945 完整事件/2,495 cohort：25bps 单边净日均 h20 −2.15bps/t=−3.21 与 −2.08/t=−3.00（1/5/20 日全负）；10bps 档 h20 仍负；h20 毛事件 CAR 仅 4.4-6.0bps（盖不住一次便宜往返）；稳定腿 h20 净负 | **全族死亡（2026-07-12）** | 收盘后建仓的财报缺口 continuation 净后不存在；量能确认只是负值间相对改善（+0.07bps/日），不留调味料。事件时点/财期去重/日历时间组合基建可复用于未来新事件源（如 insider CAR）；本地未保留冻结原始输出（artifact 内嵌 36 行独立复算，误差<5e-11）——provenance 缺口见方法论节 | wave14 report artifact（research/output/）、预注册文档 |
 | **wave-15 market_regime_overlay 三规则**（spy_10m_trend / breadth_200d / trend_and_breadth，预注册 docs/wave15_market_regime_overlay_hypotheses.md 含 v1→v2 勘误） | SPY+PIT CS 2007+ | 四单元（SPY/CS 等权 × 2007-15/2016-26）判据全 FAIL：主样本最好 Sharpe 改善 +0.046（门槛 +0.10，trend_and_breadth/SPY）；2008 防御真实但 2016+ 现金拖累精确命中预注册 FAIL 条款；v1→v2 仅修 7 月末时点（最大 Sharpe 差 1.1e-4、0 verdict 变化）；独立审计 12 裁决单元/24 危机单元/8 价差摘要复算误差全 0 | **全族死亡（2026-07-12）** | 简单月频趋势/breadth 覆盖层过不了"回撤改善≥10pp × Sharpe+0.10 × 复利损失≤2pp"三门槛；按停止条件不升级 HMM/change-point/波动目标/ML regime | market_regime_overlay_v2_* JSON/MD + wave15_market_regime_overlay_independent_audit.json + v1 审计痕迹 |
+| **concentrated_topk 部署研究**（composite_v2 / f_score / operating_profitability × top-K 集中多头 + 双速退出，预注册 docs/concentrated_topk_hypotheses_2026-07.md，clean-SHA 56bc31a 跑数） | 日线+XBRL+cs_spread 2012+ | 三腿 E0（K=10/252 日/measured/2016-01-08~2026-07-10）判据全 FAIL：**composite_v2 超额 −4.4%/年**（随机池 0.48 分位、sub2021 −6.2%、剔最大 spell −4.8%）；**f_score −1.7%/年**（唯一相位判据过：4 相位中位 +1.98%，但随机 0.66 分位、sub2021 −3.4%）；**OP −9.9%/年**（随机 0.09 分位——比抽签还差）。E3 双速退出全部 judged=False：fs/v2 的 E2 Chandelier 确有防御形态（Sharpe +0.10~0.14、MDD 改善 5-6pp<10pp 门槛）但不得翻案；OP 的 E3 反而更糟（Sharpe −0.14）。稳定腿分裂：v2 2013H2-15 +3.0%/年 vs f_score −3.8% | **全族死亡（2026-07-13，跑数当日结案）** | **顶端凸性假设被证伪、且方向反转**：q5 分位有排序信息（f_score t=8.22）不等于 top-10 有肉——**top-10 尖端反而系统性弱于分位组合**（fs q5 曾 +0.9%/年 vs top-10 −1.7%）；离散分数 + 流动性并列打破实际选中"最高分段里的大流动性票"，凸性被并列键稀释是候选解释（但按停止条件不开"换并列键"变体）。win_rate 66-76% × 负超额 = 长持有小赢频繁、错过的大赢家在买不到的那部分。等权持有漂移 + 252 日锁仓也锁死了动量收割。owner 交易形状（5-10 只半年-一年）在这三个信号上**没有可部署出口**；E0 全败停止条件生效——不换第四选股器、不调 K/持有期/并列键/退出参数 | 三选股器 JSON/MD/daily/spells/random parquet（双机 research/output/）、study 行×6（253 台账，code_git_dirty=False）、独立复算审计 max_err<9e-16 |
 | size / short_interest_ratio / short_volume_ratio / ownership_concentration / insider_net_buy | 各 PIT 源 | 基线因子，未做长窗攻坚（size 另有制度因子行） | 基线 | 作为框架验证与对照基线维护 | docs/factors.md |
 
 ## 方法论裁决（同样防止重复踩坑）
@@ -110,22 +111,18 @@
 （wave 12）、路径动量/财报缺口/市场覆盖层（wave 13-15）全部裁决完毕。
 ~~composite_v1 散户口径复审~~（2026-07-08 FAIL 结案）；~~基本面族长窗攻坚~~
 （wave-12 收官：OP/EY 调味料、f_score 排序王者、GP/accruals/asset_growth 死亡）；
-~~liquidity_lambda~~（已兑现为价差面 2003-2026 全量 + measured 成本档基建）。
+~~liquidity_lambda~~（已兑现为价差面 2003-2026 全量 + measured 成本档基建）；
+~~concentrated_topk~~（2026-07-13 当日跑数三腿 E0 全 FAIL 结案，见裁决表——
+owner 交易形状在现有三信号上无部署出口，"顶端凸性"反向证伪）。
 
-1. **concentrated_topk（主攻，2026-07-13 立项）**：owner 真实交易形状的部署研究——
-   全市场 PIT top-K 集中多头（K=10 主/K=5 敏感性）、126/252 日持有意图、双速退出
-   （E0 固定持有基线 / E1 周频 200 日趋势 / E2 日频 ATR 追踪 / E3 = E1∨E2）、周度
-   补位、t+1 可实现价成交、measured 价差+fallback、退市实测注入；选股器只取已有
-   证据的三个：composite_v2（主候选）/ f_score / operating_profitability，对照=同池
-   随机 top-K 分布。预注册 docs/concentrated_topk_hypotheses_2026-07.md。回答的是
-   旧散户复审（30 只月频分位）没回答的问题：顶端凸性 + 长持有 + 风险退出。
-2. **Wave 16 market_intraday_momentum（concentrated_topk 之后）**：SPY+PIT 市值加权
+1. **Wave 16 market_intraday_momentum（下一条主攻）**：SPY+PIT 市值加权
    市场组合，09:30-10:00 预测 15:30-15:59；2003-2018 复现 / 2019-2026 发表后检验；
    1/2/5bps 单边；15:59 bar close 与 16:00 auction 分离。设计草案在
    docs/research_next_directions_2026-07.md §Wave 16。
-3. **fs×价格族复合 + f_score LS 出口**（唯一净后全 horizon 为正的 LS）——若
-   concentrated_topk 的 f_score 腿失败，这两个出口是其残余价值所在。
-4. peer_lead_lag（数据阻塞：需 PIT classification history）；insider_cluster CAR；
+2. **fs×价格族复合 + f_score LS 出口**（唯一净后全 horizon 为正的 LS）——
+   concentrated_topk 的 f_score 腿已 FAIL，这两个出口是 f_score 残余价值所在
+   （新 family，须另行预注册；不是 top-K 的变体复活）。
+3. peer_lead_lag（数据阻塞：需 PIT classification history）；insider_cluster CAR；
    composite_v2 覆盖率年检（数据自然累积解锁）——均挂起。
 
 ## 工程债（研究基建）
