@@ -338,6 +338,48 @@ def test_append_study_rejects_unknown_kind(tmp_path):
         append_study(path=tmp_path / "t.parquet", **_study_kwargs(study="ad_hoc"))
 
 
+def test_append_study_accepts_path_quality_kind(tmp_path):
+    path = tmp_path / "trials.parquet"
+    trial_id = append_study(
+        path=path,
+        **_study_kwargs(
+            study="path_quality",
+            factor_name="information_discreteness_12_1",
+        ),
+    )
+
+    rows = load_trials(path)
+    assert set(rows["trial_id"].astype(str)) == {trial_id}
+
+
+def test_append_study_accepts_earnings_gap_kind(tmp_path):
+    path = tmp_path / "trials.parquet"
+    trial_id = append_study(
+        path=path,
+        **_study_kwargs(
+            study="earnings_gap",
+            factor_name="gap_atr",
+        ),
+    )
+
+    rows = load_trials(path)
+    assert set(rows["trial_id"].astype(str)) == {trial_id}
+
+
+def test_append_study_accepts_market_regime_overlay_kind(tmp_path):
+    path = tmp_path / "trials.parquet"
+    trial_id = append_study(
+        path=path,
+        **_study_kwargs(
+            study="market_regime_overlay",
+            factor_name="spy_10m_trend",
+        ),
+    )
+
+    rows = load_trials(path)
+    assert set(rows["trial_id"].astype(str)) == {trial_id}
+
+
 def test_study_rows_coexist_with_evaluate_trials(tmp_path):
     path = tmp_path / "trials.parquet"
     eval_id = append_trial(_result(), path)

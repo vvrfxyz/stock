@@ -50,6 +50,7 @@ from research.factors.builtins import intraday_flow as _intraday_flow  # noqa: F
 from research.factors.builtins import intraday_moments as _intraday_moments  # noqa: F401
 from research.factors.builtins import ownership_concentration as _ownership_concentration  # noqa: F401
 from research.factors.builtins import operating_profitability as _operating_profitability  # noqa: F401
+from research.factors.builtins import path_momentum as _path_momentum  # noqa: F401
 from research.factors.builtins import residual_vol as _residual_vol  # noqa: F401
 from research.factors.builtins import short_interest as _short_interest  # noqa: F401
 from research.factors.builtins import short_volume as _short_volume  # noqa: F401

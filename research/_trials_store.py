@@ -20,8 +20,8 @@ if TYPE_CHECKING:
 # v2（2026-07-08，W0-P3）：新增 trial_kind 列区分两类行——
 #   'evaluate'：假设检验型 trial（evaluate 自动写入；历史行 trial_kind 为 NULL，
 #               读取侧一律按 'evaluate' 解释）。
-#   'study'   ：变现/部署类 study 的判据与结局（retail_reality / composite_study /
-#               size_neutral_study 收尾写入，append_study()）。
+#   'study'   ：条件/变现/部署类 study 的判据与结局（path_quality / retail_reality /
+#               composite_study / size_neutral_study 收尾写入，append_study()）。
 # 分母口径（预注册，roadmap_2026-07_researchline.md §1 P3）：study 行**不计入**
 # Bonferroni 分母——分母只数假设检验型 trial。两层标准：发现级结论用动态
 # Bonferroni（trials report），部署级 study 判据用各自预注册阈值（如 t>=2）。
@@ -91,7 +91,16 @@ METRIC_NAMES: frozenset[str] = frozenset(
     }
 )
 
-STUDY_KINDS: frozenset[str] = frozenset({"retail_reality", "composite_study", "size_neutral"})
+STUDY_KINDS: frozenset[str] = frozenset(
+    {
+        "path_quality",
+        "earnings_gap",
+        "market_regime_overlay",
+        "retail_reality",
+        "composite_study",
+        "size_neutral",
+    }
+)
 
 
 def _repo_root() -> Path:
