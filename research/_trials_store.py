@@ -97,6 +97,7 @@ STUDY_KINDS: frozenset[str] = frozenset(
         "earnings_gap",
         "market_regime_overlay",
         "concentrated_topk",
+        "market_intraday_momentum",
         "retail_reality",
         "composite_study",
         "size_neutral",
