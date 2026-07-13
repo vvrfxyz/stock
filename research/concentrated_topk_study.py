@@ -892,7 +892,10 @@ def _write_md(path: Path, report: dict) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from dotenv import load_dotenv
+
     from research.data import research_engine
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")  # systemd-run 洗净环境下 .env 是唯一连库配置
     args = parse_args(argv)
     prog = Progress("concentrated_topk", warn_gb=5.0)
     try:
