@@ -252,8 +252,14 @@ def main(argv: list[str] | None = None) -> int:
         engine = research_engine()
         as_of = args.as_of
         if as_of is None:
-            as_of = pd.Timestamp(pd.read_sql_query(
-                "select max(date) as d from daily_prices", engine)["d"].iloc[0]).date()
+            # 章程口径：形成日 = 当月第一个交易日（定时器每月 5 日跑，该日必已入库）；
+            # 当月尚无价格（极早运行）→ 明确报错，不静默回退
+            row = pd.read_sql_query(
+                "select min(date) as d from daily_prices "
+                "where date >= date_trunc('month', current_date)::date", engine)["d"].iloc[0]
+            if row is None or pd.isna(row):
+                raise RuntimeError("当月尚无交易日价格，无法按章程形成持仓单")
+            as_of = pd.Timestamp(row).date()
         month = args.month or f"{as_of.year:04d}-{as_of.month:02d}"
         args.dir.mkdir(parents=True, exist_ok=True)
         out_json = args.dir / f"{month}.json"
