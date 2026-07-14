@@ -151,13 +151,27 @@ def settle_previous(engine, prev: dict, snap: dict, prog: Progress) -> dict:
     收益口径：复权收盘比值（adj_close[exec_new] / adj_close[exec_prev] − 1），
     自动吸收分红与拆股；退市/无价按最后可得复权价冻结（延迟到有实测退市收益的
     档案更新，不在纸面账里预估）。SPY 对照同两执行日。
+
+    上月单执行价 pending（生成时形成日=面板最新日）时，在此回填：执行日 =
+    新面板中严格晚于上月形成日的第一个交易日。历史持仓单文件不改写（章程），
+    回填只进结算记录。
     """
     adj = snap["adj_close"]
     dates = snap["dates"]
-    prev_exec = pd.Timestamp(prev["execution_date"])
+    if prev.get("execution_date"):
+        prev_exec = pd.Timestamp(prev["execution_date"])
+    else:
+        after_form = dates[dates > pd.Timestamp(prev["formation_date"])]
+        if not len(after_form):
+            raise RuntimeError("上月形成日后无交易日价格，无法回填执行价")
+        prev_exec = after_form[0]
     new_exec = snap["exec_ts"]
     if new_exec is None:
-        raise RuntimeError("本月执行日价格尚不存在，无法结算上月——晚一个交易日再跑")
+        # 本月单也 pending：结算截点用面板最新日（下月回填差额不影响毛账口径——
+        # 逐段收益按执行日几何衔接，见 ledger 复利公式）
+        new_exec = dates[-1]
+    if new_exec <= prev_exec:
+        raise RuntimeError(f"结算窗口为空：{prev_exec.date()} → {new_exec.date()}")
     rows = []
     rets = []
     for h in prev["holdings"]:
@@ -257,12 +271,11 @@ def main(argv: list[str] | None = None) -> int:
         if prev_files:
             prev = json.loads(prev_files[-1].read_text())
             prev_holdings = prev["holdings"]
-            if prev.get("execution_date"):
-                with prog.stage("结算上月"):
-                    settlement = settle_previous(engine, prev, snap, prog)
-                    done = {p["period"] for p in ledger["periods"]}
-                    if settlement["period"] not in done:
-                        ledger["periods"].append(settlement)
+            with prog.stage("结算上月"):
+                settlement = settle_previous(engine, prev, snap, prog)
+                done = {p["period"] for p in ledger["periods"]}
+                if settlement["period"] not in done:
+                    ledger["periods"].append(settlement)
 
         # 本月持仓
         new_ids = pick_holdings(snap["q5_sorted_ids"], [h["security_id"] for h in prev_holdings])

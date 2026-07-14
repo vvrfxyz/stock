@@ -1,0 +1,296 @@
+{
+  "charter": "docs/paper_portfolio_charter_2026-07.md",
+  "factor": "composite_v2",
+  "month": "2026-07",
+  "formation_date": "2026-07-10",
+  "execution_date": null,
+  "execution_status": "pending_next_session",
+  "n_small_bucket": 988,
+  "n_q5": 197,
+  "turnover": {
+    "n_buys": 30,
+    "n_sells": 0,
+    "cost_frac": 0.000741
+  },
+  "cost_diag": {
+    "n_universe": 6339,
+    "n_covered": 4108,
+    "coverage": 0.6480517431771573,
+    "median_cost_bps_covered": 9.259427056724249,
+    "fallback_bps": 40.0,
+    "stress_mult": 0.5,
+    "min_periods": 10
+  },
+  "holdings": [
+    {
+      "security_id": 3242,
+      "symbol": "gcmg",
+      "name": "GCM Grosvenor Inc. Class A Common Stock",
+      "weight": 0.033333,
+      "signal": 0.687155,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 3.28
+    },
+    {
+      "security_id": 9550,
+      "symbol": "lqdt",
+      "name": "Liquidity Services, Inc.",
+      "weight": 0.033333,
+      "signal": 0.683949,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 2.89
+    },
+    {
+      "security_id": 1489,
+      "symbol": "gsl",
+      "name": "Global Ship Lease, Inc.",
+      "weight": 0.033333,
+      "signal": 0.676179,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 3.82
+    },
+    {
+      "security_id": 10644,
+      "symbol": "krt",
+      "name": "Karat Packaging Inc. Common Stock",
+      "weight": 0.033333,
+      "signal": 0.650252,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 4.3
+    },
+    {
+      "security_id": 8060,
+      "symbol": "odc",
+      "name": "Oil-Dri Corporation of America",
+      "weight": 0.033333,
+      "signal": 0.64728,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 40.0
+    },
+    {
+      "security_id": 10411,
+      "symbol": "jbss",
+      "name": "John B. Sanfilippo & SON",
+      "weight": 0.033333,
+      "signal": 0.645754,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 7.52
+    },
+    {
+      "security_id": 7953,
+      "symbol": "cswc",
+      "name": "Capital Southwest Corp",
+      "weight": 0.033333,
+      "signal": 0.639172,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 3.46
+    },
+    {
+      "security_id": 5258,
+      "symbol": "irmd",
+      "name": "iRadimed Corporation",
+      "weight": 0.033333,
+      "signal": 0.638327,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 5.53
+    },
+    {
+      "security_id": 1800,
+      "symbol": "chy",
+      "name": "Calamos Convertible and High Income Fund",
+      "weight": 0.033333,
+      "signal": 0.636204,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 3.15
+    },
+    {
+      "security_id": 5541,
+      "symbol": "obk",
+      "name": "Origin Bancorp, Inc.",
+      "weight": 0.033333,
+      "signal": 0.630893,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 2.91
+    },
+    {
+      "security_id": 2554,
+      "symbol": "pfbc",
+      "name": "Preferred Bank",
+      "weight": 0.033333,
+      "signal": 0.630299,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 40.0
+    },
+    {
+      "security_id": 1769,
+      "symbol": "chi",
+      "name": "Calamos Convertible Opportunities and Income Fund",
+      "weight": 0.033333,
+      "signal": 0.628433,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 3.91
+    },
+    {
+      "security_id": 8494,
+      "symbol": "giii",
+      "name": "G-Iii Apparel Group Ltd",
+      "weight": 0.033333,
+      "signal": 0.628365,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 4.77
+    },
+    {
+      "security_id": 8212,
+      "symbol": "trin",
+      "name": "Trinity Capital Inc. Common Stock",
+      "weight": 0.033333,
+      "signal": 0.627622,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 3.92
+    },
+    {
+      "security_id": 10104,
+      "symbol": "wsr",
+      "name": "Whitestone REIT",
+      "weight": 0.033333,
+      "signal": 0.62686,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 1.01
+    },
+    {
+      "security_id": 8482,
+      "symbol": "rushb",
+      "name": "Rush Enterprises Inc",
+      "weight": 0.033333,
+      "signal": 0.626383,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 40.0
+    },
+    {
+      "security_id": 9553,
+      "symbol": "kop",
+      "name": "Koppers Holdings, Inc.",
+      "weight": 0.033333,
+      "signal": 0.620647,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 4.7
+    },
+    {
+      "security_id": 10072,
+      "symbol": "apei",
+      "name": "American Public Education, Inc.",
+      "weight": 0.033333,
+      "signal": 0.618964,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 6.03
+    },
+    {
+      "security_id": 8542,
+      "symbol": "amal",
+      "name": "Amalgamated Financial Corp. Common Stock (DE)",
+      "weight": 0.033333,
+      "signal": 0.618834,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 2.01
+    },
+    {
+      "security_id": 9193,
+      "symbol": "krp",
+      "name": "Kimbell Royalty Partners, LP Common Units representing Limited Partner Interests",
+      "weight": 0.033333,
+      "signal": 0.6172,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 3.3
+    },
+    {
+      "security_id": 7874,
+      "symbol": "abus",
+      "name": "Arbutus Biopharma Corporation Common Stock",
+      "weight": 0.033333,
+      "signal": 0.616641,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 8.67
+    },
+    {
+      "security_id": 10381,
+      "symbol": "aat",
+      "name": "AMERICAN ASSETS TRUST, INC.",
+      "weight": 0.033333,
+      "signal": 0.611799,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 2.42
+    },
+    {
+      "security_id": 2043,
+      "symbol": "ccd",
+      "name": "Calamos Dynamic Convertible & Income Fund",
+      "weight": 0.033333,
+      "signal": 0.611152,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 5.14
+    },
+    {
+      "security_id": 6672,
+      "symbol": "cffn",
+      "name": "Capitol Federal Financial, Inc.",
+      "weight": 0.033333,
+      "signal": 0.610867,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 3.03
+    },
+    {
+      "security_id": 10202,
+      "symbol": "ebf",
+      "name": "Ennis, Inc.",
+      "weight": 0.033333,
+      "signal": 0.610161,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 2.67
+    },
+    {
+      "security_id": 1628,
+      "symbol": "vmd",
+      "name": "Viemed Healthcare, Inc. Common Shares",
+      "weight": 0.033333,
+      "signal": 0.608018,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 3.26
+    },
+    {
+      "security_id": 2036,
+      "symbol": "idt",
+      "name": "IDT Corporation Class B",
+      "weight": 0.033333,
+      "signal": 0.606886,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 3.2
+    },
+    {
+      "security_id": 7701,
+      "symbol": "cpf",
+      "name": "Central Pacific Financial Corporation",
+      "weight": 0.033333,
+      "signal": 0.605943,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 2.0
+    },
+    {
+      "security_id": 7128,
+      "symbol": "alrs",
+      "name": "Alerus Financial Corporation Common Stock",
+      "weight": 0.033333,
+      "signal": 0.605,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 2.65
+    },
+    {
+      "security_id": 6924,
+      "symbol": "hbt",
+      "name": "HBT Financial, Inc. Common Stock",
+      "weight": 0.033333,
+      "signal": 0.603831,
+      "exec_price_raw": null,
+      "cost_bps_one_side": 2.87
+    }
+  ]
+}

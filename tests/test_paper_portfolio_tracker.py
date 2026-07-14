@@ -92,8 +92,22 @@ class TestSettlement:
         notes = {r["security_id"]: r["note"] for r in s["positions"]}
         assert notes[2] == "frozen_last_price"
 
-    def test_missing_new_exec_raises(self):
+    def test_pending_prev_exec_backfilled_from_formation(self):
+        # 上月单 execution_date=None（pending）：回填为形成日后第一个交易日
+        prev = self._prev()
+        prev["execution_date"] = None
+        prev["formation_date"] = "2026-06-01"
+        s = settle_previous(None, prev, self._snap(), None)
+        assert s["from"] == "2026-06-02"
+
+    def test_pending_new_exec_uses_last_panel_date(self):
         snap = self._snap()
         snap["exec_ts"] = None
+        s = settle_previous(None, self._prev(), snap, None)
+        assert s["to"] == "2026-07-01"
+
+    def test_empty_window_raises(self):
+        snap = self._snap()
+        snap["exec_ts"] = pd.Timestamp("2026-06-02")  # 等于上月执行日 → 空窗
         with pytest.raises(RuntimeError):
             settle_previous(None, self._prev(), snap, None)
